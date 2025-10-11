@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GameRent - Аренда игр PS4/PS5</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        :root {
+            --primary: #6a11cb;
+            --secondary: #2575fc;
+            --accent: #ff4d94;
+            --dark: #1a1a2e;
+            --light: #f8f9fa;
+            --success: #28a745;
+            --warning: #ffc107;
+            --danger: #dc3545;
+        }
+
+        body {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: var(--light);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        /* Header Styles */
+        header {
+            background: rgba(26, 26, 46, 0.95);
+            backdrop-filter: blur(10px);
+            position: fixed;
+            width: 100%;
+            top: 0;
+            z-index: 1000;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 0;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: var(--light);
+        }
+
+        .logo i {
+            color: var(--accent);
+        }
+
+        .nav-menu {
+            display: flex;
+            list-style: none;
+            gap: 30px;
+        }
+
+        .nav-menu a {
+            color: var(--light);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s;
+            position: relative;
+        }
+
+        .nav-menu a:hover {
+            color: var(--accent);
+        }
+
+        .nav-menu a::after {
+            content: '';
+            position: absolute;
+            bottom: -5px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: var(--accent);
+            transition: width 0.3s;
+        }
+
+        .nav-menu a:hover::after {
+            width: 100%;
+        }
+
+        .cart-icon {
+            position: relative;
+            cursor: pointer;
+            font-size: 1.5rem;
+        }
+
+        .cart-count {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            background: var(--accent);
+            color: white;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+
+        /* Hero Section */
+        .hero {
+            padding: 150px 0 80px;
+            text-align: center;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" opacity="0.1"><polygon fill="white" points="1000,1000 0,1000 0,0 500,500"/></svg>');
+            background-size: cover;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            margin-bottom: 20px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .hero p {
+            font-size: 1.2rem;
+            max-width: 700px;
+            margin: 0 auto 30px;
+            opacity: 0.9;
+        }
+
+        .hero-badges {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 40px;
+            flex-wrap: wrap;
+        }
+
+        .badge {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 10px 20px;
+            border-radius: 50px;
+            backdrop-filter: blur(10px);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 15px 30px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 50px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-decoration: none;
+            box-shadow: 0 4px 15px rgba(255, 77, 148, 0.4);
+        }
+
+        .btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(255, 77, 148, 0.6);
+        }
+
+        /* Games Section */
+        .games-section {
+            padding: 80px 0;
+        }
+
+        .section-title {
+            text-align: center;
+            margin-bottom: 50px;
+            font-size: 2.5rem;
+            position: relative;
+        }
+
+        .section-title::after {
+            content: '';
+            position: absolute;
+            bottom: -15px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100px;
+            height: 4px;
+            background: linear-gradient(to right, var(--primary), var(--accent));
+            border-radius: 2px;
+        }
+
+        .games-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 30px;
+        }
+
+        .game-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            overflow: hidden;
+            transition: transform 0.3s, box-shadow 0.3s;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .game-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.4);
+        }
+
+        .game-header {
+            padding: 20px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .game-title {
+            font-size: 1.4rem;
+            font-weight: 700;
+        }
+
+        .game-platform {
+            display: flex;
+            gap: 5px;
+        }
+
+        .platform {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .game-content {
+            padding: 20px;
+        }
+
+        .game-info {
+            margin-bottom: 20px;
+        }
+
+        .game-info p {
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .game-info i {
+            color: var(--accent);
+            width: 20px;
+        }
+
+        .rental-options {
+            margin-bottom: 20px;
+        }
+
+        .rent-period {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .period-select {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .rent-price {
+            font-weight: 700;
+            color: var(--accent);
+            font-size: 1.1rem;
+        }
+
+        input[type="radio"] {
+            accent-color: var(--accent);
+            width: 18px;
+            height: 18px;
+        }
+
+        .btn-rent {
+            width: 100%;
+            text-align: center;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+        }
+
+        /* How it works */
+        .how-it-works {
+            padding: 80px 0;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 30px;
+        }
+
+        .step-card {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 30px;
+            border-radius: 15px;
+            text-align: center;
+            transition: transform 0.3s;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .step-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .step-number {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 1.5rem;
+            font-weight: 700;
+            box-shadow: 0 5px 15px rgba(106, 17, 203, 0.4);
+        }
+
+        .step-card h3 {
+            margin-bottom: 15px;
+            font-size: 1.3rem;
+        }
+
+        /* Contact Section */
+        .contact-section {
+            padding: 80px 0;
+        }
+
+        .contact-links {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 40px;
+        }
+
+        .contact-link {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            padding: 25px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            text-decoration: none;
+            color: var(--light);
+            transition: all 0.3s;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .contact-link:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateY(-5px);
+        }
+
+        .contact-icon {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+        }
+
+        .contact-info h3 {
+            margin-bottom: 5px;
+            font-size: 1.2rem;
+        }
+
+        /* Footer */
+        footer {
+            background: rgba(0, 0, 0, 0.5);
+            padding: 40px 0;
+            text-align: center;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .footer-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .social-links {
+            display: flex;
+            gap: 20px;
+        }
+
+        .social-link {
+            width: 40px;
+            height: 40px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+
+        .social-link:hover {
+            background: var(--accent);
+            transform: translateY(-3px);
+        }
+
+        /* Mobile Menu */
+        .mobile-menu-btn {
+            display: none;
+            background: none;
+            border: none;
+            color: var(--light);
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+
+        /* Responsive */
+        @media (max-width: 992px) {
+            .hero h1 {
+                font-size: 2.8rem;
+            }
+            
+            .games-grid {
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            }
+        }
+
+        @media (max-width: 768px) {
+            .nav-menu {
+                display: none;
+                position: absolute;
+                top: 100%;
+                left: 0;
+                width: 100%;
+                background: rgba(26, 26, 46, 0.95);
+                flex-direction: column;
+                padding: 20px;
+                gap: 15px;
+                backdrop-filter: blur(10px);
+            }
+            
+            .nav-menu.active {
+                display: flex;
+            }
+            
+            .mobile-menu-btn {
+                display: block;
+            }
+            
+            .hero h1 {
+                font-size: 2.2rem;
+            }
+            
+            .hero p {
+                font-size: 1rem;
+            }
+            
+            .section-title {
+                font-size: 2rem;
+            }
+        }
+
+        @media (max-width: 576px) {
+            .hero {
+                padding: 120px 0 60px;
+            }
+            
+            .hero h1 {
+                font-size: 1.8rem;
+            }
+            
+            .games-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .badge {
+                padding: 8px 15px;
+                font-size: 0.9rem;
+            }
+            
+            .contact-link {
+                flex-direction: column;
+                text-align: center;
+                gap: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <div class="container">
+            <div class="header-content">
+                <div class="logo">
+                    <i class="fas fa-gamepad"></i>
+                    <span>GameRent</span>
+                </div>
+                
+                <button class="mobile-menu-btn">
+                    <i class="fas fa-bars"></i>
+                </button>
+                
+                <ul class="nav-menu">
+                    <li><a href="#home">Главная</a></li>
+                    <li><a href="#games">Каталог игр</a></li>
+                    <li><a href="#how-it-works">Как арендовать</a></li>
+                    <li><a href="#contact">Контакты</a></li>
+                </ul>
+                
+                <div class="cart-icon" onclick="showCart()">
+                    <i class="fas fa-shopping-cart"></i>
+                    <span class="cart-count">0</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="hero" id="home">
+        <div class="container">
+            <h1>Аренда игр для PS4 и PS5</h1>
+            <p>Играйте в лучшие игры по доступным ценам! Все игры с русскими субтитрами.</p>
+            
+            <div class="hero-badges">
+                <div class="badge">
+                    <i class="fas fa-gamepad"></i>
+                    <span>10+ игр в каталоге</span>
+                </div>
+                <div class="badge">
+                    <i class="fas fa-playstation"></i>
+                    <span>PS4 и PS5</span>
+                </div>
+                <div class="badge">
+                    <i class="fas fa-tag"></i>
+                    <span>Доступные цены</span>
+                </div>
+            </div>
+            
+            <a href="#games" class="btn">Смотреть каталог</a>
+        </div>
+    </section>
+
+    <!-- Games Section -->
+    <section class="games-section" id="games">
+        <div class="container">
+            <h2 class="section-title">Каталог игр</h2>
+            
+            <div class="games-grid">
+                <!-- Mortal Kombat X -->
+                <div class="game-card" data-game="Mortal Kombat X">
+                    <div class="game-header">
+                        <div class="game-title">Mortal Kombat X</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Файтинг</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1-2</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mkx-3" name="mkx-period" data-days="3" data-price="100">
+                                    <label for="mkx-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mkx-7" name="mkx-period" data-days="7" data-price="200">
+                                    <label for="mkx-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mkx-14" name="mkx-period" data-days="14" data-price="300">
+                                    <label for="mkx-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mkx-30" name="mkx-period" data-days="30" data-price="500">
+                                    <label for="mkx-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Mortal Kombat X')">Арендовать</button>
+                    </div>
+                </div>
+
+                <!-- Mortal Kombat 11 -->
+                <div class="game-card" data-game="Mortal Kombat 11">
+                    <div class="game-header">
+                        <div class="game-title">Mortal Kombat 11</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Файтинг</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1-2</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mk11-3" name="mk11-period" data-days="3" data-price="100">
+                                    <label for="mk11-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                       </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mk11-7" name="mk11-period" data-days="7" data-price="200">
+                                    <label for="mk11-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mk11-14" name="mk11-period" data-days="14" data-price="300">
+                                    <label for="mk11-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mk11-30" name="mk11-period" data-days="30" data-price="500">
+                                    <label for="mk11-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Mortal Kombat 11')">Арендовать</button>
+                    </div>
+                </div>
+
+                <!-- It Takes Two + A Way Out -->
+                <div class="game-card" data-game="It Takes Two + A Way Out">
+                    <div class="game-header">
+                        <div class="game-title">It Takes Two + A Way Out</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Приключение, Кооператив</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 2</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="ittakes-3" name="ittakes-period" data-days="3" data-price="150">
+                                    <label for="ittakes-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">150₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="ittakes-7" name="ittakes-period" data-days="7" data-price="250">
+                                    <label for="ittakes-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">250₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="ittakes-14" name="ittakes-period" data-days="14" data-price="300">
+                                    <label for="ittakes-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="ittakes-30" name="ittakes-period" data-days="30" data-price="500">
+                                    <label for="ittakes-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('It Takes Two + A Way Out')">Арендовать</button>
+                    </div>
+                </div>
+
+                <!-- Metro Game Saga -->
+                <div class="game-card" data-game="Metro Game Saga">
+                    <div class="game-header">
+                        <div class="game-title">Metro Game Saga</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Шутер, Постапокалипсис</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="metro-3" name="metro-period" data-days="3" data-price="100">
+                                    <label for="metro-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="metro-7" name="metro-period" data-days="7" data-price="200">
+                                    <label for="metro-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="metro-14" name="metro-period" data-days="14" data-price="300">
+                                    <label for="metro-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="metro-30" name="metro-period" data-days="30" data-price="500">
+                                    <label for="metro-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Metro Game Saga')">Арендовать</button>
+                    </div>
+                </div>
+                <!-- Far Cry 6 Deluxe Edition -->
+                <div class="game-card" data-game="Far Cry 6 Deluxe Edition">
+                    <div class="game-header">
+                        <div class="game-title">Far Cry 6 Deluxe Edition</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Шутер, Открытый мир</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="farcry-3" name="farcry-period" data-days="3" data-price="100">
+                                    <label for="farcry-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="farcry-7" name="farcry-period" data-days="7" data-price="200">
+                                    <label for="farcry-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="farcry-14" name="farcry-period" data-days="14" data-price="300">
+                                    <label for="farcry-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="farcry-30" name="farcry-period" data-days="30" data-price="500">
+                                    <label for="farcry-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Far Cry 6 Deluxe Edition')">Арендовать</button>
+                    </div>
+                </div>
+
+                <!-- Terraria + Stardew Valley -->
+                <div class="game-card" data-game="Terraria + Stardew Valley">
+                    <div class="game-header">
+                        <div class="game-title">Terraria + Stardew Valley</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Песочница, Симулятор</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1-4</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="terraria-3" name="terraria-period" data-days="3" data-price="100">
+                                    <label for="terraria-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="terraria-7" name="terraria-period" data-days="7" data-price="200">
+                                    <label for="terraria-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="terraria-14" name="terraria-period" data-days="14" data-price="300">
+                                    <label for="terraria-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="terraria-30" name="terraria-period" data-days="30" data-price="500">
+                                    <label for="terraria-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Terraria + Stardew Valley')">Арендовать</button>
+                    </div>
+                </div>
+
+                <!-- Mafia Trilogy -->
+                <div class="game-card" data-game="Mafia Trilogy">
+                    <div class="game-header">
+                        <div class="game-title">Mafia Trilogy</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Экшен, Приключение</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mafia-3" name="mafia-period" data-days="3" data-price="100">
+                                    <label for="mafia-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mafia-7" name="mafia-period" data-days="7" data-price="200">
+                                    <label for="mafia-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mafia-14" name="mafia-period" data-days="14" data-price="300">
+                                    <label for="mafia-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="mafia-30" name="mafia-period" data-days="30" data-price="500">
+                                    <label for="mafia-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Mafia Trilogy')">Арендовать</button>
+                    </div>
+                </div>
+                <!-- The Witcher 3 -->
+                <div class="game-card" data-game="The Witcher 3">
+                    <div class="game-header">
+                        <div class="game-title">The Witcher 3</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> RPG, Открытый мир</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="witcher-3" name="witcher-period" data-days="3" data-price="100">
+                                    <label for="witcher-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="witcher-7" name="witcher-period" data-days="7" data-price="200">
+                                    <label for="witcher-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="witcher-14" name="witcher-period" data-days="14" data-price="300">
+                                    <label for="witcher-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="witcher-30" name="witcher-period" data-days="30" data-price="500">
+                                    <label for="witcher-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('The Witcher 3')">Арендовать</button>
+                    </div>
+                </div>
+
+                <!-- Sekiro: Shadows Die Twice GOTY -->
+                <div class="game-card" data-game="Sekiro: Shadows Die Twice GOTY">
+                    <div class="game-header">
+                        <div class="game-title">Sekiro: Shadows Die Twice GOTY</div>
+                        <div class="game-platform">
+                            <span class="platform">PS4</span>
+                            <span class="platform">PS5</span>
+                        </div>
+                    </div>
+                    <div class="game-content">
+                        <div class="game-info">
+                            <p><i class="fas fa-theater-masks"></i> <strong>Жанр:</strong> Экшен, Слэшер</p>
+                            <p><i class="fas fa-users"></i> <strong>Игроков:</strong> 1</p>
+                            <p><i class="fas fa-closed-captioning"></i> <strong>Субтитры:</strong> Русские</p>
+                        </div>
+                        
+                        <div class="rental-options">
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="sekiro-3" name="sekiro-period" data-days="3" data-price="100">
+                                    <label for="sekiro-3">3 дня</label>
+                                </div>
+                                <div class="rent-price">100₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="sekiro-7" name="sekiro-period" data-days="7" data-price="200">
+                                    <label for="sekiro-7">7 дней</label>
+                                </div>
+                                <div class="rent-price">200₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="sekiro-14" name="sekiro-period" data-days="14" data-price="300">
+                                    <label for="sekiro-14">14 дней</label>
+                                </div>
+                                <div class="rent-price">300₽</div>
+                            </div>
+                            <div class="rent-period">
+                                <div class="period-select">
+                                    <input type="radio" id="sekiro-30" name="sekiro-period" data-days="30" data-price="500">
+                                    <label for="sekiro-30">30 дней</label>
+                                </div>
+                                <div class="rent-price">500₽</div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-rent" onclick="addToCart('Sekiro: Shadows Die Twice GOTY')">Арендовать</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- How it works -->
+    <section class="how-it-works" id="how-it-works">
+        <div class="container">
+            <h2 class="section-title">Как арендовать игру</h2>
+            
+            <div class="steps">
+                <div class="step-card">
+                    <div class="step-number">1</div>
+                    <h3>Выберите игру</h3>
+                    <p>Подберите игру из нашего каталога PS4/PS5 и выберите период аренды</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">2</div>
+                    <h3>Добавьте в корзину</h3>
+                    <p>Нажмите кнопку "Арендовать" для добавления игры в корзину</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">3</div>
+                    <h3>Свяжитесь с нами</h3>
+                    <p>Перейдите в корзину и свяжитесь с нами любым удобным способом</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">4</div>
+                    <h3>Получите игру</h3>
+                    <p>Заберите игру в удобное для вас время</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Contact Section -->
+    <section class="contact-section" id="contact">
+        <div class="container">
+            <h2 class="section-title">Свяжитесь с нами</h2>
+            <p style="text-align: center; max-width: 700px; margin: 0 auto 40px; opacity: 0.9;">
+                Выберите удобный способ связи для аренды игр. Мы ответим в кратчайшие сроки!
+            </p>
+            
+            <div class="contact-links">
+                <a href="tel:+79270825069" class="contact-link">
+                    <div class="contact-icon">
+                        <i class="fas fa-phone-alt"></i>
+                    </div>
+                    <div class="contact-info">
+                        <h3>Телефон / WhatsApp</h3>
+                        <p>+7 (927) 082-50-69</p>
+                    </div>
+                </a>
+                
+                <a href="https://t.me/Enotik_9258" target="_blank" class="contact-link">
+                    <div class="contact-icon">
+                        <i class="fab fa-telegram"></i>
+                    </div>
+                    <div class="contact-info">
+                        <h3>Telegram</h3>
+                        <p>@Enotik_9258</p>
+                    </div>
+                </a>
+                
+                <a href="https://vk.com/id605290173" target="_blank" class="contact-link">
+                    <div class="contact-icon">
+                        <i class="fab fa-vk"></i>
+                    </div>
+                    <div class="contact-info">
+                        <h3>ВКонтакте</h3>
+                        <p>vk.com/id605290173</p>
+                    </div>
+                </a>
+                
+                <a href="mailto:egormisenev3@gmail.com" class="contact-link">
+                    <div class="contact-icon">
+                        <i class="fas fa-envelope"></i>
+                    </div>
+                    <div class="contact-info">
+                        <h3>Email</h3>
+                        <p>egormisenev3@gmail.com</p>
+                    </div>
+                </a>
+            </div>
+            <div style="text-align: center; margin-top: 40px; padding: 25px; background: rgba(255, 255, 255, 0.05); border-radius: 15px; backdrop-filter: blur(10px);">
+                <h3 style="margin-bottom: 15px;"><i class="far fa-clock"></i> Время работы</h3>
+                <p>10:00 - 22:00 ежедневно</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-content">
+                <div class="logo">
+                    <i class="fas fa-gamepad"></i>
+                    <span>GameRent</span>
+                </div>
+                
+                <p>Аренда игр для PS4 и PS5</p>
+                
+                <div class="social-links">
+                    <a href="tel:+79270825069" class="social-link">
+                        <i class="fas fa-phone-alt"></i>
+                    </a>
+                    <a href="https://t.me/Enotik_9258" target="_blank" class="social-link">
+                        <i class="fab fa-telegram"></i>
+                    </a>
+                    <a href="https://vk.com/id605290173" target="_blank" class="social-link">
+                        <i class="fab fa-vk"></i>
+                    </a>
+                    <a href="mailto:egormisenev3@gmail.com" class="social-link">
+                        <i class="fas fa-envelope"></i>
+                    </a>
+                </div>
+                
+                <p>&copy; 2024 GameRent. Все права защищены.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // Корзина
+        let cart = [];
+        let cartCount = 0;
+        
+        // Получить выбранный период для игры
+        function getSelectedPeriod(gameName) {
+            const gameCard = document.querySelector(`.game-card[data-game="${gameName}"]`);
+            const selectedRadio = gameCard.querySelector('input[type="radio"]:checked');
+            
+            if (!selectedRadio) {
+                alert('Пожалуйста, выберите период аренды!');
+                return null;
+            }
+            
+            return {
+                days: parseInt(selectedRadio.dataset.days),
+                price: parseInt(selectedRadio.dataset.price)
+            };
+        }
+        
+        // Добавить игру в корзину
+        function addToCart(gameName) {
+            const period = getSelectedPeriod(gameName);
+            if (!period) return;
+            
+            cart.push({
+                name: gameName,
+                days: period.days,
+                price: period.price,
+                id: Date.now() + Math.random()
+            });
+            
+            cartCount = cart.length;
+            updateCartCount();
+            
+            let message = `🎮 Игра "${gameName}" добавлена в корзину!\n\n`;
+            message += `📅 Период: ${period.days} дней\n`;
+            message += `💎 Стоимость: ${period.price}₽\n\n`;
+            message += `Для оформления заказа свяжитесь с нами:\n`;
+            message += `📞 Телефон: +7 (927) 082-50-69\n`;
+            message += `✈️ Telegram: @Enotik_9258`;
+            
+            alert(message);
+        }
+        
+        // Обновить счетчик корзины
+        function updateCartCount() {
+            document.querySelector('.cart-count').textContent = cartCount;
+        }
+        
+        // Показать корзину
+        function showCart() {
+            if (cart.length === 0) {
+                alert('🛒 Корзина пуста\n\nВыберите игры из каталога для аренды.');
+                return;
+            }
+            
+            let cartContent = '🛒 Ваша корзина:\n\n';
+            let total = 0;
+            
+            cart.forEach((item, index) => {
+                cartContent += `${index + 1}. ${item.name}\n`;
+                cartContent += `   📅 ${item.days} дней - ${item.price}₽\n\n`;
+                total += item.price;
+            });
+            
+            cartContent += `💎 Общая стоимость: ${total}₽`;
+            cartContent += '\n\n📞 Для оформления заказа:';
+            cartContent += '\nТелефон: +7 (927) 082-50-69';
+            cartContent += '\nTelegram: @Enotik_9258';
+            cartContent += '\nВК: vk.com/id605290173';
+            cartContent += '\nEmail: egormisenev3@gmail.com';
+            
+            alert(cartContent);
+        }
+        
+        // Мобильное меню
+        document.querySelector('.mobile-menu-btn').addEventListener('click', function() {
+            document.querySelector('.nav-menu').classList.toggle('active');
+        });
+        
+        // Плавная прокрутка для ссылок
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                e.preventDefault();
+                
+                const targetId = this.getAttribute('href');
+                if (targetId === '#') return;
+                
+                const targetElement = document.querySelector(targetId);
+                if (targetElement) {
+                    window.scrollTo({
+                        top: targetElement.offsetTop - 80,
+                        behavior: 'smooth'
+                    });
+                    
+                    // Закрыть мобильное меню если открыто
+                    document.querySelector('.nav-menu').classList.remove('active');
+                }
+            });
+        });
+        
+        // Закрыть мобильное меню при клике вне его
+        document.addEventListener('click', function(e) {
+            if (!e.target.closest('.nav-menu') && !e.target.closest('.mobile-menu-btn')) {
+                document.querySelector('.nav-menu').classList.remove('active');
+            }
+        });
+    </script>
+</body>
+</html>
