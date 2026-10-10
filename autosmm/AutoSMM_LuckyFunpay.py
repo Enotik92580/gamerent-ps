@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - зависит от окружения
     BeautifulSoup = None
 
 NAME = "AutoSMM"
-VERSION = "23.0.0"
+VERSION = "23.0.1"
 DESCRIPTION = "Автоматическая продажа SMM-услуг: автовыгрузка, ручные лоты, автоцена, рефилл"
 CREDITS = "@LuckyFunPay_Support"
 AUTHOR_URL = "https://t.me/LuckyFunPay_Support"
@@ -342,7 +342,7 @@ THEMES: Dict[str, Dict[str, Any]] = {
              'warn': ('📌 УСЛОВИЯ', '📌 TERMS'),
              'intro': ('🤖 Заказ обрабатывается ботом автоматически 24/7', '🤖 Orders are processed by the bot 24/7'),
              'footer': ('📈 Статус заказа можно проверить в любой момент командой «чек».',
-                        '📈 You can check the order status any time with the "чек" command.'), 'details': True},
+                        '📈 You can check the order status any time with the "check" command.'), 'details': True},
 }
 THEME_ORDER = ['premium', 'neon', 'fire', 'minimal', 'classic', 'info']
 LEGACY_STYLE_THEME = {'s1': 'premium', 's2': 'neon', 's3': 'classic', 's4': 'info', 's5': 'fire'}
@@ -1750,7 +1750,7 @@ def _theme_description(theme: Dict[str, Any], ctx: Dict[str, Any], english: bool
             flow.append('Send the answer option number when the bot asks')
         if ctx['confirm']:
             flow.append('Confirm the start with "+"')
-        flow.append('Check the status any time: чек ORDER_NUMBER')
+        flow.append('Check the status any time: check ORDER_NUMBER')
     else:
         flow = [f"Оплатите нужное количество — от {ctx['min_pcs']} до {ctx['max_pcs']} шт.",
                 f"Отправьте в чат {ctx['link_hint']}: {ctx['example_link']}"]
@@ -1817,10 +1817,32 @@ def render_lot_texts(service: Dict[str, Any], quantity: int, price: float, choic
     if not cfg['design'].get('english', True):
         summary_en = _summary_field(_translit(summary_ru), s_en)
         desc_en = _translit(desc_ru)
+    summary_en = _summary_field(_latin_only(summary_en), s_en)
+    desc_en = _latin_only(desc_en)
     desc_ru = _clip_units(desc_ru, max(1, d_ru - _utf16_len(tag_line))).rstrip() + tag_line
     desc_en = _clip_units(desc_en, max(1, d_en - _utf16_len(tag_line))).rstrip() + tag_line
     return {'summary_ru': summary_ru, 'summary_en': summary_en, 'desc_ru': desc_ru, 'desc_en': desc_en,
             'platform': profile['platform'], 'kind': profile['kind'], 'template': choice}
+
+
+def _latin_only(text: str) -> str:
+    """FunPay отклоняет английские поля с кириллицей («некорректное английское описание»)."""
+    text = str(text or '')
+    return _translit(text) if re.search('[а-яё]', text, re.I) else text
+
+
+def _plain_english(text: str) -> str:
+    """Запасной вариант EN-текста: только латиница, цифры и пунктуация, без эмодзи."""
+    lines = []
+    text = _latin_only(text)
+    for ru, en in (('—', '-'), ('–', '-'), ('«', '"'), ('»', '"'), ('…', '...'), ('•', '-'), ('×', 'x')):
+        text = text.replace(ru, en)
+    for line in text.splitlines():
+        line = re.sub(r'[^\x20-\x7E]', ' ', line)
+        line = re.sub(r'\s+', ' ', line).strip(' -•|')
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    return '\n'.join(lines).strip()
 
 
 def _with_tag(text: str, tag: str, limit: int = 5000) -> str:
@@ -2144,12 +2166,13 @@ def _create_lot(subcategory: int, panel_id: str, service: Dict[str, Any], quanti
         raise LotPublishError('Не удалось прочитать текущие лоты FunPay. Создание отменено до отправки запроса.') from exc
     subcategory_obj = account.get_subcategory(enums.SubCategoryTypes.COMMON, int(subcategory))
     result = None
-    for validation_attempt in range(3):
+    for validation_attempt in range(4):
         try:
+            payload = {k: v for k, v in fields.items() if not k.startswith('_autosmm')}
             try:
-                lot_obj = LotFields(0, dict(fields), subcategory_obj, account.currency)
+                lot_obj = LotFields(0, payload, subcategory_obj, account.currency)
             except TypeError:
-                lot_obj = LotFields(0, dict(fields))
+                lot_obj = LotFields(0, payload)
             result = _fp_call(account.save_lot, lot_obj, attempts=2)
             break
         except Exception as exc:
@@ -2158,6 +2181,20 @@ def _create_lot(subcategory: int, panel_id: str, service: Dict[str, Any], quanti
             if 'много предложений' in error.lower():
                 raise LotPublishError('Достигнут лимит предложений FunPay в этом разделе.', stop_batch=True) from None
             raw_errors = refusal.get('errors', [])
+            en_fields = {str(item[0]) for item in raw_errors if isinstance(item, (list, tuple)) and len(item) >= 2
+                         and str(item[0]) in {'fields[summary][en]', 'fields[name][en]', 'fields[desc][en]'}} \
+                if isinstance(raw_errors, list) else set()
+            if en_fields and not fields.get('_autosmm_plain_en'):
+                # FunPay не принял английский текст — повторяем с простым латинским вариантом.
+                fields['_autosmm_plain_en'] = '1'
+                plain = _plain_english(TAG_RE.sub('', fields.get('fields[desc][en]', ''))).strip()
+                fields['fields[desc][en]'] = (plain + f'\n\n#SMM:{tag}' if tag else plain)
+                summary = _summary_field(_plain_english(fields.get('fields[summary][en]', '')) or 'SMM service', limits['summary_en'])
+                fields['fields[summary][en]'] = summary
+                if 'fields[name][en]' in fields:
+                    fields['fields[name][en]'] = summary
+                warnings.append('FunPay не принял английское описание — использован упрощённый латинский текст.')
+                continue
             long_fields = [item[0] for item in raw_errors if isinstance(item, (list, tuple)) and len(item) >= 2
                            and str(item[0]) in {'fields[summary][ru]', 'fields[summary][en]', 'fields[name][ru]', 'fields[name][en]'}
                            and 'длинн' in str(item[1]).lower()] if isinstance(raw_errors, list) else []
@@ -3741,7 +3778,16 @@ def _restyle_lots(keys: List[str], choice: str, progress: Optional[Callable[[int
             updates = {'fields[summary][ru]': texts['summary_ru'], 'fields[summary][en]': texts['summary_en'],
                        'fields[desc][ru]': texts['desc_ru'], 'fields[desc][en]': texts['desc_en']}
             _apply_lot_updates(fields, updates)
-            _save_lot_fields(fields)
+            try:
+                _save_lot_fields(fields)
+            except Exception as exc:
+                bad = {str(x[0]) for x in (_funpay_rejection(exc).get('errors') or []) if isinstance(x, (list, tuple)) and x}
+                if not bad & {'fields[summary][en]', 'fields[desc][en]', 'fields[name][en]'}:
+                    raise
+                plain = _plain_english(TAG_RE.sub('', texts['desc_en'])) + f'\n\n#SMM:{lot["tag"]}'
+                _apply_lot_updates(fields, {'fields[summary][en]': _summary_field(_plain_english(texts['summary_en']), limits['summary_en']),
+                                            'fields[desc][en]': plain})
+                _save_lot_fields(fields)
             with config_tx() as tx:
                 if key in tx['lot_mapping']:
                     item = tx['lot_mapping'][key]
