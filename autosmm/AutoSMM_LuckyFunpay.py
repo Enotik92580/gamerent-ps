@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - зависит от окружения
     BeautifulSoup = None
 
 NAME = "AutoSMM"
-VERSION = "23.1.0"
+VERSION = "23.1.1"
 DESCRIPTION = "Автоматическая продажа SMM-услуг: автовыгрузка, ручные лоты, автоцена, рефилл"
 CREDITS = "@LuckyFunPay_Support"
 AUTHOR_URL = "https://t.me/LuckyFunPay_Support"
@@ -1598,7 +1598,8 @@ def _variant(service: Dict[str, Any], profile: Dict[str, Any]) -> str:
     words += [p for k, p in _COMPOUND_KINDS + _SIMPLE_KINDS if k == profile['kind']]
     words += [re.escape(x) for x in KINDS.get(profile['kind'], KINDS['generic'])['select'] if len(x) >= 4]
     # Слова из названия типа («бусты канала», «старты бота») не повторяем в варианте.
-    title_stems = [w[:4] for w in re.split(r'[\s/-]+', KINDS.get(profile['kind'], KINDS['generic'])['ru'].lower()) if len(w) >= 4]
+    kinfo = KINDS.get(profile['kind'], KINDS['generic'])
+    title_stems = [w[:4] for w in re.split(r'[\s/-]+', (kinfo['ru'] + ' ' + kinfo['en']).lower()) if len(w) >= 4]
     parts = []
     for chunk in _name_chunks(text):
         tokens = []
@@ -1777,6 +1778,8 @@ def _badges(ctx: Dict[str, Any], english: bool = False) -> List[Tuple[str, int]]
         result.append(('⚡ INSTANT' if english else '⚡ МОМЕНТАЛЬНО', 1))
     if ctx['per_piece_raw'] > 1:
         result.append(((f'{ctx["per_piece"]} PCS PACK' if english else f'ПАКЕТ {ctx["per_piece"]} ШТ'), 6))
+    elif ctx['min_pcs'] > 1:
+        result.append(((f'MIN {ctx["min_pcs"]} PCS' if english else f'ОТ {ctx["min_pcs"]} ШТ'), 6))
     result.append(('AUTO 24/7' if english else 'АВТОВЫДАЧА 24/7', 5))
     return result
 
@@ -4429,6 +4432,7 @@ def r_lots(q: Any) -> None:
              [B('🤖 Автовыгрузка', 'll:auto:0'), B('✋ Ручные', 'll:man:0')],
              [B('❗ Без FunPay ID', 'll:nofp:0'), B('📦 Выгрузки', 'bts')],
              [B('🎨 Переоформить лоты', 'dsr'), B('♻️ Рефилл: массово', 'rfb')],
+             [B('📦 Кол-во за 1 шт. всем лотам', 'lqall')],
              [B('◀️ Назад', 'home')])
     _edit(q, text, kb)
 
@@ -4631,7 +4635,66 @@ def i_lot_edit(message: Any, text: str, data: Dict[str, Any]) -> None:
             item['stock_target'] = value
     _clear(message)
     _show(message.chat.id, '✅ Сохранено.')
+    if field in ('qty', 'svc') and lot.get('funpay_lot_id'):
+        _show(message.chat.id, '⏳ Обновляю цену и описание лота на FunPay под новое количество…')
+        _submit(_refresh_lots_job, message.chat.id, [key])
+        return
     _show(message.chat.id, *scr_lot(key))
+
+
+def _refresh_lots_job(chat_id: int, keys: List[str]) -> None:
+    """После смены количества или услуги: пересчитать цену и пересобрать тексты на FunPay."""
+    cfg = load_config()
+    keys = [k for k in keys if cfg['lot_mapping'].get(k, {}).get('funpay_lot_id')]
+    manual_price = [cfg['lot_mapping'][k]['name'] for k in keys if not cfg['lot_mapping'][k].get('autoprice')]
+    report = _pricing_pass(manual=True, only_keys=set(keys), force_price=True) if _account_ready() else \
+        {'updated': [], 'errors': ['Аккаунт FunPay ещё не загружен.'], 'skipped': [], 'same': 0}
+    done, errors = _restyle_lots(keys, 'keep')
+    lines = [f'✅ Обновлено лотов на FunPay: {done} из {len(keys)}']
+    if report['updated']:
+        lines.append('💰 Цены:\n' + '\n'.join('• ' + escape(x) for x in report['updated'][:15]))
+    if manual_price:
+        lines.append(f'⚠️ У {len(manual_price)} лотов выключена автоцена — цену проверьте вручную (💵 Цена на FunPay).')
+    for item in (report['errors'] + errors)[:10]:
+        lines.append('❌ ' + escape(item))
+    _show(chat_id, '\n\n'.join(lines), _back_kb('lot:' + keys[0] if len(keys) == 1 else 'lots', '◀️ Назад'))
+
+
+@route('lqall')
+def r_lots_qty_all(q: Any) -> None:
+    _ask(q, 'lots_qty', '📦 <b>Количество за 1 шт. для всех лотов</b>\n\nВведите, сколько единиц услуги выдавать за 1 шт. лота '
+                        '(обычно <code>1</code>). Бот поменяет количество у всех лотов, пересчитает цены и обновит описания на FunPay.',
+         back='lots')
+
+
+@inp('lots_qty')
+def i_lots_qty(message: Any, text: str, data: Dict[str, Any]) -> None:
+    value = _int(text)
+    if value <= 0:
+        raise ValueError('Введите число больше нуля.')
+    with config_tx() as tx:
+        keys = [k for k, v in tx['lot_mapping'].items() if v['quantity'] != value]
+        for key in keys:
+            tx['lot_mapping'][key]['quantity'] = value
+    _clear(message)
+    if not keys:
+        _show(message.chat.id, f'ℹ️ У всех лотов уже {value} ед. за 1 шт.', _back_kb('lots', '◀️ Лоты'))
+        return
+    def job(progress: Callable) -> str:
+        cfg = load_config()
+        with_fp = [k for k in keys if cfg['lot_mapping'].get(k, {}).get('funpay_lot_id')]
+        report = _pricing_pass(manual=True, only_keys=set(with_fp), force_price=True)
+        done, errors = _restyle_lots(with_fp, 'keep', progress)
+        manual = sum(1 for k in with_fp if not cfg['lot_mapping'][k].get('autoprice'))
+        text = (f'📦 Количество {value} ед. за 1 шт. установлено у {len(keys)} лотов.\n'
+                f'💰 Цен обновлено: {len(report["updated"])} · 🎨 описаний: {done}')
+        if manual:
+            text += f'\n⚠️ У {manual} лотов выключена автоцена — проверьте их цену вручную.'
+        errs = report['errors'] + errors
+        if errs:
+            text += '\n\nОшибки:\n' + '\n'.join('• ' + escape(x) for x in errs[:10])
+        return text
+    _progress_job(message.chat.id, 'Обновляю количество, цены и описания', job, _back_kb('lots', '◀️ Лоты'))
 
 
 def _bind_funpay_id(chat_id: int, key: str, lot_id: int) -> None:
@@ -5005,9 +5068,9 @@ def r_service_chosen(q: Any, service_id: str) -> None:
 
 
 def _qty_rows(prefix: str, service: Dict[str, Any]) -> List[List[_TelegramButton]]:
-    smin = max(1, _int(service.get('min'), 1))
-    values = sorted({smin, *(x for x in (100, 500, 1000, 5000) if x >= smin and (not _int(service.get('max')) or x <= _int(service.get('max'))))})[:5]
-    return [[B(f'{v}', f'{prefix}:{v}') for v in values]]
+    smin, smax = max(1, _int(service.get('min'), 1)), _int(service.get('max'))
+    values = sorted({1, smin, *(x for x in (100, 1000) if not smax or x <= smax)})[:4]
+    return [[B(('1 шт. = 1 ед.' if v == 1 else f'Пакет {v}'), f'{prefix}:{v}') for v in values]]
 
 
 def _service_chosen(chat_id: int, user_id: int, mode: str, service_id: str) -> None:
@@ -5036,7 +5099,7 @@ def _service_chosen(chat_id: int, user_id: int, mode: str, service_id: str) -> N
         cardinal_instance.telegram.set_state(chat_id, getattr(sent, 'message_id', 0), user_id, 'autosmm:create_node', {})
         return
     sent = _show(chat_id, _service_card(service, wizard['panel']) + '\n\n📦 Сколько единиц услуги заказывать за 1 шт. лота? '
-                 'Введите число или выберите:', _kb(*_qty_rows('nbq', service), [B('❌ Отмена', 'x:new')]))
+                 'Обычно 1 (1 шт. = 1 подписчик). Введите число или выберите:', _kb(*_qty_rows('nbq', service), [B('❌ Отмена', 'x:new')]))
     cardinal_instance.telegram.set_state(chat_id, getattr(sent, 'message_id', 0), user_id, 'autosmm:bind_qty', {})
 
 
@@ -5135,7 +5198,8 @@ def _create_node_set(chat_id: int, user_id: int, node: int) -> None:
         return
     wizard['node'] = node
     service = wizard['service']
-    sent = _show(chat_id, f'🗂 Раздел: {node}\n\n📦 Сколько единиц услуги в 1 шт. лота? (минимум услуги: {service.get("min")})',
+    sent = _show(chat_id, f'🗂 Раздел: {node}\n\n📦 Сколько единиц услуги в 1 шт. лота? Обычно 1 — тогда покупатель просто берёт нужное '
+                 f'количество (минимум услуги: {service.get("min")}).',
                  _kb(*_qty_rows('ncq', service), [B('❌ Отмена', 'x:new')]))
     cardinal_instance.telegram.set_state(chat_id, getattr(sent, 'message_id', 0), user_id, 'autosmm:create_qty', {})
 
@@ -5171,7 +5235,7 @@ def _create_qty_set(chat_id: int, user_id: int, quantity: int) -> None:
     wizard['qty'] = quantity
     cfg = load_config()
     mode, value = _effective_markup(cfg, None)
-    note = '' if quantity >= smin else f'\n⚠️ Меньше минимума услуги ({smin}): покупателю нужно будет брать от {math.ceil(smin / quantity)} шт.'
+    note = '' if quantity >= smin else f'\nℹ️ Покупатель сможет заказать от {math.ceil(smin / quantity)} шт. — это будет указано в лоте.'
     sent = _show(chat_id, f'📦 За 1 шт.: {quantity}{escape(note)}\n\n📈 Наценка: выберите глобальную ({_markup_text(mode, value)}) '
                           'или введите свой процент:', _kb([B(f'🌍 Глобальная ({_markup_text(mode, value)})', 'ncm:g')], [B('❌ Отмена', 'x:new')]))
     cardinal_instance.telegram.set_state(chat_id, getattr(sent, 'message_id', 0), user_id, 'autosmm:create_markup', {})
@@ -5474,12 +5538,13 @@ def r_auto_next(q: Any) -> None:
     if not wizard or not wizard.get('selected'):
         _answer(q, 'Сначала отметьте услуги.', True)
         return
-    _ask(q, 'auto_qty', f'📦 Выбрано услуг: {len(wizard["selected"])}.\n\nСколько единиц услуги выдавать за 1 шт. лота? '
-                        'Если у услуги минимум больше — количество будет поднято до минимума (можно отключить на шаге проверки).\n\n'
-                        'Введите число или нажмите «Минимум каждой услуги».', back='ag:0')
+    _ask(q, 'auto_qty', f'📦 Выбрано услуг: {len(wizard["selected"])}.\n\nСколько единиц услуги выдавать за 1 шт. лота?\n'
+                        '• <b>1</b> — обычная продажа: 1 шт. на FunPay = 1 подписчик/просмотр/лайк. Если у услуги есть минимум, '
+                        'в лоте будет написано «от N шт.».\n• Больше 1 — лот продаётся пакетами.', back='ag:0')
     try:
         bot.edit_message_reply_markup(q.message.chat.id, q.message.message_id,
-                                      reply_markup=_kb([B('📏 Минимум каждой услуги', 'aq:min')], [B('❌ Отмена', 'x:ag:0')]))
+                                      reply_markup=_kb([B('1 шт. = 1 ед. (рекомендуется)', 'aq:1')],
+                                                       [B('📏 Пакет = минимум услуги', 'aq:min')], [B('❌ Отмена', 'x:ag:0')]))
     except Exception:
         pass
 
@@ -5492,7 +5557,7 @@ def i_auto_qty(message: Any, text: str, data: Dict[str, Any]) -> None:
     if not wizard:
         raise ValueError('Мастер устарел.')
     wizard['qty'] = _int(text)
-    wizard.setdefault('adapt', True)
+    wizard.setdefault('adapt', False)
     _clear(message)
     _show(message.chat.id, *scr_auto_section(wizard))
 
@@ -5506,8 +5571,8 @@ def r_auto_qty(q: Any, value: str) -> None:
         cardinal_instance.telegram.clear_state(q.message.chat.id, q.from_user.id, False)
     except Exception:
         pass
-    wizard['qty'] = 0
-    wizard.setdefault('adapt', True)
+    wizard['qty'] = 0 if value == 'min' else max(1, _int(value, 1))
+    wizard.setdefault('adapt', False)
     _edit(q, *scr_auto_section(wizard))
 
 
@@ -5623,12 +5688,8 @@ def _auto_plan(wizard: Dict[str, Any]) -> Dict[str, Any]:
     for service in _auto_selected(wizard):
         smin, smax = max(1, _int(service.get('min'), 1)), _int(service.get('max'))
         qty = wizard['qty'] or smin
-        if qty < smin:
-            if wizard.get('adapt', True):
-                qty = smin
-            else:
-                skipped.append(f'{service["service"]}: минимум услуги {smin} > {qty}')
-                continue
+        if qty < smin and wizard.get('adapt', False):
+            qty = smin  # пакет: 1 шт. лота = минимум услуги
         if smax and qty > smax:
             skipped.append(f'{service["service"]}: максимум услуги {smax} < {qty}')
             continue
@@ -5662,7 +5723,7 @@ def scr_auto_review(wizard: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
             f'Уже выставлены (пропуск дублей): {info["duplicates"]}\nПропущено: {len(info["skipped"])}\n'
             f'Разделы FunPay: {", ".join(map(str, nodes[:8])) or "—"}\n'
             f'За 1 шт.: {wizard["qty"] or "минимум каждой услуги"}'
-            f' · подгонка под минимум: {"ВКЛ" if wizard.get("adapt", True) else "ВЫКЛ"}\n'
+            f' · {"пакет до минимума услуги" if wizard.get("adapt", False) else "без пакетов (покупатель берёт от минимума)"}\n'
             f'Наценка: {_markup_text(mode, value)} · Оформление: {escape(_template_name(cfg, wizard["choice"]))}\n\n'
             '<b>Типы услуг:</b>\n' + '\n'.join(f'• {escape(k)}: {v}' for k, v in sorted(kinds.items())[:20]))
     if info['skipped']:
@@ -5670,7 +5731,7 @@ def scr_auto_review(wizard: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     if wizard.get('selects'):
         text += f'\n\n🧩 Поля раздела заданы вручную: {len(wizard["selects"])}'
     rows = [[B(f'🚀 Создать {len(info["plan"])} лотов', 'ago')] if info['plan'] else None,
-            [B('👁 Пример лота', 'asamp'), B(f'📏 Подгонка: {"ВКЛ" if wizard.get("adapt", True) else "ВЫКЛ"}', 'aadapt')],
+            [B('👁 Пример лота', 'asamp'), B(f'📏 Пакет по минимуму: {"ВКЛ" if wizard.get("adapt", False) else "ВЫКЛ"}', 'aadapt')],
             [B('🧩 Поля раздела', 'fl:auto')] if wizard.get('node_mode') == 'one' else None,
             [B('❌ Отмена', 'home')]]
     return text[:4000], _kb(*rows)
@@ -5681,7 +5742,7 @@ def r_auto_adapt(q: Any) -> None:
     wizard = _wizards.get(q.from_user.id)
     if not wizard:
         return
-    wizard['adapt'] = not wizard.get('adapt', True)
+    wizard['adapt'] = not wizard.get('adapt', False)
     _edit(q, *scr_auto_review(wizard))
 
 
