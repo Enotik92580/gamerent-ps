@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - зависит от окружения
     BeautifulSoup = None
 
 NAME = "AutoSMM"
-VERSION = "23.0.1"
+VERSION = "23.1.0"
 DESCRIPTION = "Автоматическая продажа SMM-услуг: автовыгрузка, ручные лоты, автоцена, рефилл"
 CREDITS = "@LuckyFunPay_Support"
 AUTHOR_URL = "https://t.me/LuckyFunPay_Support"
@@ -241,7 +241,7 @@ _COMPOUND_KINDS = [
     ('premium_followers', r'(premium|премиум)[^|\]]*?(подписч|subscriber|member|follower|участник)|'
                           r'(подписч|subscriber|member|follower|участник)[^|\]]*?(premium|премиум)'),
     ('traffic', r'traffic|трафик|website|визит\w*\s+на\s+сайт|посещен'),
-    ('votes', r'\bpoll|опрос|голосован|\bvotes?\b'),
+    ('votes', r'\bpoll|\bопрос|голосован|\bvotes?\b'),
 ]
 # Простые типы: выбирается слово, которое встречается в названии раньше всех.
 _SIMPLE_KINDS = [
@@ -350,7 +350,7 @@ LEGACY_STYLE_THEME = {'s1': 'premium', 's2': 'neon', 's3': 'classic', 's4': 'inf
 CUSTOM_TEMPLATE_VARS = (
     '{title} {title_en} {platform} {platform_en} {kind} {kind_en} {emoji} {service_name} {clean_name} '
     '{per_piece} {unit} {min_pcs} {max_pcs} {min} {max} {speed} {start} {guarantee} {quality} '
-    '{example_link} {link_hint} {requirements} {price} {service_id} {category} {badges}'
+    '{example_link} {link_hint} {requirements} {price} {service_id} {category} {badges} {variant}'
 )
 
 DEFAULT_DOMAINS = [
@@ -736,6 +736,7 @@ def _default_config() -> Dict[str, Any]:
         'auto_refunds': True, 'confirm_link': True, 'domain_check': True, 'anti_dumping': True, 'min_margin': 0.0,
         'api_timeout': 45, 'poll_interval': 120, 'notification_chat_id': None, 'auto_start': True,
         'notify_new_order': False, 'watcher_enabled': True, 'respect_blacklist': True,
+        'watcher_notify': 'important', 'watcher_threshold': 5.0, 'watcher_autoprice': True,
         'early_complete_minutes': 5, 'link_hint_minutes': 10, 'remind_hours': 6, 'stale_hours': 24,
         'summary_limit': 80, 'description_limit': 5000,
         'proxy': {'mode': 'bot', 'url': ''},
@@ -743,7 +744,7 @@ def _default_config() -> Dict[str, Any]:
         'refill': {'send_moment': 'after_start', 'notify': True, 'auto_enable': False},
         'messages': deepcopy(DEFAULT_MESSAGES), 'message_template_version': 6,
         'paused_buyers': [],
-        'design': {'theme': 'premium', 'custom': {}, 'assign': {}, 'sections': {}, 'english': True},
+        'design': {'theme': 'premium', 'custom': {}, 'assign': {}, 'sections': {}, 'english': True, 'title_source': 'smart'},
         'batches': {},
     }
 
@@ -881,8 +882,11 @@ def _normalize_config(cfg: Any) -> Tuple[Dict[str, Any], bool]:
         cfg['messages']['after_confirmation'] = DEFAULT_MESSAGES['after_confirmation']
     cfg['message_template_version'] = 6
     for key in ('auto_refunds', 'confirm_link', 'domain_check', 'anti_dumping', 'auto_start', 'notify_new_order',
-                'watcher_enabled', 'respect_blacklist'):
+                'watcher_enabled', 'respect_blacklist', 'watcher_autoprice'):
         cfg[key] = bool(cfg.get(key))
+    if cfg.get('watcher_notify') not in ('important', 'all', 'off'):
+        cfg['watcher_notify'] = 'important'
+    cfg['watcher_threshold'] = max(0.0, min(1000.0, _float(cfg.get('watcher_threshold'), 5.0)))
     cfg['poll_interval'] = max(20, min(3600, _int(cfg.get('poll_interval'), 120)))
     cfg['api_timeout'] = max(5, min(180, _int(cfg.get('api_timeout'), 45)))
     cfg['early_complete_minutes'] = max(0, min(1440, _int(cfg.get('early_complete_minutes'), 5)))
@@ -1532,7 +1536,7 @@ def _parse_service(service: Dict[str, Any]) -> Dict[str, Any]:
     elif re.search(r'\binstant\b|моментальн|мгновенн', low):
         info['start'] = 'моментально'
     match = re.search(r'(?:\br(\d{1,3})\b|refill\s*:?\s*(\d{1,3})\s*(?:d|days?|дн\w*)|(\d{1,3})\s*(?:d|days?|дн\w*)\s*refill|'
-                      r'гарант\w*\s*(\d{1,3})\s*(?:д|дн\w*)|(\d{1,3})\s*(?:д|дн\w*)\s*гарант\w*)', low)
+                      r'(?:гарант|рефил)\w*\s*:?\s*(\d{1,3})\s*(?:д|дн\w*)|(\d{1,3})\s*(?:д|дн\w*)\s*(?:гарант|рефил)\w*)', low)
     if match:
         days = _int(next(x for x in match.groups() if x))
         if 0 < days <= 3650:
@@ -1544,7 +1548,8 @@ def _parse_service(service: Dict[str, Any]) -> Dict[str, Any]:
         info['guarantee_days'] = 3650
     elif service.get('refill') in (True, 1, '1', 'true', 'True'):
         info['guarantee'] = 'есть (рефилл)'
-    if re.search(r'no\s*refill|без\s*гарант|без\s*рефилл|nr\b|non[\s-]?drop\s*no', low):
+    info['no_refill'] = bool(re.search(r'no\s*refill|без\s*гарант|без\s*рефил|\bnr\b', low))
+    if info['no_refill'] and not match:
         info['guarantee'], info['guarantee_days'] = '', 0
     match = re.search(r'max\s*:?\s*(\d+(?:[.,]\d+)?\s*[kкmм]?)', low)
     if match:
@@ -1553,15 +1558,95 @@ def _parse_service(service: Dict[str, Any]) -> Dict[str, Any]:
     for pattern, label in ((r'\breal\b|живы|реальн', 'ЖИВЫЕ'), (r'premium|премиум', 'PREMIUM'), (r'\bhq\b|high\s*quality|качествен', 'HQ'),
                            (r'\bru\b|рус|россия|рф\b', 'RU'), (r'снг|\bcis\b', 'СНГ'), (r'\bmix\b|микс', 'MIX'),
                            (r'\busa?\b|сша', 'USA'), (r'non[\s-]?drop|без\s+списан', 'БЕЗ СПИСАНИЙ'), (r'\bbots?\b|бот(ы|ов)\b', 'БОТЫ')):
-        if re.search(pattern, low) and label not in info['quality']:
+        found = re.search(pattern, low)
+        if found and label not in info['quality']:
             info['quality'].append(label)
+            info.setdefault('quality_words', {})[label] = found.group(0)
     text = re.sub(r'\[[^\]]*\bid\b[^\]]*\]|\bid\s*[:#]?\s*\d+|^\s*\d+\s*[-–.|:]\s*', ' ', text, flags=re.I)
     text = _EMOJI_RE.sub(' ', text)
-    text = re.sub(r'\[\s*\]|\(\s*\)|\|\s*\||[|•]+\s*$', ' ', text)
-    text = re.sub(r'\s*[|•]\s*', ' • ', text)
-    text = re.sub(r'\s+', ' ', text).strip(' •-–|:')
-    info['clean_name'] = text or raw.strip() or 'SMM-услуга'
+    info['clean_name'] = ' • '.join(_name_chunks(text)) or raw.strip() or 'SMM-услуга'
     return info
+
+
+def _name_chunks(text: str) -> List[str]:
+    """«Telegram Подписчики [Без гарантии] [Резервные]» → ['Telegram Подписчики', 'Без гарантии', 'Резервные']."""
+    result: List[str] = []
+    for chunk in re.split(r'[\[\]\(\)\|•{}]+|\s[-–—]\s', text):
+        chunk = re.sub(r'\s+', ' ', chunk).strip(' .,;:-–—/\\*#')
+        if len(chunk) >= 2 and not chunk.isdigit() and chunk.lower() not in (x.lower() for x in result):
+            result.append(chunk)
+    return result
+
+
+_STRUCTURAL_RE = [
+    r'(\d+(?:[.,]\d+)?\s*[kкmм]?\s*[-–]\s*)?\d+(?:[.,]\d+)?\s*[kкmм]?\s*(?:/|per|в|за)\s*(?:day|d|сут\w*|день|дн|h|hour|час)\b',
+    r'(?:start|старт)\s*:?\s*(?:[0-9]+\s*[-–]\s*[0-9]+|[0-9]+)?\s*(?:h|hr|hours?|ч|час\w*|min|мин\w*|m)?\b',
+    r'\b(?:max|min|макс|мин)\s*:?\s*\d+(?:[.,]\d+)?\s*[kкmм]?\b', r'\br\d{1,3}\b', r'\bid\s*[:#]?\s*\d+',
+    r'\binstant\b|моментальн\w*|мгновенн\w*', r'\bnr\b',
+]
+_FILLER_RE = r'^(?:на|в|для|for|to|on|услуг\w*|services?|накрутк\w*|smm|new|новинка|best|топ|top)$'
+_LONE_FILLER_RE = r'^(?:post|posts|пост|посты)$'
+
+
+def _variant(service: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    """Чем услуга отличается от других того же типа: «Без гарантии • Резервные».
+    Соцсеть, тип, скорость, старт и лимиты отбрасываются — они уже показаны отдельно."""
+    text = _EMOJI_RE.sub(' ', str(service.get('name') or ''))
+    for pattern in _STRUCTURAL_RE:
+        text = re.sub(pattern, ' ', text, flags=re.I)
+    words = [PLATFORMS.get(profile['platform'], {}).get('pattern', '')]
+    words += [p for k, p in _COMPOUND_KINDS + _SIMPLE_KINDS if k == profile['kind']]
+    words += [re.escape(x) for x in KINDS.get(profile['kind'], KINDS['generic'])['select'] if len(x) >= 4]
+    # Слова из названия типа («бусты канала», «старты бота») не повторяем в варианте.
+    title_stems = [w[:4] for w in re.split(r'[\s/-]+', KINDS.get(profile['kind'], KINDS['generic'])['ru'].lower()) if len(w) >= 4]
+    parts = []
+    for chunk in _name_chunks(text):
+        tokens = []
+        for token in chunk.split():
+            low = token.lower()
+            if any(w and re.search(w, low) for w in words) or re.fullmatch(_FILLER_RE, low) or \
+                    any(low.startswith(stem) for stem in title_stems):
+                continue
+            tokens.append(token)
+        if len(tokens) == 1 and re.fullmatch(_LONE_FILLER_RE, tokens[0].lower()):
+            tokens = []
+        cleaned = ' '.join(tokens).strip(' .,;:-–—/')
+        if len(cleaned) >= 2 and not cleaned.isdigit() and cleaned.lower() not in (x.lower() for x in parts):
+            parts.append(cleaned)
+    if profile['kind'] == 'reactions':
+        # Для реакций эмодзи — это и есть суть услуги (👍❤️🔥), их не выбрасываем.
+        emojis = ''.join(dict.fromkeys(re.findall('[\U0001F300-\U0001FAFF\u2764\u2B50]', str(service.get('name') or ''))))
+        if emojis:
+            parts.insert(0, emojis[:12])
+    return ' • '.join(parts[:4])
+
+
+_EN_PHRASES = [
+    (r'без\s+гарант\w*', 'no refill'), (r'без\s+рефил\w*', 'no refill'), (r'без\s+списан\w*', 'no drop'),
+    (r'гарант\w*', 'refill'), (r'рефил\w*', 'refill'), (r'резервн\w*', 'reserve'), (r'живы\w*', 'real'),
+    (r'реальн\w*', 'real'), (r'быстр\w*', 'fast'), (r'медленн\w*', 'slow'), (r'дешев\w*|дешёв\w*', 'cheap'),
+    (r'премиум\w*', 'premium'), (r'русск\w*|россия\w*|\bрф\b', 'russian'), (r'бот(ы|ов)?\b', 'bots'),
+    (r'смешанн\w*|микс\w*', 'mix'), (r'качествен\w*', 'HQ'), (r'стабильн\w*', 'stable'), (r'нов(ые|ый|ая)\b', 'new'),
+    (r'активн\w*', 'active'), (r'целев\w*', 'targeted'), (r'мужск\w*', 'male'), (r'женск\w*', 'female'),
+    (r'офферн\w*|оффер\w*', 'offer'), (r'медиа\w*', 'media'), (r'аудитори\w*', 'audience'), (r'снг', 'CIS'),
+    (r'последн\w*', 'latest'), (r'будущ\w*', 'future'), (r'пост\b', 'post'), (r'пост(ов|а|ы)\b', 'posts'), (r'публикаци\w*', 'post'),
+    (r'позитивн\w*', 'positive'), (r'негативн\w*', 'negative'), (r'аккаунт\w*', 'accounts'), (r'просмотр\w*', 'views'),
+    (r'подписчик\w*', 'followers'), (r'реакци\w*', 'reactions'), (r'лайк\w*', 'likes'), (r'комментари\w*', 'comments'),
+    (r'участник\w*', 'members'), (r'репост\w*', 'shares'), (r'канал\w*', 'channel'), (r'чат\w*', 'chat'),
+    (r'групп\w*', 'group'), (r'видео', 'video'), (r'сторис', 'stories'), (r'эфир\w*', 'live'), (r'автопросмотр\w*', 'auto views'),
+    (r'удержани\w*', 'retention'), (r'миров\w*', 'worldwide'), (r'онлайн\w*', 'online'), (r'час(ы|ов)\b', 'hours'),
+    (r'бот(а|у)\b', 'bot'), (r'зарубежн\w*', 'foreign'), (r'иностранн\w*', 'foreign'), (r'мгновенн\w*', 'instant'),
+    (r'моментальн\w*', 'instant'), (r'ручн\w*', 'manual'), (r'авто\w*', 'auto'), (r'дешёв\w*', 'cheap'),
+    (r'\bдн(я|ей|и)?\b|\bдень\b', 'days'), (r'\bчас(а|ов)?\b|\bч\b', 'h'), (r'\bмин\w*', 'min'),
+    (r'\bи\b', '&'), (r'\bс\b', 'with'), (r'\bот\b', 'from'), (r'\bдо\b', 'up to'),
+]
+
+
+def _en_phrase(text: str) -> str:
+    result = str(text or '')
+    for pattern, en in _EN_PHRASES:
+        result = re.sub(pattern, en, result, flags=re.I)
+    return _translit(result) if re.search('[а-яё]', result, re.I) else result
 
 
 def _service_profile(service: Dict[str, Any]) -> Dict[str, Any]:
@@ -1632,6 +1717,11 @@ def _design_context(service: Dict[str, Any], quantity: int, price: float = 0.0, 
         title_en = f"{pinfo['short'] if platform not in ('vk', 'ok', 'dzen', 'yamusic', 'website') else _translit(pinfo['short'])} {kinfo['en']}".strip()
     if platform == 'website':
         title_ru, title_en = kinfo['ru'] if kind == 'traffic' else title_ru, 'WEBSITE TRAFFIC' if kind == 'traffic' else title_en
+    variant = _variant(service, profile)
+    if cfg['design'].get('title_source') == 'panel':
+        title_ru = _short(profile['clean_name'], 70)
+        title_en = _short(_en_phrase(profile['clean_name']), 70)
+        variant = ''
     unit = _plural(quantity, kinfo['unit'])
     unit_en = _plural_en(quantity, kinfo['unit_en'])
     return {
@@ -1643,7 +1733,8 @@ def _design_context(service: Dict[str, Any], quantity: int, price: float = 0.0, 
         'min_pcs': min_pcs, 'max_pcs': max_pcs, 'min': _human_number(service.get('min', '1')), 'max': _human_number(service.get('max', '—')),
         'speed': profile['speed'], 'start': profile['start'], 'guarantee': profile['guarantee'],
         'guarantee_days': profile['guarantee_days'], 'quality': ', '.join(profile['quality']),
-        'quality_list': profile['quality'],
+        'quality_list': profile['quality'], 'quality_words': profile.get('quality_words', {}),
+        'no_refill': profile.get('no_refill', False), 'variant': variant, 'variant_en': _en_phrase(variant),
         'example_link': _example_link(platform, kind), 'link_hint': TARGET_TEXT.get(target, TARGET_TEXT['post'])[0],
         'link_hint_en': TARGET_TEXT.get(target, TARGET_TEXT['post'])[1],
         'requirements': '\n'.join('• ' + x for x in notes_ru), 'requirements_en': '\n'.join('• ' + x for x in notes_en),
@@ -1657,13 +1748,23 @@ def _design_context(service: Dict[str, Any], quantity: int, price: float = 0.0, 
 def _badges(ctx: Dict[str, Any], english: bool = False) -> List[Tuple[str, int]]:
     """(текст, приоритет). Чем больше приоритет, тем дольше значок остаётся в названии."""
     result: List[Tuple[str, int]] = []
-    quality = [x for x in ctx['quality_list'] if x != 'БОТЫ'][:2]
+    variant = ctx.get('variant') or ''
+    low = variant.lower()
+    if variant:
+        result.append(((ctx['variant_en'] if english else variant).upper(), 7))
+    quality = [x for x in ctx['quality_list'] if x != 'БОТЫ' and x.lower() not in ctx['title'].lower() and
+               not (low and str(ctx['quality_words'].get(x, '')).lower() in low)][:2]
     if quality:
         text = ' '.join(quality)
         if english:
             text = _en_text(text)
         result.append((text, 3))
-    if ctx['guarantee_days']:
+    shown = bool(re.search(r'гарант|рефил|refill|guarantee|warranty', low))
+    if ctx.get('no_refill') and not shown and not ctx['guarantee_days']:
+        result.append(('⛔ NO REFILL' if english else '⛔ БЕЗ ГАРАНТИИ', 4))
+    elif shown:
+        pass
+    elif ctx['guarantee_days']:
         days = ctx['guarantee_days']
         text = (f'♻️ {"LIFETIME" if days >= 3650 else str(days) + "D"} REFILL' if english else
                 f'♻️ ГАРАНТИЯ {"НАВСЕГДА" if days >= 3650 else str(days) + " ДН"}')
@@ -1688,6 +1789,15 @@ def _compose_summary(theme: Dict[str, Any], title: str, badges: List[Tuple[str, 
         text = re.sub(r'\s+', ' ', text).strip(' •|✦✔')
         if _utf16_len(text) <= limit or not items:
             break
+        if len(items) == 1 and items[0][1] >= 7:
+            # Остался только вариант услуги — укорачиваем его, но не убираем.
+            base = _format(theme['summary'], {'title': title, 'badges': ''})
+            room = limit - _utf16_len(re.sub(r'\s+', ' ', base).strip(' •|✦✔')) - 1
+            if room >= 6:
+                short = _summary_field(items[0][0], room)
+                text = re.sub(r'\s+', ' ', _format(theme['summary'], {'title': title, 'badges': short})).strip(' •|✦✔')
+                if _utf16_len(text) <= limit:
+                    return text
         items.remove(min(items, key=lambda x: x[1]))
     if _utf16_len(text) > limit:
         text = _summary_field(_format(theme['summary'], {'title': title, 'badges': ''}).strip(' •|✦✔'), limit)
@@ -1714,8 +1824,8 @@ def _theme_description(theme: Dict[str, Any], ctx: Dict[str, Any], english: bool
     if english:
         lines.append(f"{b} 1 pc = {ctx['per_piece']} {ctx['unit_en']}")
         if ctx['clean_name']:
-            name = ctx['clean_name'] if not re.search('[а-яё]', ctx['clean_name'], re.I) else ctx['title_en'].title()
-            lines.append(f"{b} 🧾 Service: {name}")
+            lines.append(f"{b} 🧾 Service: {_en_phrase(ctx['clean_name'])}")
+
         if ctx['start']:
             lines.append(f"{b} 🚀 Start: {_en_text(ctx['start'])}")
         if ctx['speed']:
@@ -1731,6 +1841,7 @@ def _theme_description(theme: Dict[str, Any], ctx: Dict[str, Any], english: bool
         lines.append(f"{b} 1 шт. = {ctx['per_piece']} {ctx['unit']}")
         if ctx['clean_name']:
             lines.append(f"{b} 🧾 Услуга: {ctx['clean_name']}")
+
         if ctx['start']:
             lines.append(f"{b} 🚀 Старт: {ctx['start']}")
         if ctx['speed']:
@@ -1804,7 +1915,7 @@ def render_lot_texts(service: Dict[str, Any], quantity: int, price: float, choic
         values = {**ctx, 'badges': ' • '.join(text for text, _ in _badges(ctx))}
         summary_ru = _summary_field(_format(custom.get('summary_ru') or '{title}', values), s_ru)
         desc_ru = _format(custom.get('desc_ru') or '', values).strip() or _theme_description(theme, ctx, False)
-        values_en = {**values, 'badges': ' • '.join(text for text, _ in _badges(ctx, True)),
+        values_en = {**values, 'badges': ' • '.join(text for text, _ in _badges(ctx, True)), 'variant': ctx['variant_en'],
                      'requirements': ctx['requirements_en'], 'link_hint': ctx['link_hint_en']}
         summary_en = _summary_field(_format(custom.get('summary_en') or '', values_en), s_en) if custom.get('summary_en') else \
             _compose_summary(theme, ctx['title_en'], _badges(ctx, True), s_en)
@@ -3423,7 +3534,8 @@ def _lot_price_info(cfg: Dict[str, Any], lot: Dict[str, Any], api: Optional[Pane
             'cost_native': native, 'mode': mode, 'value': value, 'price': price}
 
 
-def _pricing_pass(force: bool = False, manual: bool = False) -> Dict[str, Any]:
+def _pricing_pass(force: bool = False, manual: bool = False, only_keys: Optional[set] = None,
+                  force_price: bool = False) -> Dict[str, Any]:
     cfg = load_config()
     report = {'updated': [], 'same': 0, 'skipped': [], 'errors': [], 'stock': 0}
     if not _account_ready():
@@ -3432,13 +3544,15 @@ def _pricing_pass(force: bool = False, manual: bool = False) -> Dict[str, Any]:
     full = force or time.time() - _float(_state_get('last_full_sync', 0)) > 6 * 3600
     apis: Dict[str, PanelAPI] = {}
     for key, lot in cfg['lot_mapping'].items():
+        if only_keys is not None and key not in only_keys:
+            continue
         label = _short(lot['name'], 40)
         if not lot.get('funpay_lot_id'):
             if lot.get('autoprice') and cfg['pricing']['enabled']:
                 report['skipped'].append(f'{label}: не привязан FunPay ID')
             continue
-        want_price = cfg['pricing']['enabled'] and lot.get('autoprice')
-        want_stock = full and lot.get('stock_target')
+        want_price = (cfg['pricing']['enabled'] or force_price) and lot.get('autoprice')
+        want_stock = full and lot.get('stock_target') and only_keys is None
         if not want_price and not want_stock:
             continue
         try:
@@ -3479,7 +3593,7 @@ def _pricing_pass(force: bool = False, manual: bool = False) -> Dict[str, Any]:
                         tx['lot_mapping'][key]['last_price'] = new_price
         except Exception as exc:
             report['errors'].append(f'{label}: {_rejection_text(exc, cfg)}')
-    if full:
+    if full and only_keys is None:
         _state_set('last_full_sync', time.time())
     if not manual and cfg['pricing'].get('notify') and (report['updated'] or report['errors']):
         _notify_admins(_pricing_report_text(report))
@@ -3562,7 +3676,13 @@ def _restore_lots(lot_ids: List[int], cfg: Dict[str, Any]) -> int:
 # Вотчер изменений услуг у провайдера
 # ---------------------------------------------------------------------------
 
+WATCH_MODES = ['important', 'all', 'off']
+WATCH_MODE_LABELS = {'important': 'только важные', 'all': 'все', 'off': 'выключены'}
+
+
 def _watcher_pass() -> None:
+    """Сверяет используемые услуги с каталогом провайдера.
+    Цена изменилась — цены лотов пересчитываются сразу; уведомление — одно на проверку."""
     cfg = load_config()
     if not cfg.get('watcher_enabled'):
         return
@@ -3571,6 +3691,9 @@ def _watcher_pass() -> None:
         used.setdefault(str(lot['panel_id']), set()).add(str(lot['service_id']))
     snapshots = _state_get('watch', {}) or {}
     missing = _state_get('watch_missing', {}) or {}
+    threshold = max(0.0, _float(cfg.get('watcher_threshold'), 5.0))
+    events: List[Dict[str, Any]] = []
+    reprice: set = set()
     for panel_id, service_ids in used.items():
         try:
             api = PanelAPI(cfg, panel_id)
@@ -3580,12 +3703,13 @@ def _watcher_pass() -> None:
         panel_snap = snapshots.setdefault(panel_id, {})
         for service_id in service_ids:
             key = f'{panel_id}:{service_id}'
-            lots = [x for x in cfg['lot_mapping'].values() if str(x['panel_id']) == panel_id and str(x['service_id']) == service_id]
+            lots = [(k, x) for k, x in cfg['lot_mapping'].items() if str(x['panel_id']) == panel_id and str(x['service_id']) == service_id]
             service = catalog.get(service_id)
             if not service:
                 if service_id in panel_snap and not missing.get(key):
                     missing[key] = time.time()
-                    _watch_alert(cfg, panel_id, service_id, lots, ['Услуга пропала из каталога провайдера'])
+                    events.append({'panel': panel_id, 'service': service_id, 'lots': lots, 'important': True,
+                                   'changes': ['Услуга пропала из каталога провайдера']})
                 continue
             missing.pop(key, None)
             current = {'rate': _float(service.get('rate')), 'name': str(service.get('name') or ''),
@@ -3594,31 +3718,64 @@ def _watcher_pass() -> None:
             panel_snap[service_id] = current
             if not old:
                 continue
-            changes = []
+            changes, important = [], False
             if abs(old['rate'] - current['rate']) > 1e-9:
-                changes.append(f'Цена за 1000: {old["rate"]:g} → {current["rate"]:g}')
+                pct = (current['rate'] - old['rate']) / max(old['rate'], 1e-9) * 100
+                changes.append(f'Цена за 1000: {old["rate"]:g} → {current["rate"]:g} ({pct:+.2f}%)')
+                important = important or abs(pct) >= threshold
+                if cfg.get('watcher_autoprice', True):
+                    reprice.update(k for k, x in lots if x.get('autoprice') and x.get('funpay_lot_id'))
             if old['name'] != current['name']:
                 changes.append(f'Название: «{_short(old["name"], 60)}» → «{_short(current["name"], 60)}»')
+                important = True
             if old['min'] != current['min']:
                 changes.append(f'Минимум: {old["min"]} → {current["min"]}')
+                important = True
             if old['max'] != current['max']:
                 changes.append(f'Максимум: {old["max"]} → {current["max"]}')
+                important = True
             if changes:
-                _watch_alert(cfg, panel_id, service_id, lots, changes)
+                events.append({'panel': panel_id, 'service': service_id, 'lots': lots, 'important': important, 'changes': changes})
     _state_set('watch', snapshots)
     _state_set('watch_missing', missing)
+    report = None
+    if reprice and _account_ready():
+        report = _pricing_pass(manual=True, only_keys=reprice, force_price=True)
+    mode = cfg.get('watcher_notify', 'important')
+    shown = [] if mode == 'off' else [e for e in events if mode == 'all' or e['important']]
+    if shown:
+        _watch_alert(cfg, shown, report)
+    elif report and report['errors']:
+        logger.warning('[AutoSMM] Watcher reprice errors: %s', '; '.join(report['errors'][:5]))
 
 
-def _watch_alert(cfg: Dict[str, Any], panel_id: str, service_id: str, lots: List[Dict[str, Any]], changes: List[str]) -> None:
-    panel = cfg['services'].get(panel_id, {})
-    lot_lines = '\n'.join('• ' + escape(_short(x['name'], 60)) for x in lots[:10])
-    text = (f'⚠️ <b>AutoSMM: провайдер изменил услугу</b>\nПанель: {escape(panel.get("name", panel_id))}\n'
-            f'Услуга: <code>{escape(service_id)}</code>\n\n' + '\n'.join('• ' + escape(x) for x in changes) +
-            f'\n\nЛоты ({len(lots)}):\n{lot_lines}')
+def _watch_alert(cfg: Dict[str, Any], events: List[Dict[str, Any]], report: Optional[Dict[str, Any]] = None) -> None:
+    parts = [f'⚠️ <b>AutoSMM: провайдер изменил услуги ({len(events)})</b>']
+    for event in events[:15]:
+        panel = cfg['services'].get(event['panel'], {})
+        lots = ', '.join(escape(_short(x['name'], 45)) for _, x in event['lots'][:3])
+        more = f' и ещё {len(event["lots"]) - 3}' if len(event['lots']) > 3 else ''
+        parts.append(f'\n<b>{escape(panel.get("name", event["panel"]))}</b> · услуга <code>{escape(event["service"])}</code>\n'
+                     + '\n'.join('• ' + escape(x) for x in event['changes']) + f'\nЛоты: {lots}{more}')
+    if len(events) > 15:
+        parts.append(f'\n… и ещё {len(events) - 15} услуг')
+    if report is not None:
+        if report['updated']:
+            parts.append('\n💰 <b>Цены лотов обновлены автоматически:</b>\n' + '\n'.join('• ' + escape(x) for x in report['updated'][:10]))
+        elif cfg.get('watcher_autoprice', True):
+            parts.append('\n💰 Цены лотов пересчитаны — изменение слишком мало, на FunPay цены оставлены.')
+        if report['errors']:
+            parts.append('\n❌ Ошибки пересчёта:\n' + '\n'.join('• ' + escape(x) for x in report['errors'][:5]))
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton(f'🔴 Выключить лоты по этой услуге ({len(lots)})', callback_data=f'wdis:{panel_id}:{service_id}'),
-           InlineKeyboardButton('✅ Ок, ничего не делать', callback_data='wok'))
-    _notify_admins(text, kb, html=True)
+    for event in [e for e in events if e['important']][:4]:
+        count = sum(1 for _, x in event['lots'] if x.get('funpay_lot_id'))
+        if count:
+            kb.add(InlineKeyboardButton(f'🔴 Выключить лоты услуги {event["service"]} ({count})',
+                                        callback_data=f'wdis:{event["panel"]}:{event["service"]}'))
+    mode = cfg.get('watcher_notify', 'important')
+    kb.row(*([InlineKeyboardButton('🔕 Только важные', callback_data='wnot:important')] if mode == 'all' else []),
+           InlineKeyboardButton('🔇 Выключить', callback_data='wnot:off'), InlineKeyboardButton('✅ Ок', callback_data='wok'))
+    _notify_admins('\n'.join(parts)[:4000], kb, html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -6190,13 +6347,23 @@ def r_design(q: Any) -> None:
     d = cfg['design']
     text = (f'🎨 <b>Оформление лотов</b>\n\nТема по умолчанию: <b>{escape(_template_name(cfg, d["theme"]))}</b>\n'
             f'Свои шаблоны: {len(d["custom"])} · Назначений: {len(d["assign"])} · Разделов в карте: {len(d["sections"])}\n'
-            f'Английская версия: {"полноценная" if d.get("english", True) else "транслит"}\n\n'
+            f'Английская версия: {"полноценная" if d.get("english", True) else "транслит"}\n'
+            f'Название лота: {"тип + соцсеть + вариант услуги" if d.get("title_source") != "panel" else "название услуги из панели"}\n\n'
             'Порядок выбора оформления: шаблон лота → назначение «соцсеть + тип» → «соцсеть» → «тип» → тема по умолчанию.')
     kb = _kb([B('🎨 Тема по умолчанию', 'dsth'), B('👁 Предпросмотр', 'dsp')],
              [B('🧩 Свои шаблоны', 'dsc'), B('📌 Назначения', 'dsa')],
              [B('🗺 Карта разделов FunPay', 'dsm'), B('🔄 Переоформить лоты', 'dsr')],
+             [B(f'🏷 Название: {"тип + вариант" if d.get("title_source") != "panel" else "как в панели"}', 'dstn')],
              [B(f'🇬🇧 EN: {"перевод" if d.get("english", True) else "транслит"}', 'dse'), B('◀️ Назад', 'home')])
     _edit(q, text, kb)
+
+
+@route('dstn')
+def r_design_title_source(q: Any) -> None:
+    with config_tx() as tx:
+        tx['design']['title_source'] = 'panel' if tx['design'].get('title_source') != 'panel' else 'smart'
+    _answer(q, 'Новое название применится к новым лотам. Уже выставленные — через «🔄 Переоформить лоты».', True)
+    r_design(q)
 
 
 @route('dse')
@@ -6700,12 +6867,14 @@ def r_refill_select_page(q: Any, page: str, value: str) -> None:
 
 SETTING_TOGGLES = [('auto_refunds', 'Автовозврат'), ('confirm_link', 'Подтверждение ссылки'), ('domain_check', 'Проверка доменов'),
                    ('anti_dumping', 'Антидемпинг'), ('auto_start', 'Автозапуск'), ('notify_new_order', 'Увед. о новом заказе'),
-                   ('watcher_enabled', 'Вотчер услуг'), ('respect_blacklist', 'Чёрный список бота')]
+                   ('watcher_enabled', 'Вотчер услуг'), ('respect_blacklist', 'Чёрный список бота'),
+                   ('watcher_autoprice', 'Цена за провайдером')]
 SETTING_VALUES = {'min_margin': ('Мин. прибыль (₽)', 'float'), 'poll_interval': ('Проверка статусов (сек)', 'int'),
                   'early_complete_minutes': ("Защита от раннего 'выполнено' (мин)", 'int'), 'api_timeout': ('Таймаут API (сек)', 'int'),
                   'remind_hours': ('Напоминание о ссылке (ч, 0 — выкл)', 'int'), 'stale_hours': ('Сообщить мне о заказе без ссылки (ч)', 'int'),
-                  'notification_chat_id': ('Чат уведомлений (ID, 0 — админы)', 'int')}
-SETTING_LIMITS = {'poll_interval': (20, 3600), 'early_complete_minutes': (0, 1440), 'api_timeout': (5, 180), 'remind_hours': (0, 720),
+                  'notification_chat_id': ('Чат уведомлений (ID, 0 — админы)', 'int'),
+                  'watcher_threshold': ('Вотчер: важное изменение цены от (%)', 'float')}
+SETTING_LIMITS = {'watcher_threshold': (0, 1000), 'poll_interval': (20, 3600), 'early_complete_minutes': (0, 1440), 'api_timeout': (5, 180), 'remind_hours': (0, 720),
                   'stale_hours': (0, 720)}
 
 
@@ -6714,10 +6883,13 @@ def r_settings(q: Any) -> None:
     cfg = load_config()
     lines = ['⚙️ <b>Настройки</b>', '']
     lines += [f'{_on(cfg[k])} {label}' for k, label in SETTING_TOGGLES]
+    lines.append(f'👁 Уведомления вотчера: {WATCH_MODE_LABELS[cfg["watcher_notify"]]}')
+    lines.append('<i>«Цена за провайдером» — при изменении цены услуги у провайдера цены лотов с ней пересчитываются сразу.</i>')
     lines.append('')
     lines += [f'• {label}: <code>{escape(str(cfg.get(k) if cfg.get(k) is not None else "—"))}</code>' for k, (label, _) in SETTING_VALUES.items()]
     rows = [[B(f'{_on(cfg[k])} {label}', f'stt:{k}') for k, label in SETTING_TOGGLES[i:i + 2]] for i in range(0, len(SETTING_TOGGLES), 2)]
     rows += [[B('✏️ ' + label, f'ste:{k}')] for k, (label, _) in SETTING_VALUES.items()]
+    rows.append([B(f'👁 Уведомления вотчера: {WATCH_MODE_LABELS[cfg["watcher_notify"]]}', 'wnm')])
     rows.append([B(f'⏸ На паузе (/stop): {len(cfg["paused_buyers"])}', 'stp'), B('💾 Бэкап сейчас', 'stb')])
     rows.append([B('◀️ Назад', 'home')])
     _edit(q, '\n'.join(lines), _kb(*rows))
@@ -6757,6 +6929,27 @@ def i_setting_edit(message: Any, text: str, data: Dict[str, Any]) -> None:
         tx[key] = value
     _clear(message)
     _show(message.chat.id, '✅ Сохранено.', _back_kb('st', '◀️ К настройкам'))
+
+
+@route('wnm')
+def r_watch_mode(q: Any) -> None:
+    with config_tx() as tx:
+        tx['watcher_notify'] = WATCH_MODES[(WATCH_MODES.index(tx['watcher_notify']) + 1) % len(WATCH_MODES)]
+    r_settings(q)
+
+
+@route('wnot')
+def r_watch_notify(q: Any, mode: str) -> None:
+    if mode not in WATCH_MODES:
+        return
+    with config_tx() as tx:
+        tx['watcher_notify'] = mode
+    _answer(q, '🔇 Уведомления вотчера выключены. Цены лотов продолжат обновляться сами. Включить: ⚙️ Настройки.'
+            if mode == 'off' else '🔕 Теперь только важные изменения (цена от порога, название, лимиты, пропажа услуги).', True)
+    try:
+        bot.edit_message_reply_markup(q.message.chat.id, q.message.message_id, reply_markup=None)
+    except Exception:
+        pass
 
 
 @route('stp')
