@@ -1,4 +1,4 @@
-# AppRoute Shop (Auto) 1.0.1 — плагин для FunPay Cardinal
+# AppRoute Shop (Auto) 1.0.2 — плагин для FunPay Cardinal
 
 Автопродажа готовых цифровых товаров магазина AppRoute (approute.ru / approute.io): подарочные карты и ваучеры,
 коды пополнения, ключи активации и туристические eSIM. После оплаты на FunPay бот покупает номинал у поставщика
@@ -8,6 +8,12 @@
 Автор: [@LuckyFunPay_Support](https://t.me/LuckyFunPay_Support) · канал [@LuckyFunPay](https://t.me/LuckyFunPay)
 
 Файл для установки: `AppRoute_LuckyFunpay.py`. Вся инструкция есть и в самом плагине: кнопка «📖 Инструкция» в панели.
+
+## 1.0.2
+
+- Исправлено: «no such column: state» при запуске. В папке `storage/plugins/approute_shop/` уже была база
+  другого плагина. Теперь плагин хранит данные в своей папке `storage/plugins/approute_shop_lucky/`.
+  Если в базе старый формат таблицы, недостающие колонки добавляются автоматически.
 
 ## 1.0.1
 
@@ -93,7 +99,7 @@
 
 ## Данные
 
-`storage/plugins/approute_shop/shop.sqlite3` — настройки, лоты, каталог и журнал заказов. Не удаляйте эту папку,
+`storage/plugins/approute_shop_lucky/shop.sqlite3` — настройки, лоты, каталог и журнал заказов. Не удаляйте эту папку,
 пока есть незавершённые покупки: журнал защищает от повторных списаний.
 
 ## Проверка

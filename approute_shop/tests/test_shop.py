@@ -522,3 +522,26 @@ def test_search_ranks_and_translates():
     assert found[0][1]["id"] == "a"
     assert P.search_items(products, "playstation турция")[0][1]["id"] == "c"
     assert P.search_items(products, "zzzz") == []
+
+
+def test_old_table_layout_is_upgraded(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.sqlite3"
+    db = sqlite3.connect(str(path))
+    db.execute("CREATE TABLE records (kind TEXT, id TEXT, data TEXT NOT NULL, PRIMARY KEY(kind,id))")
+    db.execute("INSERT INTO records VALUES ('order', 'A1', '{\"id\": \"A1\", \"state\": \"queued\", \"created\": 1}')")
+    db.commit()
+    db.close()
+    store = P.Store(path)
+    assert [r["id"] for r in store.orders_in({"queued"})] == ["A1"]
+
+
+def test_foreign_table_is_reported(tmp_path):
+    import sqlite3
+    path = tmp_path / "foreign.sqlite3"
+    db = sqlite3.connect(str(path))
+    db.execute("CREATE TABLE records (name TEXT)")
+    db.commit()
+    db.close()
+    with pytest.raises(P.ShopError):
+        P.Store(path)

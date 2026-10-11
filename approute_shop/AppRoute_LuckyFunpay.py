@@ -23,7 +23,7 @@
  7. Включите «🔄 Автообновление» цен, при желании измените «✉️ Шаблон выдачи».
  8. В главном меню нажмите «Статус», чтобы индикатор стал 🟢.
 
-Данные: storage/plugins/approute_shop/shop.sqlite3. Не удаляйте эту папку при
+Данные: storage/plugins/approute_shop_lucky/shop.sqlite3. Не удаляйте эту папку при
 незавершённых заказах: там журнал покупок, защищающий от повторных списаний.
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 NAME = "AppRoute Shop (Auto)"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Автопродажа кодов, гифт-карт и eSIM из магазина AppRoute • /approute_shop"
 CREDITS = "@LuckyFunPay_Support"
 UUID = "d1eb44d6-c72b-48ed-8ee3-c5ca58ea9413"
@@ -59,7 +59,8 @@ SUPPORT_URL = "https://t.me/LuckyFunPay_Support"
 PREFIX = "arshop:"
 COMMAND = "approute_shop"
 CANCEL_COMMAND = "shop_cancel"
-STORAGE = Path("storage/plugins/approute_shop")
+# Own folder: storage/plugins/approute_shop may hold another plugin's database with a different layout.
+STORAGE = Path("storage/plugins/approute_shop_lucky")
 LOG = logging.getLogger("FPC.AppRouteShop")
 
 # AppRoute order type for prepaid goods (vouchers, keys, eSIM). Direct top-up uses "dtu".
@@ -409,6 +410,23 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS records (kind TEXT, id TEXT, data TEXT NOT NULL, state TEXT,"
                         " due REAL, chat TEXT, outbox INTEGER, PRIMARY KEY(kind,id))")
+        # A table created by an older layout lacks the indexed columns: add and fill them.
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(records)")}
+        if not {"kind", "id", "data"} <= columns:
+            raise ShopError(f"Файл {path} занят базой другого плагина. Удалите или переименуйте его и перезапустите бота.")
+        missing = [(n, t) for n, t in (("state", "TEXT"), ("due", "REAL"), ("chat", "TEXT"), ("outbox", "INTEGER"))
+                   if n not in columns]
+        for name, kind in missing:
+            self.db.execute(f"ALTER TABLE records ADD COLUMN {name} {kind}")
+        if missing:
+            for kind, key, data in self.db.execute("SELECT kind, id, data FROM records").fetchall():
+                try:
+                    value = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    self.db.execute("UPDATE records SET state=?, due=?, chat=?, outbox=? WHERE kind=? AND id=?",
+                                    (*self.columns(kind, value), kind, key))
         self.db.execute("CREATE INDEX IF NOT EXISTS records_state ON records(kind, state)")
         self.db.execute("CREATE INDEX IF NOT EXISTS records_chat ON records(kind, chat)")
         self.db.execute("CREATE INDEX IF NOT EXISTS records_due ON records(kind, due)")
