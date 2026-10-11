@@ -1,1799 +1,1063 @@
-"""Auto VIP Roblox v16 for FunPay Cardinal, Python 3.10+.
-Strict offer identity, transactional stock, durable delivery and refund queues.
-Unconfirmed Roblox cleanup quarantines a server instead of selling it again.
-See README.md for migration and the FunPayAPI offer-ID compatibility boundary.
+"""Auto VIP Roblox v17 для FunPay Cardinal.
+
+Автоматическая сдача VIP-серверов Roblox в аренду на FunPay:
+автовыдача ссылки после оплаты, таймер аренды, выключение сервера и сброс
+ссылки по окончании, пулы и категории серверов, несколько аренд у одного
+покупателя, друзья и платное добавление в друзья, бонусы, два режима цен.
+Вся настройка — в Telegram: /vip_config.
 """
 from __future__ import annotations
 
 import html
-import json
 import logging
 import math
-from contextlib import contextmanager
-from urllib.parse import urlsplit, quote
-from types import SimpleNamespace
 import os
+import queue
+import random
 import re
 import sqlite3
+import string
 import threading
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from string import Formatter
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
-from telebot.types import CallbackQuery, InlineKeyboardButton as Button
-from telebot.types import InlineKeyboardMarkup as Keyboard, Message
-
-from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
-
-try:  # Present in current FPC; the fallback keeps the plugin loadable on old builds.
-    from FunPayAPI.common.enums import MessageTypes
-except Exception:  # pragma: no cover - compatibility branch
-    MessageTypes = None
 
 try:
-    from tg_bot import CBT, utils as tg_utils
-    from tg_bot.static_keyboards import CLEAR_STATE_BTN
-except Exception:  # pragma: no cover - only used while Cardinal itself is broken
+    from telebot.types import InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard
+except Exception:  # pragma: no cover - Cardinal всегда содержит pyTelegramBotAPI
+    Button = Keyboard = None
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover - bs4 входит в зависимости FunPayAPI
+    BeautifulSoup = None
+
+try:
+    from tg_bot import CBT
+except Exception:  # pragma: no cover
     CBT = None
-    tg_utils = None
-    CLEAR_STATE_BTN = lambda: None
+
+try:
+    from FunPayAPI.common.enums import OrderStatuses
+except Exception:  # pragma: no cover
+    OrderStatuses = None
 
 
 NAME = "Auto VIP Roblox"
-VERSION = "16.2.0"
+VERSION = "17.0.0"
 DESCRIPTION = (
-    "Безопасная аренда Roblox VIP: серверы привязаны к аккаунтам, выдача "
-    "атомарна, очистка повторяется до успеха, цены и лоты синхронизируются с FunPay. "
-    "Админ-панель не пересекается с другими плагинами Cardinal."
+    "Автоматическая аренда VIP-серверов Roblox на FunPay: выдача ссылки после оплаты, "
+    "таймер, выключение сервера и сброс ссылки по окончании, категории серверов, "
+    "друзья и платное добавление, бонусы, режимы цен. Панель: /vip_config."
 )
 CREDITS = "@LuckyFunPay_Support"
-AUTHOR_URL = "https://t.me/LuckyFunPay_Support"
-DEVELOPER_URL = "https://t.me/LuckyFunPay"
 UUID = "dbd0fc30-4033-4afc-8e36-0edcaa517466"
-SETTINGS_PAGE = False
+SETTINGS_PAGE = True
 
-PREFIX = "avr15"
-STATE_PREFIX = f"{PREFIX}_state_"
-# Keep the former database name deliberately: a v11 installation is upgraded in
-# place, so accounts, lots and the stock pool do not disappear on the first run.
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AutoVIPRoblox_Monolith.db")
 LOG = logging.getLogger("FPC.AutoVIPRoblox")
 
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(PLUGIN_DIR, "AutoVIPRoblox_v17.db")
+OLD_DB_PATH = os.path.join(PLUGIN_DIR, "AutoVIPRoblox_Monolith.db")
+
+DEFAULT_PLACE_ID = "109983668079237"
+DEFAULT_GAME_NAME = "Steal a Brainrot"
+WARN_BEFORE = 15 * 60
+SELECTION_TTL = 5 * 60
+LOT_SYNC_INTERVAL = 5 * 60
+CANCEL_WORDS = ("отмена", "cancel", "стоп")
+TAG_RE = re.compile(r"#FR[A-Z0-9]{5}")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
 DEFAULTS = {
-    "auto_refund": "1",
-    "lot_management": "1",
     "event_mode": "0",
+    "lot_management": "1",
     "global_proxy": "",
+    "bonus_active": "1",
     "friends_module_active": "1",
     "friends_auto_remove": "1",
     "friends_default_limit": "0",
-    "legacy_commands": "1",  # disabled by default: does not interfere with other plugins
     "review_bonus_active": "1",
     "review_bonus_hours": "1",
-    "msg_post_payment": (
-        "🎮 <b>VIP-сервер Roblox выдан</b>\n\n"
-        "🔗 Ссылка: {link}\n"
-        "⏱ Аренда: {hours} ч.\n"
-        "📦 Заказ: #{order_id}{bonus_line}\n\n"
-        "Команды: <code>!vip_time</code>, <code>!vip_link</code>, "
-        "<code>!vip_friends Ник</code>, <code>!vip_help</code>\n"
-        "Для доступа пользователям до 13 лет отправьте заявку владельцу: {owner_url}"
-    ),
-    "msg_post_expire": "⏳ Аренда по заказу #{order_id} завершена. Сервер освобождён.",
-    "msg_friend_added": "✅ {friend_name} добавлен в доступ к вашему VIP-серверу.",
-    "msg_friend_not_found": "❌ Не удалось найти/принять заявку от {input}. Сначала отправьте заявку владельцу сервера.",
-    "msg_friend_limit": "❌ Лимит друзей для этой аренды: {limit}.",
-    "msg_review_bonus": "⭐ Спасибо за отзыв 5★! Добавлено {bonus_hours} ч. к активной аренде.",
+    "paid_active": "0",
+    "paid_price": "50",
+    "paid_lifetime": "10",
+    "paid_node": "402",
 }
 
-DB: "PluginDB | None" = None
-CARDINAL = None
+# Текстовые настройки платного добавления (сбрасываются кнопкой «♻️ Сбросить тексты»).
+PAID_TEXT_DEFAULTS = {
+    "paid_game": "[Прочие]",
+    "paid_game_name_ru": "Roblox VIP сервер",
+    "paid_game_name_en": "Roblox VIP server",
+    "paid_type": "Услуги",
+    "paid_title_ru": "Добавление друга на арендованный VIP-сервер Roblox",
+    "paid_title_en": "Add a friend to the rented Roblox VIP server",
+    "paid_desc_ru": (
+        "Доплата за дополнительное добавление друга на ваш арендованный VIP-сервер Roblox.\n"
+        "1 шт. = 1 друг. После оплаты бот сам добавит игрока на сервер."
+    ),
+    "paid_desc_en": (
+        "Payment for an additional friend slot on your rented Roblox VIP server. "
+        "1 pcs = 1 friend. After payment the bot adds the player to the server automatically."
+    ),
+    "paid_pay_msg_ru": "Спасибо за оплату! Бот уже добавляет друга на ваш VIP-сервер — смотрите сообщения в чате.",
+    "paid_pay_msg_en": "Thank you! The bot is adding your friend to the VIP server — see the chat messages.",
+}
+DEFAULTS.update(PAID_TEXT_DEFAULTS)
+
+EN_DESC_FILLER = (
+    " This listing was created automatically for a specific buyer of a Roblox VIP server rental. "
+    "If you did not request it, please do not pay for it - the payment will be refunded automatically."
+)
+
+# ---------------------------------------------------------------------------
+# Шаблоны сообщений покупателю. vars — допустимые переменные и их описание.
+# fallback — упрощённый текст, если в пользовательском шаблоне ошибка.
+# ---------------------------------------------------------------------------
+TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "post_payment": {
+        "title": "Сообщение после выдачи сервера",
+        "vars": {"link": "ссылка на сервер", "hours": "часы аренды (с учётом бонуса)", "order_id": "номер заказа",
+                 "price": "цена заказа", "buyer_id": "ID покупателя", "server_id": "ID сервера", "chat_id": "ID чата"},
+        "default": (
+            "🎮 Ваш VIP-сервер Roblox готов!\n\n"
+            "🔗 Ссылка: {link}\n"
+            "⏰ Время аренды: {hours} ч.\n"
+            "📦 Заказ: #{order_id}\n\n"
+            "📋 Команды:\n"
+            "!время — сколько осталось\n"
+            "!ссылка — новая ссылка на сервер\n"
+            "!друзья ник — добавить в друзья и на сервер\n"
+            "!отзыв — бонусное время за отзыв\n"
+            "!команды — все команды"
+        ),
+        "fallback": "🎮 VIP-сервер выдан!\n🔗 Ссылка: {link}\n⏰ Время: {hours} ч.\n📦 Заказ: #{order_id}\nКоманды: !команды",
+    },
+    "post_expire": {
+        "title": "Сообщение об истечении аренды",
+        "vars": {"order_id": "номер заказа", "hours": "часы аренды", "buyer_id": "ID покупателя",
+                 "server_id": "ID сервера", "chat_id": "ID чата"},
+        "default": (
+            "⌛ Аренда по заказу #{order_id} завершена. Сервер отключён, ссылка больше не работает.\n\n"
+            "🙏 Пожалуйста, подтвердите выполнение заказа: https://funpay.com/orders/{order_id}/\n"
+            "Спасибо за покупку!"
+        ),
+        "fallback": "⌛ Аренда по заказу #{order_id} завершена. Подтвердите заказ: https://funpay.com/orders/{order_id}/",
+    },
+    "friend_invite": {
+        "title": "Сообщение-приглашение",
+        "vars": {"owner_profile_link": "ссылка на профиль владельца", "owner_username": "ник владельца",
+                 "order_id": "номер заказа"},
+        "default": (
+            "🤝 Если вам меньше 13 лет или ссылка не пускает на сервер:\n"
+            "1) Отправьте заявку в друзья владельцу сервера {owner_username}: {owner_profile_link}\n"
+            "2) Напишите сюда: !друзья ВашНик\n"
+            "Бот примет заявку и добавит вас на VIP-сервер (заказ #{order_id}).\n"
+            "Играете компанией? Каждый друг отправляет заявку, а вы пишете !друзья НикДруга."
+        ),
+        "fallback": "🤝 Отправьте заявку в друзья: {owner_profile_link} и напишите !друзья ВашНик",
+    },
+    "friend_added": {
+        "title": "Сообщение о добавлении",
+        "vars": {"friend_name": "ник добавленного игрока", "order_id": "номер заказа"},
+        "default": "✅ {friend_name} добавлен(а) в друзья и на VIP-сервер (заказ #{order_id}). Можно заходить!",
+        "fallback": "✅ {friend_name} добавлен(а) на VIP-сервер.",
+    },
+    "friend_not_found": {
+        "title": "Сообщение 'не найдено'",
+        "vars": {"input": "то, что написал покупатель", "owner_profile_link": "ссылка на профиль владельца"},
+        "default": (
+            "❌ Не нашёл игрока или входящую заявку в друзья от «{input}».\n"
+            "Отправьте заявку владельцу сервера: {owner_profile_link}\n"
+            "Подождите минуту и повторите команду !друзья ник."
+        ),
+        "fallback": "❌ Заявка от «{input}» не найдена. Отправьте заявку: {owner_profile_link}",
+    },
+    "friend_limit": {
+        "title": "Сообщение о лимите",
+        "vars": {"limit": "установленный лимит", "order_id": "номер заказа"},
+        "default": "❌ Достигнут лимит добавлений для этой аренды: {limit} (заказ #{order_id}).",
+        "fallback": "❌ Достигнут лимит добавлений: {limit}.",
+    },
+    "paid_limit_reached": {
+        "title": "Лимит исчерпан (после добавления)",
+        "vars": {"limit": "лимит", "price": "цена за 1 добавление", "order_id": "номер заказа аренды"},
+        "default": (
+            "ℹ️ Бесплатные добавления для заказа #{order_id} закончились (лимит: {limit}).\n"
+            "Следующих друзей можно добавить за доплату — {price} ₽ за одного. Просто напишите !друзья ник."
+        ),
+        "fallback": "ℹ️ Бесплатный лимит ({limit}) исчерпан. Следующие добавления — {price} ₽.",
+    },
+    "paid_lot_created": {
+        "title": "Лот создан",
+        "vars": {"link": "ссылка на лот", "price": "цена", "minutes": "через сколько минут лот удалится",
+                 "friend_name": "ник игрока из команды", "limit": "лимит", "order_id": "номер заказа аренды"},
+        "default": (
+            "💳 Создал лот для доплаты за добавление {friend_name}: {link}\n"
+            "Цена: {price} ₽ за 1 добавление.\n"
+            "В поле «Количество» укажите, сколько друзей хотите добавить (1 шт. = 1 друг).\n"
+            "⏳ Без оплаты лот удалится через {minutes} мин."
+        ),
+        "fallback": "💳 Лот для доплаты: {link} — {price} ₽ за 1 добавление. Удалится через {minutes} мин.",
+    },
+    "paid_lot_exists": {
+        "title": "Лот уже есть",
+        "vars": {"link": "ссылка на лот", "minutes": "сколько минут осталось до удаления",
+                 "price": "цена", "friend_name": "ник игрока"},
+        "default": (
+            "ℹ️ У вас уже есть неоплаченный лот доплаты: {link}\n"
+            "Цена: {price} ₽ за 1 добавление. Лот удалится через {minutes} мин."
+        ),
+        "fallback": "ℹ️ Ваш лот доплаты: {link} (удалится через {minutes} мин.)",
+    },
+    "paid_received": {
+        "title": "Оплата получена",
+        "vars": {"amount": "сколько добавлений куплено", "order_id": "номер заказа аренды"},
+        "default": "✅ Оплата получена! Начислено добавлений: {amount} (аренда #{order_id}).",
+        "fallback": "✅ Оплата получена. Добавлений: {amount}.",
+    },
+    "review_bonus": {
+        "title": "Сообщение о бонусе за отзыв",
+        "vars": {"bonus_hours": "начисленные часы", "order_id": "номер заказа",
+                 "new_time": "новое время окончания (ДД.ММ ЧЧ:ММ)"},
+        "default": "⭐ Спасибо за отзыв! К аренде по заказу #{order_id} добавлено {bonus_hours} ч. Новое окончание: {new_time}.",
+        "fallback": "⭐ Спасибо за отзыв! Добавлено {bonus_hours} ч.",
+    },
+}
+FRIEND_TEMPLATES = ("friend_invite", "friend_added", "friend_not_found", "friend_limit")
+MAIN_TEMPLATES = ("post_payment", "post_expire")
+PAID_TEMPLATES = ("paid_limit_reached", "paid_lot_created", "paid_lot_exists", "paid_received")
+
+# Глобальное состояние
+S: "Store | None" = None
+CARDINAL: Any = None
 STOP = threading.Event()
-WORKER: threading.Thread | None = None
+EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix="AutoVIP")
+ORDER_QUEUE: "queue.Queue" = queue.Queue()
+THREADS: List[threading.Thread] = []
+GUARD = threading.RLock()
+RUNNING: set = set()
+LOCKS: Dict[str, threading.RLock] = {}
+SELECTIONS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+HANDLED: Dict[str, float] = {}
+FP_LOCK = threading.Lock()
+SYNC_REQUEST = threading.Event()
+API_CACHE: Dict[int, Tuple[str, str, Any]] = {}
 
 
+# ---------------------------------------------------------------------------
+# Вспомогательные функции
+# ---------------------------------------------------------------------------
 def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
-def as_int(value: Any, default: int = 0) -> int:
+def now() -> float:
+    return time.time()
+
+
+def norm_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def parse_number(raw: Any) -> float:
     try:
-        return int(str(value).strip())
+        value = float(str(raw).strip().replace(",", "."))
     except (TypeError, ValueError):
-        return default
+        raise ValueError("нужно число") from None
+    if not math.isfinite(value):
+        raise ValueError("нужно число")
+    return value
 
 
-def positive_float(value: Any, field: str) -> float:
+def fmt_num(value: Any) -> str:
     try:
-        result = float(str(value).replace(",", ".").strip())
+        return f"{round(float(value), 2):g}"
     except (TypeError, ValueError):
-        raise ValueError(f"{field}: нужно число")
-    if not math.isfinite(result) or result <= 0 or result > 1_000_000:
-        raise ValueError(f"{field}: нужно конечное число от 0 (не включительно) до 1000000")
-    return result
+        return str(value)
 
 
-def normalize_proxy(raw):
-    value = (raw or '').strip()
-    if not value or value == '-':
+def fmt_left(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    return f"{hours}ч {minutes}м" if hours else f"{minutes}м"
+
+
+def fmt_money(value: Any) -> str:
+    try:
+        return f"{float(value):,.2f}".replace(",", " ")
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def fmt_dt(ts: float, with_year: bool = False) -> str:
+    return time.strftime("%d.%m.%Y %H:%M" if with_year else "%d.%m %H:%M", time.localtime(ts))
+
+
+def plural_hours(value: float) -> str:
+    if float(value) != int(value):
+        return "часа"
+    n = int(value) % 100
+    if 11 <= n <= 14:
+        return "часов"
+    n %= 10
+    return "час" if n == 1 else ("часа" if 2 <= n <= 4 else "часов")
+
+
+def strip_html(text: str) -> str:
+    return re.sub(r"<[^>]*>", "", str(text or ""))
+
+
+def currency_symbol() -> str:
+    try:
+        cur = getattr(CARDINAL.account, "currency", None)
+        text = str(cur) if cur is not None else ""
+        if text and "." not in text and len(text) <= 3 and "UNKNOWN" not in text:
+            return text
+    except Exception:
+        pass
+    return "₽"
+
+
+def short(text: str, size: int = 60) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text if len(text) <= size else text[: size - 1] + "…"
+
+
+# --- прокси ---------------------------------------------------------------
+PROXY_RE = re.compile(r"^(?:(?P<user>[^:@\s/]+):(?P<pwd>[^@\s]+)@)?(?P<host>[A-Za-z0-9.\-]+):(?P<port>\d{1,5})$")
+
+
+def normalize_proxy(raw: str) -> str:
+    value = re.sub(r"^(?:https?|socks4a?|socks5h?)://", "", str(raw or "").strip(), flags=re.I).rstrip("/")
+    match = PROXY_RE.match(value)
+    if not match or not 1 <= int(match.group("port")) <= 65535:
+        raise ValueError("bad proxy")
+    return value
+
+
+def proxy_dict(proxy: str) -> Optional[Dict[str, str]]:
+    if not proxy:
         return None
-    if '://' not in value:
-        value = 'http://' + value
+    url = "http://" + proxy
+    return {"http": url, "https": url}
+
+
+def mask_proxy(proxy: str) -> str:
+    match = PROXY_RE.match(proxy or "")
+    if not match:
+        return proxy or ""
+    if match.group("user"):
+        return f"{match.group('user')}:***@{match.group('host')}:{match.group('port')}"
+    return proxy
+
+
+# --- шаблоны --------------------------------------------------------------
+def template_fields(text: str) -> Optional[List[str]]:
+    """Список переменных шаблона или None, если в скобках ошибка."""
     try:
-        parts = urlsplit(value)
-        if parts.scheme not in ('http', 'https', 'socks5', 'socks5h') or not parts.hostname or not parts.port or parts.path not in ('', '/') or parts.query or parts.fragment:
-            raise ValueError()
-    except ValueError:
-        raise ValueError('Нужен HTTP/HTTPS/SOCKS5 прокси: login:pass@host:port') from None
-    return {'http': value, 'https': value}
+        result = []
+        for _, field, spec, conv in Formatter().parse(text):
+            if field is None:
+                continue
+            if spec or conv:
+                return None
+            result.append(field)
+        return result
+    except (ValueError, IndexError):
+        return None
 
 
-def split_ids(text: str) -> list[str]:
-    return [item for item in re.split(r"[\s,;]+", text.strip()) if item]
+def template_problems(key: str, text: str) -> List[str]:
+    fields = template_fields(text)
+    if fields is None:
+        return ["ошибка в фигурных скобках"]
+    allowed = TEMPLATES[key]["vars"]
+    return ["{" + f + "}" for f in fields if f not in allowed]
 
 
-class PluginDB:
-    """Small transaction layer. Network I/O is deliberately never done under its lock."""
+def _format(text: str, allowed: Dict[str, str], values: Dict[str, Any]) -> Optional[str]:
+    fields = template_fields(text)
+    if fields is None or any(f not in allowed for f in fields):
+        return None
+    try:
+        return text.format_map({k: "" if values.get(k) is None else str(values.get(k)) for k in allowed})
+    except (ValueError, KeyError, IndexError):
+        return None
+
+
+def get_template(key: str) -> str:
+    value = S.get("tpl_" + key, "") if S else ""
+    return value if value.strip() else TEMPLATES[key]["default"]
+
+
+def render(key: str, **values: Any) -> str:
+    info = TEMPLATES[key]
+    text = _format(get_template(key), info["vars"], values)
+    if text is None:
+        text = _format(info["fallback"], info["vars"], values) or info["fallback"]
+    return strip_html(text).strip()
+
+
+# ---------------------------------------------------------------------------
+# База данных
+# ---------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cookie TEXT NOT NULL, username TEXT,
+    roblox_id TEXT, created_at REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, game_id TEXT, game_name TEXT);
+CREATE TABLE IF NOT EXISTS servers (
+    server_id TEXT PRIMARY KEY, category_id INTEGER, owner_account_id INTEGER,
+    added_at REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS lots (
+    lot_id INTEGER PRIMARY KEY, name TEXT NOT NULL, hours REAL NOT NULL,
+    category_id INTEGER, server_id TEXT,
+    price_normal REAL NOT NULL DEFAULT 50, price_event REAL NOT NULL DEFAULT 100,
+    friend_limit INTEGER, last_active INTEGER, added_at REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS bonus_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, buy_hours REAL NOT NULL, get_hours REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rentals (
+    rental_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, buyer_id TEXT NOT NULL, buyer_name TEXT,
+    chat_id TEXT NOT NULL, lot_id INTEGER, lot_name TEXT, server_id TEXT NOT NULL,
+    account_id INTEGER, place_id TEXT, hours REAL NOT NULL, price REAL NOT NULL DEFAULT 0,
+    start_time REAL NOT NULL, end_time REAL NOT NULL, status TEXT NOT NULL,
+    end_reason TEXT, link TEXT, warned INTEGER NOT NULL DEFAULT 0,
+    paid_slots INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt REAL NOT NULL DEFAULT 0, last_error TEXT,
+    created_at REAL NOT NULL, finished_at REAL);
+CREATE INDEX IF NOT EXISTS idx_rentals_status ON rentals(status, end_time);
+CREATE INDEX IF NOT EXISTS idx_rentals_buyer ON rentals(buyer_id, status);
+CREATE TABLE IF NOT EXISTS rental_friends (
+    rental_id TEXT NOT NULL, roblox_id TEXT NOT NULL, name TEXT, account_id INTEGER,
+    on_server INTEGER NOT NULL DEFAULT 0, unfriend INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'added', added_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (rental_id, roblox_id));
+CREATE TABLE IF NOT EXISTS processed_orders (
+    order_id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS reviews (order_id TEXT PRIMARY KEY, given_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS friend_lots (
+    tag TEXT PRIMARY KEY, offer_id TEXT, rental_id TEXT NOT NULL, buyer_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL, friend_input TEXT, friend_name TEXT, price REAL NOT NULL,
+    created_at REAL NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS friend_payments (
+    order_id TEXT PRIMARY KEY, tag TEXT, rental_id TEXT, amount INTEGER NOT NULL,
+    price REAL NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, chat_name TEXT, text TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL);
+"""
+
+LIVE = "('active','ending')"  # аренда занимает сервер
+
+
+class Store:
+    """Одно соединение SQLite под общей блокировкой. Сетевые запросы под ней не выполняются."""
 
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.RLock()
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        if os.path.exists(path):
-            with sqlite3.connect(path) as old:
-                try:
-                    version = old.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()
-                except sqlite3.OperationalError:
-                    version = None
-                if not version or version[0] != '16':
-                    backup_path = path + '.before-v16-' + str(time.time_ns()) + '.bak'
-                    backup = sqlite3.connect(backup_path)
-                    try:
-                        old.backup(backup)
-                    finally:
-                        backup.close()
-            old.close()
-        self.init()
+        self.con = sqlite3.connect(path, timeout=30, check_same_thread=False, isolation_level=None)
+        self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.execute("PRAGMA busy_timeout=30000")
+        self.con.executescript(SCHEMA)
+        for key, value in DEFAULTS.items():
+            self.con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+    def q(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
+        with self.lock:
+            return self.con.execute(sql, params).fetchall()
+
+    def q1(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        with self.lock:
+            return self.con.execute(sql, params).fetchone()
+
+    def ex(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        with self.lock:
+            return self.con.execute(sql, params)
+
+    def val(self, sql: str, params: tuple = (), default: Any = 0) -> Any:
+        row = self.q1(sql, params)
+        return row[0] if row and row[0] is not None else default
 
     @contextmanager
-    def conn(self):
-        con = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys = ON")
-        con.execute("PRAGMA busy_timeout = 30000")
-        try:
-            with con:
-                yield con
-        finally:
-            con.close()
+    def tx(self):
+        with self.lock:
+            if self.con.in_transaction:
+                yield self
+                return
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                yield self
+            except BaseException:
+                self.con.execute("ROLLBACK")
+                raise
+            self.con.execute("COMMIT")
 
-    def init(self) -> None:
-        with self.lock, self.conn() as con:
-            con.execute("PRAGMA journal_mode = WAL")
-            con.executescript("""
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cookie TEXT NOT NULL, proxy TEXT NOT NULL DEFAULT '', username TEXT,
-                    roblox_id TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS categories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, game_id TEXT
-                );
-                CREATE TABLE IF NOT EXISTS servers (
-                    server_id TEXT PRIMARY KEY, category_id INTEGER,
-                    owner_account_id INTEGER, place_id TEXT, status TEXT NOT NULL DEFAULT 'free',
-                    FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL,
-                    FOREIGN KEY(owner_account_id) REFERENCES accounts(id) ON DELETE RESTRICT
-                );
-                CREATE TABLE IF NOT EXISTS lots (
-                    lot_id INTEGER PRIMARY KEY, hours REAL NOT NULL DEFAULT 1,
-                    category_id INTEGER, server_id TEXT, bind_type TEXT NOT NULL DEFAULT 'random',
-                    price_normal REAL NOT NULL DEFAULT 0, price_event REAL NOT NULL DEFAULT 0,
-                    friend_limit INTEGER NOT NULL DEFAULT -1, active INTEGER NOT NULL DEFAULT 1, name TEXT,
-                    FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL,
-                    FOREIGN KEY(server_id) REFERENCES servers(server_id) ON DELETE SET NULL
-                );
-                CREATE TABLE IF NOT EXISTS wholesale_bonuses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, buy_hours REAL NOT NULL, get_hours REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS rentals (
-                    rental_id TEXT PRIMARY KEY, buyer_id TEXT NOT NULL, chat_id TEXT NOT NULL,
-                    lot_id INTEGER NOT NULL, server_id TEXT NOT NULL, owner_account_id INTEGER NOT NULL,
-                    hours REAL NOT NULL, start_time REAL NOT NULL, end_time REAL NOT NULL,
-                    status TEXT NOT NULL, price REAL NOT NULL DEFAULT 0, cleanup_reason TEXT,
-                    cleanup_attempts INTEGER NOT NULL DEFAULT 0, next_cleanup_at REAL, last_error TEXT,
-                    FOREIGN KEY(server_id) REFERENCES servers(server_id),
-                    FOREIGN KEY(owner_account_id) REFERENCES accounts(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_rentals_active ON rentals(status, end_time);
-                CREATE TABLE IF NOT EXISTS payments (
-                    order_id TEXT PRIMARY KEY, rental_id TEXT, buyer_id TEXT NOT NULL, chat_id TEXT NOT NULL,
-                    lot_id INTEGER, paid_hours REAL NOT NULL, bonus_hours REAL NOT NULL,
-                    price REAL NOT NULL DEFAULT 0, state TEXT NOT NULL, review_bonus_given INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL, FOREIGN KEY(rental_id) REFERENCES rentals(rental_id)
-                );
-                CREATE TABLE IF NOT EXISTS rental_friends (
-                    rental_id TEXT NOT NULL, roblox_id TEXT NOT NULL, name TEXT,
-                    remove_from_server INTEGER NOT NULL DEFAULT 1, unfriend_on_cleanup INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(rental_id, roblox_id), FOREIGN KEY(rental_id) REFERENCES rentals(rental_id) ON DELETE CASCADE
-                );
-            """)
-            self._migrate_legacy(con)
-            self._upgrade_v16(con)
-            self._recover_interrupted_operations(con)
-            for key, value in DEFAULTS.items():
-                con.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
+    def get(self, key: str, default: Optional[str] = None) -> str:
+        row = self.q1("SELECT value FROM settings WHERE key=?", (key,))
+        if row is not None:
+            return str(row["value"])
+        return DEFAULTS.get(key, "") if default is None else default
 
-    @staticmethod
-    def _add_column(con, table, definition):
-        columns = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
-        if definition.split()[0] not in columns:
-            con.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+    def set(self, key: str, value: Any) -> None:
+        self.ex("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)))
 
-    def _migrate_legacy(self, con: sqlite3.Connection) -> None:
-        # Existing Monolith databases are retained. Servers are bound automatically only
-        # when there is exactly one Roblox account; a multi-account store must bind them
-        # explicitly in the new interface rather than guessing and risking an чужой server.
-        self._add_column(con, "servers", "owner_account_id INTEGER")
-        self._add_column(con, "servers", "place_id TEXT")
-        self._add_column(con, "accounts", "enabled INTEGER NOT NULL DEFAULT 1")
-        self._add_column(con, "accounts", "created_at REAL NOT NULL DEFAULT 0")
-        self._add_column(con, "rentals", "next_cleanup_at REAL")
-        try:
-            count = con.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-            if count == 1:
-                account_id = con.execute("SELECT id FROM accounts LIMIT 1").fetchone()[0]
-                con.execute("UPDATE servers SET owner_account_id=? WHERE owner_account_id IS NULL", (account_id,))
-                con.execute("""UPDATE servers SET place_id=(SELECT game_id FROM categories c WHERE c.id=servers.category_id)
-                               WHERE place_id IS NULL AND category_id IS NOT NULL""")
-            # v11 had only `orders`. Migrate its active records once so an existing
-            # paid rental is not treated as free stock after the upgrade. If the
-            # old installation had several Roblox accounts, ownership is ambiguous;
-            # the server stays locked (`cleanup_failed`) until the owner is bound in
-            # the panel, rather than guessing with somebody else's cookie.
-            old_table = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'").fetchone()
-            has_sessions = con.execute("SELECT 1 FROM rentals LIMIT 1").fetchone()
-            if old_table and not has_sessions:
-                con.execute("""INSERT OR IGNORE INTO accounts(id,cookie,proxy,username,roblox_id,enabled,created_at)
-                               VALUES(0,'','','UNBOUND',NULL,0,0)""")
-                old_orders = con.execute("""SELECT order_id,buyer_id,chat_id,server_id,hours,start_time,end_time,status,price,friends_added
-                                           FROM orders WHERE status='active'""").fetchall()
-                for old in old_orders:
-                    server = con.execute("SELECT owner_account_id,place_id FROM servers WHERE server_id=?", (old["server_id"],)).fetchone()
-                    owner_id = server["owner_account_id"] if server else None
-                    status = "active" if owner_id and server["place_id"] else "cleanup_failed"
-                    rental_id = "legacy-" + str(old["order_id"])
-                    con.execute("""INSERT OR IGNORE INTO rentals(rental_id,buyer_id,chat_id,lot_id,server_id,owner_account_id,hours,start_time,end_time,status,price,last_error)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (rental_id, str(old["buyer_id"]), str(old["chat_id"]), 0, str(old["server_id"]), owner_id or 0,
-                                 float(old["hours"] or 0), float(old["start_time"] or time.time()), float(old["end_time"] or time.time()),
-                                 status, float(old["price"] or 0), None if status == "active" else "Нужно указать владельца Roblox и Place ID"))
-                    con.execute("""INSERT OR IGNORE INTO payments(order_id,rental_id,buyer_id,chat_id,lot_id,paid_hours,bonus_hours,price,state,created_at)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                                (str(old["order_id"]), rental_id, str(old["buyer_id"]), str(old["chat_id"]), 0,
-                                 float(old["hours"] or 0), 0, float(old["price"] or 0), "issued", float(old["start_time"] or time.time())))
-                    try:
-                        for friend_id in json.loads(old["friends_added"] or "[]"):
-                            con.execute("INSERT OR IGNORE INTO rental_friends(rental_id,roblox_id,remove_from_server,unfriend_on_cleanup) VALUES(?,?,1,0)",
-                                        (rental_id, str(friend_id)))
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pass
-        except sqlite3.OperationalError as exc:
-            raise RuntimeError("Схема старой базы не поддерживается; исходная база сохранена в резервной копии") from exc
-
-    @staticmethod
-    def _recover_interrupted_operations(con):
-        now = time.time()
-        con.execute("UPDATE payments SET state='issue_failed' WHERE state='issuing'")
-        con.execute("""UPDATE rentals SET status='cleanup_failed',
-            cleanup_reason=COALESCE(cleanup_reason,'issue_failed'), next_cleanup_at=?,
-            last_error='Восстановление незавершённой операции' WHERE status IN ('issuing','cleaning','refunding')""", (now,))
-        con.execute("UPDATE outbox SET state='pending' WHERE state='sending'")
-        con.execute("UPDATE incoming_orders SET state='pending' WHERE state='processing'")
-        con.execute("""UPDATE servers SET status='cleaning' WHERE EXISTS
-            (SELECT 1 FROM rentals r WHERE r.server_id=servers.server_id AND r.status='cleanup_failed')""")
-        con.execute("""UPDATE servers SET status='error' WHERE status IN ('reserved','occupied') AND NOT EXISTS
-            (SELECT 1 FROM rentals r WHERE r.server_id=servers.server_id
-             AND r.status IN ('issuing','delivering','active','cleaning','cleanup_failed'))""")
-
-    def _upgrade_v16(self, con):
-        for table, column in (
-            ('rentals', "link TEXT"), ('rentals', "source_key TEXT"),
-            ('payments', "currency TEXT NOT NULL DEFAULT 'RUB'"),
-            ('payments', "refund_previous_state TEXT"), ('payments', "last_error TEXT"),
-            ('payments', "next_refund_at REAL NOT NULL DEFAULT 0"),
-            ('servers', "verified INTEGER NOT NULL DEFAULT 0"),
-            ('servers', "enabled INTEGER NOT NULL DEFAULT 1"),
-            ('lots', "paused INTEGER NOT NULL DEFAULT 0"),
-            ('lots', "last_error TEXT"), ('lots', "subcategory_id INTEGER"),
-            ('rental_friends', "state TEXT NOT NULL DEFAULT 'added'"),
-        ):
-            self._add_column(con, table, column)
-        con.executescript('''
-            CREATE TABLE IF NOT EXISTS outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe TEXT UNIQUE NOT NULL,
-                rental_id TEXT, order_id TEXT, chat_id TEXT NOT NULL, text TEXT NOT NULL,
-                kind TEXT NOT NULL DEFAULT 'notice', state TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
-                last_error TEXT, created_at REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS incoming_orders (
-                order_id TEXT PRIMARY KEY, amount INTEGER, price REAL, lot_id INTEGER,
-                state TEXT NOT NULL DEFAULT 'pending', error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-                next_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS time_credits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, rental_id TEXT NOT NULL,
-                order_id TEXT, hours REAL NOT NULL, start_time REAL NOT NULL,
-                end_time REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS managed_friends (
-                account_id INTEGER NOT NULL, roblox_id TEXT NOT NULL,
-                PRIMARY KEY(account_id,roblox_id));
-        ''')
-        self._add_column(con, 'incoming_orders', 'event_lot_id INTEGER')
-        self._add_column(con, 'incoming_orders', 'event_error TEXT')
-        # Preserve v15 sessions and their timeline. Never infer a game from another pool.
-        for rental in con.execute('SELECT * FROM rentals').fetchall():
-            if con.execute('SELECT 1 FROM time_credits WHERE rental_id=?', (rental['rental_id'],)).fetchone():
-                continue
-            cursor = float(rental['start_time'])
-            for p in con.execute("SELECT * FROM payments WHERE rental_id=? AND state!='refunded' ORDER BY created_at,order_id", (rental['rental_id'],)).fetchall():
-                hours = float(p['paid_hours']) + float(p['bonus_hours'])
-                con.execute('INSERT INTO time_credits(rental_id,order_id,hours,start_time,end_time) VALUES(?,?,?,?,?)',
-                            (rental['rental_id'], p['order_id'], hours, cursor, cursor + hours * 3600))
-                cursor += hours * 3600
-            extra = float(rental['end_time']) - cursor
-            if extra > 0:
-                con.execute('INSERT INTO time_credits(rental_id,hours,start_time,end_time) VALUES(?,?,?,?)',
-                            (rental['rental_id'], extra / 3600, cursor, float(rental['end_time'])))
-        con.execute('''INSERT OR IGNORE INTO managed_friends(account_id,roblox_id)
-            SELECT r.owner_account_id,f.roblox_id FROM rental_friends f JOIN rentals r USING(rental_id)
-            WHERE f.unfriend_on_cleanup=1 AND f.state!='removed'
-            AND r.status IN ('active','issuing','delivering','refunding','cleaning','cleanup_failed')''')
-        for rental in con.execute("SELECT * FROM rentals WHERE source_key IS NULL").fetchall():
-            lot = con.execute('SELECT * FROM lots WHERE lot_id=?', (rental['lot_id'],)).fetchone()
-            server = con.execute('SELECT * FROM servers WHERE server_id=?', (rental['server_id'],)).fetchone()
-            if not lot or not server:
-                continue
-            key = source_key(lot)
-            matches = ((lot['bind_type'] == 'server' and lot['server_id'] == server['server_id']) or
-                       (lot['bind_type'] == 'category' and lot['category_id'] == server['category_id']) or
-                       (lot['bind_type'] == 'random' and server['category_id'] is None))
-            if key and matches:
-                con.execute('UPDATE rentals SET source_key=? WHERE rental_id=?', (key, rental['rental_id']))
-        con.execute("INSERT INTO settings(key,value) VALUES('schema_version','16') ON CONFLICT(key) DO UPDATE SET value='16'")
-
-    def setting(self, key: str, default: str = "") -> str:
-        with self.lock, self.conn() as con:
-            row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            return str(row[0]) if row else default
-
-    def set_setting(self, key: str, value: Any) -> None:
-        with self.lock, self.conn() as con:
-            con.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
-
-    def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        with self.lock, self.conn() as con:
-            return con.execute(sql, params).fetchall()
-
-    def row(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-        result = self.rows(sql, params)
-        return result[0] if result else None
+    def flag(self, key: str) -> bool:
+        return self.get(key) == "1"
 
 
-@dataclass(frozen=True)
-class RobloxAccount:
-    id: int
-    cookie: str
-    proxy: str
-    roblox_id: str
+# ---------------------------------------------------------------------------
+# Перенос данных из прежней базы (v11/v15/v16 «AutoVIPRoblox_Monolith.db»)
+# ---------------------------------------------------------------------------
+OLD_DEFAULT_TEMPLATES = {
+    "msg_friend_added": "✅ {friend_name} добавлен в доступ к вашему VIP-серверу.",
+    "msg_friend_not_found": "❌ Не удалось найти/принять заявку от {input}. Сначала отправьте заявку владельцу сервера.",
+    "msg_friend_limit": "❌ Лимит друзей для этой аренды: {limit}.",
+    "msg_review_bonus": "⭐ Спасибо за отзыв 5★! Добавлено {bonus_hours} ч. к активной аренде.",
+    "msg_post_expire": "⏳ Аренда по заказу #{order_id} завершена. Сервер освобождён.",
+}
+OLD_TEMPLATE_MAP = {
+    "msg_post_payment": "post_payment", "msg_post_expire": "post_expire",
+    "msg_friend_added": "friend_added", "msg_friend_not_found": "friend_not_found",
+    "msg_friend_limit": "friend_limit", "msg_review_bonus": "review_bonus",
+}
+
+
+def _g(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    try:
+        return row[key] if key in row.keys() else default
+    except (IndexError, KeyError):
+        return default
+
+
+def migrate_old_database(store: Store, old_path: str) -> Optional[str]:
+    """Копирует аккаунты, серверы, лоты, настройки и аренды прежней версии. Старая база не меняется."""
+    if not os.path.exists(old_path) or store.get("migrated_from_old", "0") == "1":
+        return None
+    try:
+        old = sqlite3.connect(f"file:{old_path}?mode=ro", uri=True, timeout=30)
+    except sqlite3.Error:
+        return None
+    old.row_factory = sqlite3.Row
+    stats = {"accounts": 0, "servers": 0, "lots": 0, "rentals": 0}
+    try:
+        tables = {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+        def rows(table: str, order: str = "") -> List[sqlite3.Row]:
+            if table not in tables:
+                return []
+            return old.execute(f"SELECT * FROM {table} {order}").fetchall()
+
+        t = now()
+        with store.tx():
+            # Настройки
+            settings = {r["key"]: r["value"] for r in rows("settings")}
+            for key in ("event_mode", "lot_management", "global_proxy", "friends_module_active",
+                        "friends_auto_remove", "friends_default_limit", "review_bonus_active", "review_bonus_hours"):
+                if key in settings and settings[key] is not None:
+                    value = str(settings[key])
+                    if key == "global_proxy" and value:
+                        try:
+                            value = normalize_proxy(value)
+                        except ValueError:
+                            value = ""
+                    store.set(key, value)
+            for old_key, new_key in OLD_TEMPLATE_MAP.items():
+                value = settings.get(old_key)
+                if not value or value == OLD_DEFAULT_TEMPLATES.get(old_key):
+                    continue
+                if not template_problems(new_key, value):
+                    store.set("tpl_" + new_key, strip_html(html.unescape(value)))
+            # Аккаунты
+            for r in rows("accounts", "ORDER BY id"):
+                if (_g(r, "id", 0) or 0) <= 0 or not _g(r, "cookie") or _g(r, "enabled", 1) in (0, "0"):
+                    continue
+                store.ex("INSERT OR IGNORE INTO accounts(id,cookie,username,roblox_id,created_at) VALUES(?,?,?,?,?)",
+                         (r["id"], r["cookie"], _g(r, "username"), _g(r, "roblox_id"), _g(r, "created_at", t) or t))
+                stats["accounts"] += 1
+            # Категории
+            for r in rows("categories", "ORDER BY id"):
+                game = _g(r, "game_id")
+                store.ex("INSERT OR IGNORE INTO categories(id,name,game_id,game_name) VALUES(?,?,?,?)",
+                         (r["id"], r["name"], str(game) if game else None,
+                          DEFAULT_GAME_NAME if str(game) == DEFAULT_PLACE_ID else (str(game) if game else None)))
+            # Серверы
+            for r in rows("servers"):
+                if _g(r, "enabled", 1) in (0, "0"):
+                    continue
+                owner = _g(r, "owner_account_id")
+                store.ex("INSERT OR IGNORE INTO servers(server_id,category_id,owner_account_id,added_at) VALUES(?,?,?,?)",
+                         (str(r["server_id"]), _g(r, "category_id"), owner if owner and owner > 0 else None, t))
+                stats["servers"] += 1
+            # Лоты
+            for r in rows("lots", "ORDER BY lot_id"):
+                bind = _g(r, "bind_type")
+                category = _g(r, "category_id") if bind in (None, "category") else None
+                server = _g(r, "server_id") if bind in (None, "server") else None
+                if category:
+                    server = None
+                limit = _g(r, "friend_limit")
+                limit = None if limit is None or int(limit) < 0 else int(limit)
+                store.ex("""INSERT OR IGNORE INTO lots(lot_id,name,hours,category_id,server_id,price_normal,price_event,friend_limit,added_at)
+                            VALUES(?,?,?,?,?,?,?,?,?)""",
+                         (int(r["lot_id"]), str(_g(r, "name") or f"Лот {r['lot_id']}"), float(_g(r, "hours", 1) or 1),
+                          category, str(server) if server else None, float(_g(r, "price_normal", 0) or 0),
+                          float(_g(r, "price_event", 0) or 0), limit, t))
+                stats["lots"] += 1
+            # Бонусы
+            for r in rows("wholesale_bonuses", "ORDER BY id"):
+                store.ex("INSERT INTO bonus_rules(buy_hours,get_hours) VALUES(?,?)", (r["buy_hours"], r["get_hours"]))
+            # Обработанные заказы и отзывы
+            for r in rows("payments"):
+                store.ex("INSERT OR IGNORE INTO processed_orders VALUES(?,?,?)", (str(r["order_id"]), "migrated", t))
+                if _g(r, "review_bonus_given", 0):
+                    store.ex("INSERT OR IGNORE INTO reviews VALUES(?,?)", (str(r["order_id"]), t))
+            for r in rows("incoming_orders"):
+                store.ex("INSERT OR IGNORE INTO processed_orders VALUES(?,?,?)", (str(r["order_id"]), "migrated", t))
+            # Аренды
+            lot_names = {r["lot_id"]: r["name"] for r in store.q("SELECT lot_id,name FROM lots")}
+            payments_by_rental: Dict[Any, List[sqlite3.Row]] = {}
+            for p in rows("payments"):
+                payments_by_rental.setdefault(_g(p, "rental_id"), []).append(p)
+            if "rentals" in tables:
+                for r in rows("rentals"):
+                    if str(_g(r, "buyer_id", "0")) in ("0", "") or not _g(r, "chat_id"):
+                        status_old = _g(r, "status")
+                        if status_old in ("cleanup_failed", "cleaning", "issuing", "refunding"):
+                            _migrate_rental(store, r, None, 0.0, "quiet", lot_names, t)
+                        continue
+                    pays = list(payments_by_rental.get(r["rental_id"], []))
+                    pays.sort(key=lambda p: (_g(p, "created_at", 0) or 0, str(p["order_id"])))
+                    order_id = str(pays[0]["order_id"]) if pays else str(r["rental_id"]).replace("legacy-", "")[:12]
+                    price = sum(float(_g(p, "price", 0) or 0) for p in pays if _g(p, "state") != "refunded")
+                    status_old = _g(r, "status")
+                    if status_old in ("active", "delivering"):
+                        reason = None
+                    elif status_old in ("cleanup_failed", "cleaning", "issuing", "refunding"):
+                        reason = {"manual": "manual", "cancelled": "cancelled"}.get(_g(r, "cleanup_reason"), "quiet")
+                        if _g(r, "cleanup_reason") in (None, "expired"):
+                            reason = "expired"
+                    else:
+                        reason = "history"
+                    _migrate_rental(store, r, order_id, price, reason, lot_names, t)
+                    stats["rentals"] += 1
+                for f in rows("rental_friends"):
+                    rental = store.q1("SELECT account_id,status FROM rentals WHERE rental_id=?", (f["rental_id"],))
+                    if not rental or rental["status"] not in ("active", "ending"):
+                        continue
+                    state = _g(f, "state", "added")
+                    if state == "removed":
+                        continue
+                    store.ex("""INSERT OR IGNORE INTO rental_friends(rental_id,roblox_id,name,account_id,on_server,unfriend,state,added_at)
+                                VALUES(?,?,?,?,1,?,'added',?)""",
+                             (f["rental_id"], str(f["roblox_id"]), _g(f, "name"), rental["account_id"],
+                              int(_g(f, "unfriend_on_cleanup", 0) or 0), t))
+            elif "orders" in tables:  # v11: только таблица orders
+                for r in rows("orders"):
+                    reason = None if _g(r, "status") == "active" else "history"
+                    fake = {"rental_id": "legacy-" + str(r["order_id"]), "buyer_id": _g(r, "buyer_id"),
+                            "chat_id": _g(r, "chat_id"), "lot_id": None, "server_id": _g(r, "server_id"),
+                            "owner_account_id": None, "hours": _g(r, "hours", 0), "start_time": _g(r, "start_time", t),
+                            "end_time": _g(r, "end_time", t), "link": None}
+                    _migrate_rental(store, fake, str(r["order_id"]), float(_g(r, "price", 0) or 0), reason, lot_names, t)
+                    stats["rentals"] += 1
+            store.set("migrated_from_old", "1")
+    except Exception:
+        LOG.exception("AutoVIP: не удалось перенести данные прежней версии")
+        return "⚠️ Не удалось перенести данные прежней версии: подробности в логе Cardinal."
+    finally:
+        old.close()
+    return ("✅ Данные прежней версии перенесены: аккаунтов {accounts}, серверов {servers}, лотов {lots}, "
+            "аренд {rentals}.").format(**stats)
+
+
+def _migrate_rental(store: Store, r: Any, order_id: Optional[str], price: float, reason: Optional[str],
+                    lot_names: Dict[int, str], t: float) -> None:
+    get = (lambda k, d=None: r.get(k, d)) if isinstance(r, dict) else (lambda k, d=None: _g(r, k, d))
+    start = float(get("start_time", 0) or 0)
+    end = float(get("end_time", 0) or 0)
+    hours = float(get("hours", 0) or 0)
+    if reason is None:  # активная аренда
+        if not start:
+            start, end = t, t + hours * 3600
+        status, end_reason = "active", None
+    elif reason == "history":
+        status, end_reason = ("cancelled" if get("status") in ("cancelled", "refunded", "issue_failed") else "completed"), None
+    else:
+        status, end_reason = "ending", reason
+        end = min(end or t, t)
+    owner = get("owner_account_id")
+    lot_id = get("lot_id")
+    store.ex("""INSERT OR IGNORE INTO rentals(rental_id,order_id,buyer_id,chat_id,lot_id,lot_name,server_id,account_id,
+                hours,price,start_time,end_time,status,end_reason,link,warned,created_at,finished_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             (str(get("rental_id")), order_id or str(get("rental_id"))[:8], str(get("buyer_id") or "0"),
+              str(get("chat_id") or ""), lot_id, lot_names.get(lot_id), str(get("server_id")),
+              owner if owner and owner > 0 else None, hours, price, start or t, end or t, status, end_reason,
+              get("link"), 1 if status != "active" else 0, start or t, None if status in ("active", "ending") else t))
+
+
+# ---------------------------------------------------------------------------
+# Roblox API
+# ---------------------------------------------------------------------------
+class RobloxError(Exception):
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 class RobloxAPI:
-    def __init__(self, account):
-        self.account = account
-        cookie = account.cookie.strip()
-        if cookie.startswith('.ROBLOSECURITY='):
-            cookie = cookie.split('=', 1)[1].split(';', 1)[0]
-        if '\n' in cookie or '\r' in cookie:
-            raise ValueError('Cookie должен быть одной строкой')
-        self.headers = {'Cookie': '.ROBLOSECURITY=' + cookie, 'User-Agent': 'Mozilla/5.0',
-                        'Origin': 'https://www.roblox.com', 'Referer': 'https://www.roblox.com/',
-                        'Content-Type': 'application/json'}
-        self.proxies = normalize_proxy(account.proxy)
+    def __init__(self, cookie: str, proxy: str = ""):
+        cookie = str(cookie or "").strip()
+        if cookie.startswith(".ROBLOSECURITY="):
+            cookie = cookie.split("=", 1)[1].split(";", 1)[0]
+        if not cookie or "\n" in cookie or "\r" in cookie:
+            raise ValueError("Cookie должен быть одной строкой")
+        self.cookie = cookie
+        self.proxies = proxy_dict(proxy)
         self.session = requests.Session()
         self.session.trust_env = False
-        self.csrf_token = None
+        self.csrf: Optional[str] = None
+        self.user_id: Optional[str] = None
 
-    def _request(self, method, url, csrf=False, **kwargs):
-        headers = dict(self.headers)
-        # Receive CSRF on the real operation, never call /logout.
-        if csrf and self.csrf_token:
-            headers['x-csrf-token'] = self.csrf_token
-        for attempt in range(3):
+    def request(self, method: str, url: str, write: bool = False, **kwargs) -> requests.Response:
+        last: Optional[Exception] = None
+        for attempt in range(4):
+            headers = {"Cookie": ".ROBLOSECURITY=" + self.cookie, "User-Agent": UA,
+                       "Accept": "application/json", "Origin": "https://www.roblox.com",
+                       "Referer": "https://www.roblox.com/"}
+            if write and self.csrf:
+                headers["x-csrf-token"] = self.csrf
             try:
                 response = self.session.request(method, url, headers=headers, proxies=self.proxies,
-                                                timeout=(8, 20), allow_redirects=False, **kwargs)
-            except requests.RequestException:
-                # No exception text: proxy URLs may contain passwords.
-                LOG.warning('AutoVIP Roblox: сетевая ошибка %s %s', method, urlsplit(url).hostname)
-                return None
-            if csrf and response.status_code == 403 and response.headers.get('x-csrf-token'):
-                self.csrf_token = response.headers['x-csrf-token']
-                headers['x-csrf-token'] = self.csrf_token
+                                                timeout=(10, 25), allow_redirects=False, **kwargs)
+            except requests.RequestException as exc:
+                # Текст исключения не выводим: в нём может быть пароль прокси.
+                last = RobloxError("нет соединения с Roblox (сеть/прокси: " + type(exc).__name__ + ")")
+                time.sleep(1 + attempt)
                 continue
-            if response.status_code == 429 and attempt < 2:
-                time.sleep(min(5, max(1, as_int(response.headers.get('Retry-After'), 2))))
+            token = response.headers.get("x-csrf-token")
+            if write and response.status_code == 403 and token and token != headers.get("x-csrf-token"):
+                self.csrf = token
+                continue
+            if response.status_code == 429 and attempt < 3:
+                time.sleep(2 + attempt * 2)
                 continue
             return response
-        return None
+        raise last or RobloxError("Roblox не ответил")
 
-    def _json(self, method, url, **kwargs):
-        response = self._request(method, url, **kwargs)
-        if response is None or response.status_code not in (200, 204):
-            raise RuntimeError('Roblox: HTTP ' + str(getattr(response, 'status_code', 'network')))
-        if response.status_code == 204:
+    @staticmethod
+    def _errors(response: requests.Response) -> str:
+        try:
+            errors = response.json().get("errors") or []
+            return "; ".join(str(e.get("message")) for e in errors if isinstance(e, dict))[:200]
+        except Exception:
+            return ""
+
+    def call(self, method: str, url: str, write: bool = False, **kwargs) -> Dict[str, Any]:
+        response = self.request(method, url, write=write, **kwargs)
+        if response.status_code == 401:
+            raise RobloxError("куки недействительны (401)", 401)
+        if response.status_code not in (200, 201, 204):
+            detail = self._errors(response)
+            raise RobloxError(f"HTTP {response.status_code}" + (": " + detail if detail else ""), response.status_code)
+        if response.status_code == 204 or not response.content:
             return {}
         try:
-            return response.json()
+            data = response.json()
         except ValueError:
-            raise RuntimeError('Roblox вернул некорректный JSON') from None
+            raise RobloxError("некорректный ответ Roblox") from None
+        return data if isinstance(data, dict) else {"data": data}
 
-    def authenticated(self):
-        try:
-            data = self._json('GET', 'https://users.roblox.com/v1/users/authenticated')
-            return (str(data['id']), str(data['name'])) if as_int(data.get('id')) > 0 else None
-        except (RuntimeError, KeyError):
-            return None
+    # --- аккаунт ---
+    def authenticated(self) -> Tuple[str, str]:
+        data = self.call("GET", "https://users.roblox.com/v1/users/authenticated")
+        if not data.get("id"):
+            raise RobloxError("Roblox не вернул пользователя")
+        self.user_id = str(data["id"])
+        return str(data["id"]), str(data.get("name") or data["id"])
 
-    def details(self, server_id):
-        data = self._json('GET', f'https://games.roblox.com/v1/vip-servers/{server_id}')
-        if str(data.get('id')) != str(server_id):
-            raise RuntimeError('Roblox вернул другой VIP Server ID')
+    # --- VIP-сервер ---
+    def details(self, server_id: str) -> Dict[str, Any]:
+        data = self.call("GET", f"https://games.roblox.com/v1/vip-servers/{server_id}")
+        if str(data.get("id")) != str(server_id):
+            raise RobloxError("Roblox вернул другой VIP-сервер")
         return data
 
-    def private_servers(self, place_id):
-        result, cursor, seen = [], None, set()
-        for _ in range(100):
-            params = {'excludeFriendServers': 'true'}
-            if cursor:
-                params['exclusiveStartKeyCursor'] = cursor
-            data = self._json('GET', f'https://games.roblox.com/v1/games/{place_id}/private-servers', params=params)
-            if not isinstance(data.get('data'), list):
-                raise RuntimeError('Roblox не вернул список VIP-серверов')
-            result.extend(data['data'])
-            cursor = data.get('nextPageCursor')
-            if not cursor:
-                return result
-            if cursor in seen:
-                break
-            seen.add(cursor)
-        raise RuntimeError('Roblox: не удалось дочитать страницы VIP-серверов')
+    @staticmethod
+    def place_of(data: Dict[str, Any]) -> Optional[str]:
+        game = data.get("game") or {}
+        root = game.get("rootPlace") or {}
+        place = root.get("id") or game.get("placeId")
+        return str(place) if place else None
 
-    def verify_owner(self, server_id, place_id):
-        details = self.details(server_id)
-        game = details.get('game') or {}
-        root = game.get('rootPlace') or {}
-        actual_place = root.get('id') or game.get('placeId')
-        if not actual_place or str(actual_place) != str(place_id):
-            raise RuntimeError('Place ID не совпадает с корневым Place ID VIP-сервера')
-        rows = [r for r in self.private_servers(place_id) if str(r.get('vipServerId')) == str(server_id)]
-        if not rows or any(str((r.get('owner') or {}).get('id')) != str(self.account.roblox_id) for r in rows):
-            raise RuntimeError('Roblox не подтвердил владельца VIP-сервера')
-        return details
+    def set_active(self, server_id: str, active: bool) -> bool:
+        data = self.call("PATCH", f"https://games.roblox.com/v1/vip-servers/{server_id}", write=True,
+                         json={"active": bool(active)})
+        state = data.get("active") if str(data.get("id")) == str(server_id) else None
+        if state is None:
+            state = self.details(server_id).get("active")
+        return state is bool(active)
 
-    def permission_ids(self, server_id):
-        permissions = self.details(server_id).get('permissions')
-        if not isinstance(permissions, dict) or not isinstance(permissions.get('users'), list) or 'friendsAllowed' not in permissions:
-            raise RuntimeError('Roblox не подтвердил список разрешений')
-        return {str(u['id']) for u in permissions['users']}, permissions['friendsAllowed']
+    def new_link(self, server_id: str, place_fallback: Optional[str] = None) -> str:
+        data = self.call("PATCH", f"https://games.roblox.com/v1/vip-servers/{server_id}", write=True,
+                         json={"newJoinCode": True})
+        code, place = data.get("joinCode"), self.place_of(data)
+        if not code or not place:
+            info = self.details(server_id)
+            code, place = code or info.get("joinCode"), place or self.place_of(info)
+        place = place or place_fallback
+        if not code or not place:
+            raise RobloxError("Roblox не вернул код ссылки")
+        return f"https://www.roblox.com/games/{place}?privateServerLinkCode={quote(str(code), safe='')}"
 
-    def set_permission(self, server_id, friend_id, add):
-        self._json('PATCH', f'https://games.roblox.com/v1/vip-servers/{server_id}/permissions', csrf=True,
-                   json={'usersToAdd' if add else 'usersToRemove': [int(friend_id)], 'friendsAllowed': False})
-        users, broad_access = self.permission_ids(server_id)
-        return (str(friend_id) in users) == add and broad_access is False
+    def shutdown_instances(self, server_id: str, place_id: Optional[str]) -> None:
+        """Пытается закрыть запущенные экземпляры сервера (игроки вылетают). Ошибки не критичны."""
+        if not place_id:
+            return
+        try:
+            data = self.call("GET", f"https://games.roblox.com/v1/games/{place_id}/private-servers",
+                             params={"excludeFriendServers": "true", "limit": 100})
+            for row in data.get("data") or []:
+                if str(row.get("vipServerId")) == str(server_id) and row.get("id") and (row.get("playing") or 0) > 0:
+                    self.request("POST", "https://apis.roblox.com/matchmaking-api/v1/game-instances/shutdown",
+                                 write=True, json={"placeId": int(place_id), "gameId": str(row["id"]),
+                                                   "privateServerId": int(server_id)})
+        except Exception:
+            LOG.debug("AutoVIP: shutdown экземпляров не выполнен", exc_info=True)
 
-    def clear_permissions(self, server_id):
-        users, _ = self.permission_ids(server_id)
-        self._json('PATCH', f'https://games.roblox.com/v1/vip-servers/{server_id}/permissions', csrf=True,
-                   json={'usersToRemove': [int(u) for u in users], 'friendsAllowed': False})
-        users, broad_access = self.permission_ids(server_id)
-        return not users and broad_access is False
+    def set_permission(self, server_id: str, user_id: str, add: bool) -> bool:
+        key = "usersToAdd" if add else "usersToRemove"
+        url = f"https://games.roblox.com/v1/vip-servers/{server_id}/permissions"
+        try:
+            self.call("PATCH", url, write=True, json={key: [int(user_id)]})
+        except RobloxError as exc:
+            if exc.status != 400:
+                raise
+            perms = self.details(server_id).get("permissions") or {}
+            body: Dict[str, Any] = {key: [int(user_id)], "friendsAllowed": bool(perms.get("friendsAllowed")),
+                                    "clanAllowed": bool(perms.get("clanAllowed"))}
+            if perms.get("enemyClanId") is not None:
+                body["enemyClanId"] = perms["enemyClanId"]
+            self.call("PATCH", url, write=True, json=body)
+        users = {str(u.get("id")) for u in ((self.details(server_id).get("permissions") or {}).get("users") or [])}
+        return (str(user_id) in users) == bool(add)
 
-    def set_active(self, server_id, active):
-        self._json('PATCH', f'https://games.roblox.com/v1/vip-servers/{server_id}', csrf=True, json={'active': active})
-        return self.details(server_id).get('active') is active
-
-    def regenerate_link(self, server_id):
-        old = self.details(server_id)
-        self._json('PATCH', f'https://games.roblox.com/v1/vip-servers/{server_id}', csrf=True, json={'newJoinCode': True})
-        data = self.details(server_id)
-        code = data.get('joinCode')
-        if not code or code == old.get('joinCode'):
-            raise RuntimeError('Roblox не подтвердил смену кода входа')
-        place = ((data.get('game') or {}).get('rootPlace') or {}).get('id')
-        if not as_int(place):
-            raise RuntimeError('Roblox не вернул корневой Place ID')
-        return f'https://www.roblox.com/games/{place}?privateServerLinkCode={quote(str(code), safe="")}'
-
-    def shutdown(self, server_id, place_id):
-        # Deactivate first; block reconnects. Subscription/renewal is never changed.
-        if not self.set_active(server_id, False):
-            return False
-        for attempt in range(4):
-            rows = [r for r in self.private_servers(place_id) if str(r.get('vipServerId')) == str(server_id)]
-            if rows and all(r.get('playing') == 0 for r in rows):
-                return self.details(server_id).get('active') is False
-            for row in rows:
-                game_id = row.get('id')
-                if row.get('playing', 0) and game_id:
-                    self._request('POST', 'https://apis.roblox.com/matchmaking-api/v1/game-instances/shutdown',
-                                  csrf=True, json={'placeId': int(place_id), 'gameId': str(game_id),
-                                                   'privateServerId': int(server_id)})
-            if attempt < 3:
-                time.sleep(2)
-        # An absent row is not proof of zero players. Keep quarantined and retry.
-        return False
-
-    def resolve_user(self, raw):
-        match = re.fullmatch(r'https://(?:www\.)?roblox\.com/users/(\d+)(?:/profile)?/?', raw, re.I)
-        user_id = raw if raw.isascii() and raw.isdigit() else (match.group(1) if match else None)
+    # --- пользователи и друзья ---
+    def resolve_user(self, raw: str) -> Optional[Tuple[str, str]]:
+        raw = str(raw or "").strip().strip("<>").rstrip("/")
+        match = re.search(r"roblox\.com/users/(\d+)", raw, re.I)
+        user_id = match.group(1) if match else (raw if raw.isdigit() else None)
         if user_id:
-            data = self._json('GET', f'https://users.roblox.com/v1/users/{user_id}')
-            return str(data['id']), data['name']
-        if not re.fullmatch(r'[A-Za-z0-9_]{3,20}', raw):
+            try:
+                data = self.call("GET", f"https://users.roblox.com/v1/users/{user_id}")
+            except RobloxError as exc:
+                if exc.status in (400, 404):
+                    return None
+                raise
+            return str(data["id"]), str(data.get("name") or user_id)
+        name = raw.lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", name):
             return None
-        data = self._json('POST', 'https://users.roblox.com/v1/usernames/users', json={'usernames': [raw], 'excludeBannedUsers': True}).get('data') or []
-        return (str(data[0]['id']), data[0]['name']) if data else None
+        data = self.call("POST", "https://users.roblox.com/v1/usernames/users",
+                         json={"usernames": [name], "excludeBannedUsers": True})
+        rows = data.get("data") or []
+        return (str(rows[0]["id"]), str(rows[0].get("name") or name)) if rows else None
 
-    def is_friend(self, other_id):
-        data = self._json('GET', f'https://friends.roblox.com/v1/users/{self.account.roblox_id}/friends/statuses',
-                          params={'userIds': str(other_id)})
-        rows = [r for r in data.get('data', []) if str(r.get('id')) == str(other_id)]
-        if len(rows) != 1:
-            raise RuntimeError('Roblox не подтвердил статус дружбы')
-        status = rows[0].get('status')
-        if isinstance(status, bool):
-            raise RuntimeError('Roblox вернул недопустимый статус дружбы')
-        if isinstance(status, int):
-            status = {0:'NotFriends', 1:'Friends', 2:'RequestSent', 3:'RequestReceived'}.get(status)
-        if status not in ('Friends', 'NotFriends', 'RequestSent', 'RequestReceived'):
-            raise RuntimeError('Roblox не подтвердил статус дружбы')
-        return status == 'Friends'
+    def friend_status(self, owner_id: str, user_id: str) -> str:
+        data = self.call("GET", f"https://friends.roblox.com/v1/users/{owner_id}/friends/statuses",
+                         params={"userIds": str(user_id)})
+        for row in data.get("data") or []:
+            if str(row.get("id")) == str(user_id):
+                status = row.get("status")
+                if isinstance(status, int):
+                    status = {0: "NotFriends", 1: "Friends", 2: "RequestSent", 3: "RequestReceived"}.get(status)
+                return str(status or "NotFriends")
+        return "NotFriends"
 
-    def accept_friend_request(self, friend_id):
-        self._json('POST', f'https://friends.roblox.com/v1/users/{friend_id}/accept-friend-request', csrf=True)
-        return self.is_friend(friend_id)
+    def accept_friend(self, user_id: str) -> None:
+        self.call("POST", f"https://friends.roblox.com/v1/users/{user_id}/accept-friend-request", write=True)
 
-    def unfriend(self, friend_id):
-        if not self.is_friend(friend_id):
-            return True
-        self._json('POST', f'https://friends.roblox.com/v1/users/{friend_id}/unfriend', csrf=True)
-        return not self.is_friend(friend_id)
+    def unfriend(self, user_id: str) -> None:
+        self.call("POST", f"https://friends.roblox.com/v1/users/{user_id}/unfriend", write=True)
 
 
-def database() -> PluginDB:
-    if DB is None:
-        raise RuntimeError("Auto VIP Roblox database has not been initialized")
-    return DB
+def api_for(account: sqlite3.Row) -> RobloxAPI:
+    proxy = S.get("global_proxy")
+    key = int(account["id"])
+    with GUARD:
+        cached = API_CACHE.get(key)
+        if cached and cached[0] == account["cookie"] and cached[1] == proxy:
+            return cached[2]
+        api = RobloxAPI(account["cookie"], proxy)
+        api.user_id = str(account["roblox_id"] or "") or None
+        API_CACHE[key] = (account["cookie"], proxy, api)
+        return api
 
 
-def account_for_server(server_id: str) -> tuple[sqlite3.Row, sqlite3.Row] | None:
-    return database().row("""
-        SELECT s.server_id,s.place_id,s.status,a.id account_id,a.cookie,a.proxy,a.roblox_id,a.username
-        FROM servers s JOIN accounts a ON a.id=s.owner_account_id
-        WHERE s.server_id=? AND a.enabled=1
-    """, (server_id,))
+def owner_of(server_id: str, prefer: Optional[int] = None) -> Tuple[sqlite3.Row, RobloxAPI, Dict[str, Any]]:
+    """Находит добавленный аккаунт, которому Roblox даёт управлять сервером."""
+    accounts = S.q("SELECT * FROM accounts ORDER BY id")
+    if not accounts:
+        raise RobloxError("не добавлено ни одного аккаунта Roblox")
+    cached = S.val("SELECT owner_account_id FROM servers WHERE server_id=?", (server_id,), None)
+    first = [x for x in (prefer, cached) if x]
+    accounts.sort(key=lambda a: (first.index(a["id"]) if a["id"] in first else len(first), a["id"]))
+    errors = []
+    for account in accounts:
+        try:
+            api = api_for(account)
+            data = api.details(server_id)
+        except Exception as exc:
+            errors.append(f"{account['username'] or account['id']}: {exc}")
+            continue
+        S.ex("UPDATE servers SET owner_account_id=? WHERE server_id=?", (account["id"], server_id))
+        return account, api, data
+    raise RobloxError("ни один аккаунт не управляет сервером " + server_id + " (" + "; ".join(errors)[:300] + ")")
 
 
-def roblox_for_server(server_id: str) -> tuple[RobloxAPI, sqlite3.Row] | None:
-    row = account_for_server(server_id)
-    if not row:
-        return None
-    account = RobloxAccount(int(row["account_id"]), row["cookie"], row["proxy"], str(row["roblox_id"] or ""))
-    return RobloxAPI(account), row
+def server_place_fallback(server_id: str) -> str:
+    row = S.q1("""SELECT c.game_id FROM servers s JOIN categories c ON c.id=s.category_id
+                  WHERE s.server_id=? AND c.game_id IS NOT NULL""", (server_id,))
+    return str(row["game_id"]) if row else DEFAULT_PLACE_ID
 
 
-def active_rental(buyer_id, chat_id):
-    rows = database().rows("SELECT * FROM rentals WHERE buyer_id=? AND chat_id=? AND status='active' AND end_time>?", (buyer_id, chat_id, time.time()))
-    return rows[0] if len(rows) == 1 else None
+def issue_link(server_id: str) -> Tuple[sqlite3.Row, str, str]:
+    """До 3 попыток с перебором аккаунтов: включает сервер и создаёт новую ссылку."""
+    last: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            account, api, data = owner_of(server_id)
+            place = RobloxAPI.place_of(data) or server_place_fallback(server_id)
+            if data.get("active") is False and not api.set_active(server_id, True):
+                raise RobloxError("Roblox не включил сервер (проверьте подписку)")
+            return account, api.new_link(server_id, place), place
+        except Exception as exc:
+            last = exc
+            if attempt < 2:
+                time.sleep(2)
+    raise RobloxError(str(last))
 
 
-def total_bonus(hours):
-    for rule in database().rows('SELECT buy_hours,get_hours FROM wholesale_bonuses ORDER BY buy_hours DESC'):
-        buy = positive_float(rule['buy_hours'], 'Порог бонуса')
-        get = positive_float(rule['get_hours'], 'Размер бонуса')
-        if hours >= buy:
-            return positive_float(int(hours // buy) * get, 'Итоговый бонус')
-    return 0.0
+# ---------------------------------------------------------------------------
+# FunPay и Telegram
+# ---------------------------------------------------------------------------
+def account_ready() -> bool:
+    account = getattr(CARDINAL, "account", None)
+    return bool(account is not None and getattr(account, "is_initiated", True) and getattr(account, "id", None))
 
 
-def choose_free_server(con, lot):
-    key = source_key(lot)
-    if not key or lot['paused']:
-        return None
-    base = '''SELECT s.* FROM servers s JOIN accounts a ON a.id=s.owner_account_id
-        WHERE s.status='free' AND s.enabled=1 AND s.verified=1 AND a.enabled=1
-        AND s.place_id IS NOT NULL AND a.roblox_id IS NOT NULL
-        AND NOT EXISTS(SELECT 1 FROM rentals r WHERE r.server_id=s.server_id
-          AND r.status IN ('issuing','delivering','active','refunding','cleaning','cleanup_failed'))'''
-    if lot['bind_type'] == 'server':
-        return con.execute(base + ' AND s.server_id=?', (lot['server_id'],)).fetchone()
-    if lot['bind_type'] == 'category':
-        return con.execute(base + ''' AND s.category_id=? AND EXISTS
-            (SELECT 1 FROM categories c WHERE c.id=s.category_id AND c.game_id=s.place_id)
-            ORDER BY s.server_id LIMIT 1''', (lot['category_id'],)).fetchone()
-    return con.execute(base + ''' AND s.category_id IS NULL AND NOT EXISTS
-        (SELECT 1 FROM lots l WHERE l.server_id=s.server_id)
-        ORDER BY s.server_id LIMIT 1''').fetchone()
+def plugin_enabled() -> bool:
+    plugin = (getattr(CARDINAL, "plugins", None) or {}).get(UUID)
+    return plugin is None or bool(getattr(plugin, "enabled", True))
 
 
-def send_fp(cardinal, chat_id, text, chat_name=None):
+def _send_now(chat_id: Any, text: str, chat_name: Optional[str]) -> bool:
+    target = int(chat_id) if str(chat_id).isdigit() else chat_id
     try:
-        # Account API bypasses Cardinal's $photo/$sleep parser; FunPay is plain text.
-        text = html.unescape(re.sub(r'</?(?:b|i|code|u|s|strong|em)>', '', text))
-        result = cardinal.account.send_message(int(chat_id) if str(chat_id).isdigit() else chat_id, text, chat_name)
-        confirmed = bool(getattr(result, 'id', None))
-        trace_command('send', 'Отправка подтверждена' if confirmed else 'FunPay не подтвердил отправку')
-        return confirmed
-    except Exception as exc:
-        trace_command('send', 'Ошибка отправки: ' + type(exc).__name__)
-        LOG.warning('AutoVIP: сообщение в чат %s не подтверждено', chat_id)
+        sender = getattr(CARDINAL, "send_message", None)
+        if callable(sender):
+            return bool(sender(target, text, chat_name))
+        return CARDINAL.account.send_message(target, text, chat_name) is not None
+    except Exception:
+        LOG.warning("AutoVIP: не удалось отправить сообщение в чат %s", chat_id, exc_info=True)
         return False
 
 
-def cardinal_admin_ids(cardinal: Any) -> set[int]:
-    """Read the authorization list owned by Cardinal; this plugin never self-registers admins."""
-    telegram = getattr(cardinal, "telegram", None)
-    raw = getattr(telegram, "authorized_users", {}) if telegram is not None else {}
-    values = raw.keys() if isinstance(raw, dict) else (raw or [])
-    result: set[int] = set()
+def send_fp(chat_id: Any, text: str, chat_name: Optional[str] = None, retry: bool = True) -> bool:
+    text = strip_html(text).strip()
+    if not text or not chat_id:
+        return True
+    if _send_now(chat_id, text, chat_name):
+        return True
+    if retry:
+        S.ex("INSERT INTO outbox(chat_id,chat_name,text,next_at,created_at) VALUES(?,?,?,?,?)",
+             (str(chat_id), chat_name, text, now() + 15, now()))
+    return False
+
+
+def admin_ids() -> List[int]:
+    telegram = getattr(CARDINAL, "telegram", None)
+    raw = getattr(telegram, "authorized_users", None) or []
+    values = list(raw.keys()) if isinstance(raw, dict) else list(raw)
+    result = []
     for value in values:
         try:
-            result.add(int(value))
-        except (TypeError, ValueError):
-            pass
-    # Some older Cardinal builds expose the same allowlist under admin_ids.
-    for value in getattr(telegram, "admin_ids", []) if telegram is not None else []:
-        try:
-            result.add(int(value))
+            result.append(int(value))
         except (TypeError, ValueError):
             pass
     return result
 
 
-def is_cardinal_admin(cardinal: Any, user_id: Any) -> bool:
+def is_admin(user_id: Any) -> bool:
     try:
-        return int(user_id) in cardinal_admin_ids(cardinal)
+        return int(user_id) in admin_ids()
     except (TypeError, ValueError):
         return False
 
 
-def notify_admins(cardinal: Any, text: str) -> None:
-    bot = getattr(getattr(cardinal, "telegram", None), "bot", None)
+def notify_admins(text: str) -> None:
+    bot = getattr(getattr(CARDINAL, "telegram", None), "bot", None)
     if bot is None:
         return
-    for user_id in cardinal_admin_ids(cardinal):
+    for user_id in admin_ids():
         try:
-            bot.send_message(user_id, text, parse_mode="HTML")
+            bot.send_message(user_id, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
-            LOG.debug("AutoVIP: не удалось отправить админ-уведомление", exc_info=True)
+            LOG.debug("AutoVIP: не удалось отправить уведомление в Telegram", exc_info=True)
 
 
-def is_plugin_enabled(cardinal: Any) -> bool:
-    plugin = getattr(cardinal, "plugins", {}).get(UUID)
-    return bool(plugin and plugin.enabled)
-
-
-def order_fields(cardinal, event):
-    compact = event.order
-    order_id = str(getattr(compact, 'id', '')).lstrip('#')
-    if not re.fullmatch(r'[A-Za-z0-9-]{1,64}', order_id):
-        raise ValueError('Неизвестный формат ID заказа')
-    order = cardinal.account.get_order(order_id)
-    if str(order.id).lstrip('#') != order_id or status_name(order) not in ('paid', 'closed'):
-        raise ValueError('Заказ не оплачен, возвращён или не совпадает ID')
-    if str(getattr(order, 'seller_id', '')) != str(cardinal.account.id):
-        raise ValueError('Заказ принадлежит другому продавцу')
-    saved = database().row('SELECT * FROM incoming_orders WHERE order_id=?', (order_id,))
-    if saved and saved['event_error']:
-        raise ValueError(saved['event_error'])
-    ids = native_lot_ids(order) | native_lot_ids(compact)
-    if saved and saved['event_lot_id']:
-        ids.add(int(saved['event_lot_id']))
-    if not ids and callable(getattr(cardinal.account, 'get_orders_by_ids', None)):
-        response = cardinal.account.method('post', 'https://funpay.com/api/orders/get',
-            headers={'Content-Type': 'application/json'}, payload=json.dumps({'order_uids': [order_id], 'include': ['details', 'users']}), raise_not_200=True)
-        body = response.json()
-        raw = (body.get('data') or {}).get(order_id) or {}
-        if body.get('status') != 'SUCCESS' or raw.get('order_uid') != order_id:
-            raise ValueError('FunPay не подтвердил исходные данные заказа')
-        ids = native_lot_ids(raw) | native_lot_ids(raw.get('type_data') or {})
-    if len(ids) > 1:
-        raise ValueError('Противоречивые ID лота; требуется разбор')
-    if saved and saved['lot_id']:
-        if ids and saved['lot_id'] not in ids:
-            raise ValueError('Ручная привязка противоречит ID предложения FunPay')
-        ids = {int(saved['lot_id'])}
-    if not ids:
-        raise ValueError('FunPayAPI не передаёт ID купленного предложения. Требуется ручная привязка заказа в /vip_config → Заказы.')
-    lot_id = ids.pop()
-    buyer_id = str(getattr(order, 'buyer_id', '') or '')
-    chat_id = str(getattr(order, 'chat_id', '') or getattr(compact, 'chat_id', '') or '')
-    if not buyer_id.isdigit() or int(buyer_id) <= 0 or not chat_id:
-        raise ValueError('Нет покупателя или чата в заказе')
-    amount = getattr(order, 'amount', None)
-    if amount is None:
-        amount = getattr(compact, 'amount', None)
-    if amount is None and saved:
-        amount = saved['amount']
-    if amount is None or not math.isfinite(float(amount)) or float(amount) != int(float(amount)) or not 1 <= int(float(amount)) <= 1_000_000:
-        raise ValueError('FunPayAPI не подтвердил целое количество товара')
-    price = getattr(order, 'sum', None)
-    if price is None:
-        price = getattr(compact, 'price', None)
-    if price is None and saved:
-        price = saved['price']
-    if price is None or not math.isfinite(float(price)) or float(price) < 0:
-        raise ValueError('FunPayAPI не подтвердил сумму платежа')
-    return order, lot_id, order_id, buyer_id, chat_id, int(float(amount)), float(price)
-
-
-def process_order(cardinal, event):
-    order_id = str(getattr(event.order, 'id', '')).lstrip('#')
-    db = database()
-    # Only a reservation transaction owns stock. Per-buyer serializing also prevents
-    # two simultaneous payments from creating parallel sessions for the same lot.
-    with ORDER_LOCK:
-        if db.row('SELECT 1 FROM payments WHERE order_id=?', (order_id,)):
-            return
-        try:
-            order, lot_id, order_id, buyer_id, chat_id, amount, price = order_fields(cardinal, event)
-        except Exception as exc:
-            error = str(exc) if isinstance(exc, ValueError) else 'Не удалось получить данные заказа FunPay'
-            with db.lock, db.conn() as con:
-                old = con.execute('SELECT attempts FROM incoming_orders WHERE order_id=?', (order_id,)).fetchone()
-                con.execute("UPDATE incoming_orders SET state='attention',error=?,attempts=attempts+1,next_at=? WHERE order_id=?",
-                            (error, time.time() + 300, order_id))
-            if not old or not old['attempts']:
-                notify_admins(cardinal, f'⚠️ Auto VIP: заказ #{esc(order_id)} не выдан.\n{esc(error)}')
-            return
-        lot = db.row('SELECT * FROM lots WHERE lot_id=?', (lot_id,))
-        if not lot:
-            with db.lock, db.conn() as con:
-                con.execute("UPDATE incoming_orders SET state='ignored',error=NULL WHERE order_id=?", (order_id,))
-            return
-        # A second purchase must wait for the first link to be delivered before
-        # it can extend the same session. Never allocate another server solely
-        # because delivery of the first payment is delayed.
-        waiting = db.row("""SELECT 1 FROM rentals WHERE buyer_id=? AND chat_id=? AND lot_id=?
-            AND status IN ('issuing','delivering') AND source_key=?""",
-            (buyer_id, chat_id, lot_id, source_key(lot)))
-        if waiting:
-            with db.lock, db.conn() as con:
-                con.execute("UPDATE incoming_orders SET state='pending',next_at=?,error='Ожидается доставка предыдущей покупки этого лота' WHERE order_id=?",
-                            (time.time() + 10, order_id))
-            return
-        try:
-            hours = positive_float(positive_float(lot['hours'], 'Часы лота') * amount, 'Итоговое время')
-            bonus = total_bonus(hours)
-            total = positive_float(hours + bonus, 'Время с бонусом')
-        except ValueError:
-            with db.lock, db.conn() as con:
-                con.execute("UPDATE incoming_orders SET state='attention',error='Недопустимые часы или бонусы лота' WHERE order_id=?", (order_id,))
-            notify_admins(cardinal, f'⚠️ Auto VIP: проверьте часы/бонусы лота {lot_id}, заказ #{esc(order_id)} не выдан.')
-            return
-        existing = db.row("SELECT * FROM rentals WHERE buyer_id=? AND chat_id=? AND lot_id=? AND status='active' AND end_time>? ORDER BY start_time LIMIT 1",
-                          (buyer_id, chat_id, lot_id, time.time()))
-        rental_id = existing['rental_id'] if existing else str(uuid.uuid4())
-        with ExitStack() as operation_locks:
-            operation_locks.enter_context(operation_lock('rental:' + rental_id))
-            with db.lock, db.conn() as con:
-                con.execute('BEGIN IMMEDIATE')
-                lot = con.execute('SELECT * FROM lots WHERE lot_id=?', (lot_id,)).fetchone()
-                if not lot or con.execute('SELECT 1 FROM payments WHERE order_id=?', (order_id,)).fetchone():
-                    return
-                previous = existing
-                existing = con.execute("SELECT * FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (rental_id, time.time())).fetchone() if previous else None
-                key = source_key(lot)
-                if existing and (not key or existing['source_key'] != key or lot['paused']):
-                    existing = None
-                if previous and not existing:
-                    # Cleanup or configuration may have changed while we waited.
-                    # A replacement session needs both its own ID and its own lock.
-                    rental_id = str(uuid.uuid4())
-                    operation_locks.enter_context(operation_lock('rental:' + rental_id))
-                server = None if existing else choose_free_server(con, lot)
-                currency_obj = getattr(order, 'currency', None)
-                currency = str(getattr(currency_obj, 'name', currency_obj) or 'UNKNOWN')
-                if existing:
-                    state = 'extension_pending'
-                    end = add_credit(con, rental_id, order_id, total, float(existing['end_time']))
-                    con.execute('UPDATE rentals SET end_time=?,hours=hours+?,price=price+? WHERE rental_id=?', (end, total, price, rental_id))
-                    enqueue(con, 'extension:' + order_id, chat_id, f'✅ Аренда #{payment_label(rental_id)} продлена на {total:g} ч. Остаток: {format_left(end-time.time())}.', rental_id, order_id, 'extension')
-                elif server:
-                    state = 'issuing'
-                    con.execute("UPDATE servers SET status='reserved' WHERE server_id=?", (server['server_id'],))
-                    con.execute('''INSERT INTO rentals(rental_id,buyer_id,chat_id,lot_id,server_id,owner_account_id,hours,start_time,end_time,status,price,source_key)
-                        VALUES(?,?,?,?,?,?,?,?,?,'issuing',?,?)''', (rental_id, buyer_id, chat_id, lot_id, server['server_id'], server['owner_account_id'], total, 0, 0, price, key))
-                    add_credit(con, rental_id, order_id, total, 0)
-                else:
-                    state, rental_id = 'out_of_stock', None
-                    enqueue(con, 'stock:' + order_id, chat_id, '😔 Нет доступного настроенного VIP-сервера для этого лота. Продавец уведомлён.', order_id=order_id)
-                con.execute('''INSERT INTO payments(order_id,rental_id,buyer_id,chat_id,lot_id,paid_hours,bonus_hours,price,state,currency,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)''', (order_id, rental_id, buyer_id, chat_id, lot_id, hours, bonus, price, state, currency, time.time()))
-                con.execute("UPDATE incoming_orders SET state='done',error=NULL WHERE order_id=?", (order_id,))
-            if existing:
-                return
-            if not server:
-                notify_admins(cardinal, f'⚠️ Auto VIP: заказ #{esc(order_id)} — нет доступного сервера для лота {lot_id}.')
-                if db.setting('auto_refund') == '1':
-                    request_refund(order_id)
-                return
-            try:
-                api, owner = roblox_for_server(server['server_id']) or (None, None)
-                if not api:
-                    raise RuntimeError('Нет владельца сервера')
-                api.verify_owner(server['server_id'], server['place_id'])
-                if not api.shutdown(server['server_id'], server['place_id']) or not api.clear_permissions(server['server_id']):
-                    raise RuntimeError('Roblox не подтвердил подготовку пустого сервера')
-                link = api.regenerate_link(server['server_id'])
-                if not api.set_active(server['server_id'], True):
-                    raise RuntimeError('Roblox не подтвердил включение сервера')
-                template = db.setting('msg_post_payment')
-                if '{link}' not in template:
-                    template += '\n🔗 {link}'
-                if '{owner_url}' not in template:
-                    template += '\nЗаявку в друзья отправляйте владельцу: {owner_url}'
-                replacements = {'link': link, 'hours': f'{total:g}', 'order_id': order_id,
-                                'bonus_line': f'\n🎁 Бонус: +{bonus:g} ч.' if bonus else '',
-                                'owner_url': f'https://www.roblox.com/users/{owner["roblox_id"]}/profile'}
-                for key, value in replacements.items():
-                    template = template.replace('{' + key + '}', value)
-                template += f'\nДля выбора этой аренды добавляйте #{order_id} к команде. Пример: !друзья #{order_id} Ник'
-                with db.lock, db.conn() as con:
-                    con.execute("UPDATE rentals SET status='delivering',link=? WHERE rental_id=?", (link, rental_id))
-                    con.execute("UPDATE payments SET state='delivery_pending' WHERE order_id=?", (order_id,))
-                    enqueue(con, 'issue:' + order_id, chat_id, template, rental_id, order_id, 'issue')
-            except Exception:
-                fail_issue(cardinal, order_id, rental_id, server['server_id'], chat_id, 'Roblox не подтвердил безопасную подготовку VIP-сервера')
-
-
-def fail_issue(cardinal, order_id, rental_id, server_id, chat_id, reason):
-    with database().lock, database().conn() as con:
-        con.execute("UPDATE rentals SET status='cleanup_failed',cleanup_reason='issue_failed',last_error=?,next_cleanup_at=0 WHERE rental_id=?", (reason, rental_id))
-        con.execute("UPDATE servers SET status='cleaning' WHERE server_id=?", (server_id,))
-        con.execute("UPDATE payments SET state='issue_failed' WHERE order_id=?", (order_id,))
-        enqueue(con, 'issue-failed:' + order_id, chat_id, '❌ Не удалось подготовить VIP-сервер. Продавец уведомлён.', rental_id)
-    if database().setting('auto_refund') == '1':
-        request_refund(order_id)
-    notify_admins(cardinal, f'⚠️ Auto VIP: невыдача #{esc(order_id)}. Сервер заблокирован до очистки.')
-
-
-def format_left(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours, seconds = divmod(seconds, 3600)
-    minutes = seconds // 60
-    return f"{hours}ч {minutes}м" if hours else f"{minutes}м"
-
-
-def cleanup_rental(cardinal, rental_id, reason):
-    db = database()
-    with operation_lock('rental:' + rental_id):
-        with db.lock, db.conn() as con:
-            con.execute('BEGIN IMMEDIATE')
-            rental = con.execute('SELECT * FROM rentals WHERE rental_id=?', (rental_id,)).fetchone()
-            if not rental or rental['status'] not in ('active', 'delivering', 'cleanup_failed', 'refunding'):
-                return False
-            if rental['status'] == 'active' and reason == 'expired' and rental['end_time'] > time.time():
-                return False
-            if rental['status'] == 'delivering' and reason == 'expired':
-                return False
-            reason = rental['cleanup_reason'] or reason
-            con.execute("UPDATE rentals SET status='cleaning',cleanup_reason=?,cleanup_attempts=cleanup_attempts+1 WHERE rental_id=?", (reason, rental_id))
-            con.execute("UPDATE servers SET status='cleaning' WHERE server_id=?", (rental['server_id'],))
-            con.execute("UPDATE outbox SET state='cancelled' WHERE rental_id=? AND kind IN ('issue','extension','link') AND state='pending'", (rental_id,))
-        try:
-            api, server = roblox_for_server(rental['server_id']) or (None, None)
-            if not api or str(server['account_id']) != str(rental['owner_account_id']):
-                raise RuntimeError('Не подтверждён владелец аренды')
-            # Both operations are attempted even if one fails.
-            errors = []
-            for operation in (lambda: api.shutdown(rental['server_id'], server['place_id']),
-                              lambda: api.clear_permissions(rental['server_id']),
-                              lambda: bool(api.regenerate_link(rental['server_id']))):
-                try:
-                    if not operation():
-                        errors.append('Нет подтверждения Roblox')
-                except Exception:
-                    errors.append('Ошибка операции Roblox')
-            if errors:
-                raise RuntimeError('; '.join(errors))
-            with db.lock, db.conn() as con:
-                con.execute("UPDATE rental_friends SET state='removed' WHERE rental_id=?", (rental_id,))
-            # Do not delete a friendship still used by another rental on this owner.
-            cleanup_managed_friends(api)
-            with db.lock, db.conn() as con:
-                pending = con.execute("SELECT 1 FROM payments WHERE rental_id=? AND state!='refunded'", (rental_id,)).fetchone()
-                final = 'completed' if reason in ('expired', 'manual') else 'cancelled'
-                if reason == 'refund' and not pending:
-                    final = 'refunded'
-                if reason == 'issue_failed':
-                    final = 'issue_failed'
-                con.execute('UPDATE rentals SET status=?,last_error=NULL,next_cleanup_at=NULL,link=NULL WHERE rental_id=?', (final, rental_id))
-                con.execute("UPDATE servers SET status='free' WHERE server_id=?", (rental['server_id'],))
-                undelivered = 'cancelled_unissued' if reason in ('manual','cancelled') else 'delivery_failed'
-                con.execute("UPDATE payments SET state=? WHERE rental_id=? AND state='delivery_pending'", (undelivered, rental_id))
-                con.execute("UPDATE payments SET state='extension_unnotified' WHERE rental_id=? AND state='extension_pending'", (rental_id,))
-                if rental['chat_id']:
-                    enqueue(con, 'finished:' + rental_id, rental['chat_id'], db.setting('msg_post_expire').replace('{order_id}', payment_label(rental_id)), rental_id)
-            return True
-        except Exception:
-            cleanup_error(rental_id, 'Roblox не подтвердил полную очистку. Сервер остаётся заблокирован; будет повтор.')
-            return False
-
-
-def cleanup_error(rental_id: str, error: str) -> None:
-    with database().lock, database().conn() as con:
-        row = con.execute("SELECT cleanup_attempts,server_id FROM rentals WHERE rental_id=?", (rental_id,)).fetchone()
-        attempts = int(row["cleanup_attempts"] or 1) if row else 1
-        # 30s, 60s, 120s ... then at most once per 15 minutes for a bad proxy/API outage.
-        delay = min(900, 30 * (2 ** min(attempts - 1, 5)))
-        con.execute("UPDATE rentals SET status='cleanup_failed',last_error=?,next_cleanup_at=? WHERE rental_id=?",
-                    (error, time.time() + delay, rental_id))
-        if row:
-            con.execute("UPDATE servers SET status='cleaning' WHERE server_id=?", (row["server_id"],))
-    LOG.warning("AutoVIP cleanup retry required: rental=%s: %s", rental_id, error)
-    if CARDINAL is not None:
-        notify_admins(CARDINAL, f"⚠️ <b>Auto VIP: очистка требует повтора</b>\nАренда: <code>{esc(rental_id[:8])}</code>\nПричина: {esc(error)}")
-
-
-def payment_label(rental_id):
-    row = database().row("""SELECT order_id FROM payments WHERE rental_id=?
-        ORDER BY CASE WHEN state IN ('issued','extended','extension_pending','delivery_pending') THEN 0 ELSE 1 END,
-        created_at,order_id LIMIT 1""", (rental_id,))
-    return str(row['order_id']) if row else rental_id[:8]
-
-
-def worker_loop(cardinal):
-    last_sync = 0
-    while not STOP.wait(3):
-        try:
-            db, now = database(), time.time()
-            recover_idle_operations()
-            for row in db.rows("SELECT rental_id,cleanup_reason FROM rentals WHERE (status='active' AND end_time<=?) OR (status='cleanup_failed' AND COALESCE(next_cleanup_at,0)<=?)", (now, now)):
-                run_once('rental:' + row['rental_id'], cleanup_rental, cardinal, row['rental_id'], row['cleanup_reason'] or 'expired')
-            for row in db.rows("SELECT id FROM outbox WHERE state='pending' AND next_at<=? ORDER BY id LIMIT 20", (now,)):
-                run_once('outbox:' + str(row['id']), deliver_outbox, cardinal, row['id'])
-            if db.setting('auto_refund') == '1':
-                for row in db.rows("SELECT order_id FROM payments WHERE state IN ('issue_failed','delivery_failed','out_of_stock')"):
-                    request_refund(row['order_id'])
-            for row in db.rows("SELECT order_id FROM payments WHERE state='refund_pending' AND next_refund_at<=?", (now,)):
-                run_once('refund:' + row['order_id'], perform_refund, cardinal, row['order_id'])
-            if is_plugin_enabled(cardinal):
-                for row in db.rows("SELECT order_id FROM incoming_orders WHERE state='pending' AND next_at<=? ORDER BY created_at LIMIT 10", (now,)):
-                    run_once('order:' + row['order_id'], process_order, cardinal, SimpleNamespace(order=SimpleNamespace(id=row['order_id'])))
-                if now-last_sync >= 60:
-                    last_sync = now
-                    run_once('lots', reconcile_lots, cardinal)
-        except Exception:
-            LOG.error('AutoVIP: ошибка фонового цикла; следующая попытка через 3 секунды')
-
-
-def reconcile_lots(cardinal):
-    if database().setting('lot_management') != '1':
-        return
-    with FP_LOT_LOCK:
-        for lot in database().rows('SELECT * FROM lots'):
-            try:
-                with database().lock, database().conn() as con:
-                    desired = choose_free_server(con, lot) is not None
-                fields = cardinal.account.get_lot_fields(int(lot['lot_id']))
-                if bool(fields.active) != desired:
-                    fields.active = desired
-                    cardinal.account.save_lot(fields.renew_fields())
-                with database().lock, database().conn() as con:
-                    con.execute('UPDATE lots SET active=?,last_error=NULL WHERE lot_id=?', (int(desired), lot['lot_id']))
-            except Exception:
-                with database().lock, database().conn() as con:
-                    con.execute("UPDATE lots SET last_error='FunPay не подтвердил синхронизацию' WHERE lot_id=?", (lot['lot_id'],))
-            if STOP.wait(1):
-                return
-
-
-def apply_prices(cardinal):
-    failed = []
-    with FP_LOT_LOCK:
-        target = 'price_event' if database().setting('event_mode') == '1' else 'price_normal'
-        for lot in database().rows(f'SELECT lot_id,{target} price FROM lots WHERE {target}>0'):
-            try:
-                fields = cardinal.account.get_lot_fields(int(lot['lot_id']))
-                fields.price = round(positive_float(lot['price'], 'Цена'), 2)
-                cardinal.account.save_lot(fields.renew_fields())
-            except Exception:
-                failed.append(str(lot['lot_id']))
-            if STOP.wait(1):
-                return
-    notify_admins(cardinal, 'Auto VIP: цены обновлены.' if not failed else 'Auto VIP: не удалось обновить цены лотов: ' + ', '.join(failed))
-
-
-def command_names(text: str) -> str:
-    if database().setting("legacy_commands", "0") == "1":
-        return text.replace("!vip_time", "!время").replace("!vip_link", "!ссылка").replace("!vip_friends", "!друзья").replace("!vip_help", "!команды").replace("!vip_stock", "!бронь").replace("!vip_review", "!отзыв")
-    return text
-
-
-def process_chat_message(cardinal, event):
-    obj = getattr(event, 'message', None) or getattr(event, 'chat', None)
-    text = command_text(getattr(obj, 'text', '') or getattr(obj, 'last_message_text', ''))
-    buyer = str(getattr(obj, 'author_id', None) or getattr(obj, 'last_message_author_id', '') or '')
-    chat = str(getattr(obj, 'chat_id', None) or getattr(obj, 'id', '') or '')
-    parsed = parse_chat_command(text)
-    if parsed is None:
-        return
-    if not buyer.isdigit() or buyer == '0':
-        trace_command('process', 'Не подтверждён автор-покупатель')
-        return
-    if buyer == str(cardinal.account.id) or getattr(obj, 'by_bot', False):
-        trace_command('process', 'Пропущено сообщение продавца / бота')
-        return
-    action, parts = parsed
-    trace_command('process', 'Команда принята: ' + action)
-    if action == 'help':
-        text = ('🎮 Команды VIP в этом чате:\n!vip_time — остаток времени\n!vip_link — обновить ссылку\n'
-                '!vip_friends Ник — принять заявку и дать доступ\n!vip_stock — свободные серверы общего пула\n'
-                '!vip_review — проверить отзыв 5★\n!vip_help — эта справка\n\n'
-                'При нескольких арендах: !vip_link #ЗАКАЗ или !vip_friends #ЗАКАЗ Ник.')
-        text += '\nРусские команды: !время, !ссылка, !друзья Ник, !бронь, !отзыв, !команды.\nСправка также: /com, !com, !command, !commands.\nСовместимость первой версии: !time, !link, !friend Ник, !вип.'
-        send_fp(cardinal, chat, text)
-        return
-    if action == 'stock':
-        with database().lock, database().conn() as con:
-            count = con.execute("""SELECT COUNT(*) FROM servers s JOIN accounts a ON a.id=s.owner_account_id
-                WHERE s.status='free' AND s.enabled=1 AND s.verified=1 AND a.enabled=1 AND s.category_id IS NULL
-                AND s.place_id IS NOT NULL AND a.roblox_id IS NOT NULL
-                AND NOT EXISTS(SELECT 1 FROM rentals r WHERE r.server_id=s.server_id AND r.status IN
-                    ('issuing','delivering','active','refunding','cleaning','cleanup_failed'))
-                AND NOT EXISTS(SELECT 1 FROM lots l WHERE l.server_id=s.server_id)""").fetchone()[0]
-        send_fp(cardinal, chat, f'Свободных общих серверов: {count}.')
-        return
-    rentals = database().rows("SELECT * FROM rentals WHERE buyer_id=? AND chat_id=? AND status='active' AND end_time>? ORDER BY start_time", (buyer, chat, time.time()))
-    selectors = [part.lstrip('#') for part in parts if part.startswith('#')]
-    if len(selectors) > 1:
-        send_fp(cardinal, chat, 'Укажите один номер заказа. Пример: !vip_friends #ЗАКАЗ Ник')
-        return
-    selector = selectors[0] if selectors else None
-    parts = [part for part in parts if not part.startswith('#')]
-    rental = None
-    if selector:
-        p = database().row("SELECT rental_id FROM payments WHERE order_id=? COLLATE NOCASE AND buyer_id=? AND chat_id=? AND state IN ('issued','extended','extension_pending')", (selector, buyer, chat))
-        rental = next((r for r in rentals if p and r['rental_id'] == p['rental_id']), None)
-    elif len(rentals) == 1:
-        rental = rentals[0]
-    if not rental:
-        trace_command('process', 'Нужен выбор заказа' if rentals else 'Активной аренды покупателя в этом чате нет')
-        labels = '\n'.join(f'#{payment_label(r["rental_id"])} · лот {r["lot_id"]} · {format_left(r["end_time"]-time.time())}' for r in rentals)
-        send_fp(cardinal, chat, ('Укажите заказ после команды:\n' + labels) if rentals else 'Активных VIP-аренд нет.')
-        return
-    if action == 'friends':
-        if len(parts) != 1:
-            send_fp(cardinal, chat, f'Формат: !друзья #{payment_label(rental["rental_id"])} Ник')
-        else:
-            add_friend(cardinal, rental, parts[0])
-        return
-    with ExitStack() as operations:
-        lock = operation_lock('rental:' + rental['rental_id'])
-        if not lock.acquire(blocking=False):
-            send_fp(cardinal, chat, '⏳ С этой арендой уже выполняется операция. Повторите команду чуть позже.')
-            return
-        operations.callback(lock.release)
-        rental = database().row("SELECT * FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (rental['rental_id'], time.time()))
-        if not rental:
-            send_fp(cardinal, chat, 'Аренда уже завершена или её состояние изменилось. Проверьте !vip_time.')
-            return
-        if action == 'time':
-            send_fp(cardinal, chat, f'⏱ #{payment_label(rental["rental_id"])}: {format_left(rental["end_time"]-time.time())}.')
-        elif action == 'link':
-            try:
-                send_fp(cardinal, chat, '⏳ Обновляю ссылку VIP-сервера. Дождитесь результата.')
-                api, _ = roblox_for_server(rental['server_id'])
-                link = api.regenerate_link(rental['server_id'])
-                if rental['end_time'] <= time.time():
-                    send_fp(cardinal, chat, 'Время аренды закончилось во время обновления ссылки.')
-                    return
-                with database().lock, database().conn() as con:
-                    con.execute('UPDATE rentals SET link=? WHERE rental_id=?', (link, rental['rental_id']))
-                    con.execute("UPDATE outbox SET state='cancelled' WHERE rental_id=? AND kind='link' AND state='pending'", (rental['rental_id'],))
-                    enqueue(con, 'link:' + str(uuid.uuid4()), chat, '🔗 Новая ссылка: ' + link, rental['rental_id'], kind='link')
-                deliver_command_replies(cardinal, rental['rental_id'], kind='link')
-            except Exception:
-                send_fp(cardinal, chat, 'Roblox не подтвердил обновление ссылки. Попробуйте позднее.')
-        elif action == 'review':
-            send_fp(cardinal, chat, '⏳ Проверяю отзыв 5★ по вашему заказу.')
-            rows = database().rows("SELECT order_id FROM payments WHERE rental_id=? AND state IN ('issued','extended','extension_pending') AND review_bonus_given=0", (rental['rental_id'],))
-            added = False
-            for p in rows:
-                if selector and p['order_id'].lower() != selector.lower():
-                    continue
-                try:
-                    granted = grant_review(cardinal, cardinal.account.get_order(p['order_id']))
-                    added = granted or added
-                    if granted:
-                        deliver_command_replies(cardinal, rental['rental_id'], dedupe='review:' + p['order_id'])
-                except Exception:
-                    pass
-            if not added:
-                send_fp(cardinal, chat, 'Новый отзыв 5★ не найден, бонус уже выдан или выключен продавцом.')
-
-
-def add_friend(cardinal, rental, raw):
-    db = database()
-    with GUARD:
-        if 'rental:' + rental['rental_id'] in RUNNING:
-            send_fp(cardinal, rental['chat_id'], 'Операция с этой арендой уже выполняется. Повторите позже.')
-            return
-    lock = operation_lock('rental:' + rental['rental_id'])
-    if not lock.acquire(blocking=False):
-        send_fp(cardinal, rental['chat_id'], 'Операция с этой арендой уже выполняется. Повторите позже.')
-        return
+def blacklisted(username: Any) -> bool:
+    if not username:
+        return False
     try:
-        rental = db.row("SELECT * FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (rental['rental_id'], time.time()))
-        if not rental:
-            return
-        if db.setting('friends_module_active') != '1':
-            send_fp(cardinal, rental['chat_id'], 'Автодобавление друзей выключено.')
-            return
-        api, _ = roblox_for_server(rental['server_id'])
-        with operation_lock('owner:' + str(rental['owner_account_id'])):
-            send_fp(cardinal, rental['chat_id'], '⏳ Проверяю заявку Roblox и доступ к вашему серверу.')
-            target = api.resolve_user(raw)
-            if not target:
-                raise ValueError('Пользователь Roblox не найден')
-            friend_id, friend_name = target
-            if friend_id == str(api.account.roblox_id):
-                raise ValueError('Владелец уже имеет доступ к серверу')
-            row = db.row('SELECT state FROM rental_friends WHERE rental_id=? AND roblox_id=?', (rental['rental_id'], friend_id))
-            if row and row['state'] == 'added':
-                send_fp(cardinal, rental['chat_id'], 'Этот пользователь уже добавлен.')
-                return
-            lot = db.row('SELECT friend_limit FROM lots WHERE lot_id=?', (rental['lot_id'],))
-            limit = lot['friend_limit'] if lot else -1
-            limit = as_int(db.setting('friends_default_limit'), 0) if limit < 0 else limit
-            used = db.row("SELECT COUNT(*) n FROM rental_friends WHERE rental_id=? AND state!='removed'", (rental['rental_id'],))['n']
-            if (not row or row['state'] == 'removed') and limit and used >= limit:
-                send_fp(cardinal, rental['chat_id'], db.setting('msg_friend_limit').replace('{limit}', str(limit)))
-                return
-            prior = api.is_friend(friend_id)
-            # Persist intent BEFORE accepting/granting, so crashes cannot orphan access.
-            with db.lock, db.conn() as con:
-                con.execute("INSERT INTO rental_friends(rental_id,roblox_id,name,unfriend_on_cleanup,state) VALUES(?,?,?,?,'pending') ON CONFLICT(rental_id,roblox_id) DO UPDATE SET state='pending'", (rental['rental_id'], friend_id, friend_name, int(not prior)))
-                if not prior:
-                    con.execute('INSERT OR IGNORE INTO managed_friends VALUES(?,?)', (rental['owner_account_id'], friend_id))
-            try:
-                if not prior and not api.accept_friend_request(friend_id):
-                    raise ValueError('Сначала отправьте заявку владельцу Roblox')
-                if rental['end_time'] <= time.time() or not api.set_permission(rental['server_id'], friend_id, True):
-                    raise ValueError('Roblox не подтвердил доступ или время аренды закончилось')
-                if rental['end_time'] <= time.time():
-                    raise ValueError('Время аренды закончилось')
-                with db.lock, db.conn() as con:
-                    con.execute("UPDATE rental_friends SET state='added' WHERE rental_id=? AND roblox_id=?", (rental['rental_id'], friend_id))
-                send_fp(cardinal, rental['chat_id'], db.setting('msg_friend_added').replace('{friend_name}', friend_name))
-            except Exception:
-                # Unknown network outcome must be compensated, even if no reply was received.
-                try:
-                    if api.set_permission(rental['server_id'], friend_id, False):
-                        with db.lock, db.conn() as con:
-                            con.execute("UPDATE rental_friends SET state='removed' WHERE rental_id=? AND roblox_id=?", (rental['rental_id'], friend_id))
-                        cleanup_managed_friends(api)
-                except Exception:
-                    pass
-                send_fp(cardinal, rental['chat_id'], db.setting('msg_friend_not_found').replace('{input}', raw))
+        return str(username) in (getattr(CARDINAL, "blacklist", None) or [])
     except Exception:
-        if rental:
-            send_fp(cardinal, rental['chat_id'], 'Не удалось добавить пользователя. Проверьте заявку владельцу и повторите команду.')
-    finally:
-        lock.release()
+        return False
 
 
-def process_review(cardinal, event):
-    if MessageTypes is None:
-        return
-    message = event.message
-    allowed = (getattr(MessageTypes, 'NEW_FEEDBACK', None), getattr(MessageTypes, 'FEEDBACK_CHANGED', None))
-    if str(getattr(message, 'author_id', '')) != '0' or getattr(message, 'type', None) not in allowed:
-        return
-    order = cardinal.get_order_from_object(message)
-    if order:
-        grant_review(cardinal, cardinal.account.get_order(order.id))
-
-
-# ----- Telegram panel -------------------------------------------------------
-
-def edit_or_send(bot, chat_id, text, kb, message_id=None):
-    footer = (f'\n\n<i>v{VERSION}</i>\n'
-              f'Автор: <a href="{AUTHOR_URL}">{CREDITS}</a> · '
-              f'<a href="{DEVELOPER_URL}">Канал</a>')
-    text += footer
-    options = {'reply_markup':kb, 'parse_mode':'HTML', 'disable_web_page_preview':True}
-    if message_id:
-        try:
-            bot.edit_message_text(text, chat_id, message_id, **options)
-            return
-        except Exception as exc:
-            if 'message is not modified' in str(exc).lower():
-                return
-    bot.send_message(chat_id, text, **options)
-
-
-def main_menu(bot, chat_id, message_id=None):
-    db = database()
-    counts = db.row("""SELECT
-        (SELECT COUNT(*) FROM accounts WHERE id>0 AND enabled=1 AND enabled=1) accounts,
-        (SELECT COUNT(*) FROM categories) categories,
-        (SELECT COUNT(*) FROM servers WHERE enabled=1) servers,
-        (SELECT COUNT(DISTINCT server_id) FROM rentals WHERE status IN
-            ('active','issuing','delivering','refunding','cleaning','cleanup_failed')) occupied,
-        (SELECT COUNT(*) FROM rentals WHERE status='active') active,
-        (SELECT COUNT(*) FROM rentals WHERE status='cleanup_failed') failed,
-        (SELECT COUNT(*) FROM incoming_orders WHERE state='attention') attention,
-        (SELECT COUNT(*) FROM payments WHERE state IN ('refund_pending','partial_refund')) refunds,
-        (SELECT COUNT(*) FROM outbox WHERE state IN ('pending','sending')) messages""")
-    stock = db.row("""SELECT COUNT(*) free, COALESCE(SUM(CASE WHEN s.category_id IS NULL
-        AND NOT EXISTS(SELECT 1 FROM lots l WHERE l.server_id=s.server_id) THEN 1 ELSE 0 END),0) general
-        FROM servers s JOIN accounts a ON a.id=s.owner_account_id
-        WHERE s.enabled=1 AND s.verified=1 AND s.status='free' AND a.enabled=1
-        AND s.place_id IS NOT NULL AND a.roblox_id IS NOT NULL
-        AND NOT EXISTS(SELECT 1 FROM rentals r WHERE r.server_id=s.server_id AND r.status IN
-            ('issuing','delivering','active','refunding','cleaning','cleanup_failed'))""")
-    earned = db.rows("SELECT currency,SUM(price) total FROM payments WHERE state IN ('issued','extended') GROUP BY currency ORDER BY currency")
-    amounts = [money_text(row['total'], row['currency']) for row in earned]
-    income = ' · '.join(amounts[:3]) if amounts else 'пока нет выдач'
-    if len(amounts)>3:
-        income += ' · подробнее в статистике'
-    event_mode = db.setting('event_mode') == '1'
-    mode = '🎉 Евент' if event_mode else '📋 Обычный'
-    proxy = 'настроен' if db.setting('global_proxy') else 'напрямую'
-    text = ('💼 <b>Auto VIP Roblox</b>\n'
-            f'👥 Аккаунтов: <b>{counts["accounts"]}</b>\n'
-            f'🖥 Серверов: <b>{counts["servers"]}</b> | 📁 Категорий: <b>{counts["categories"]}</b>\n\n'
-            f'🌐 Глобальный прокси: <b>{proxy}</b>\n\n'
-            f'🟢 Свободно: <b>{stock["free"]}</b> (общих: {stock["general"]}) | 🔴 Занято: <b>{counts["occupied"]}</b>\n'
-            f'💰 Выдано: <b>{income}</b>\n\n⚙️ Режим: <b>{mode}</b>')
-    alerts = []
-    if counts['failed']:
-        alerts.append(f'очистка — {counts["failed"]}')
-    if counts['attention']:
-        alerts.append(f'заказы — {counts["attention"]}')
-    if counts['refunds']:
-        alerts.append(f'возвраты — {counts["refunds"]}')
-    if alerts:
-        text += '\n\n⚠️ <b>Требуют внимания:</b> ' + ', '.join(alerts)
-    if counts['messages']:
-        text += f'\n✉️ Ожидают отправки: <b>{counts["messages"]}</b>'
-    if not counts['accounts']:
-        text += '\n\n💡 Начните с добавления аккаунта Roblox.'
-    kb = Keyboard(row_width=2)
-    kb.row(panel_button('Переключить режим', 'mode'))
-    kb.row(panel_button('🌐 Настроить прокси', 'proxy'))
-    order_title = '📥 Заказы' + (f' · {counts["attention"]}' if counts['attention'] else '')
-    kb.row(panel_button('🖥 Сервера','servers'), panel_button('👥 Аккаунты','accounts'))
-    kb.row(panel_button('📁 Категории серверов','cats'))
-    kb.row(panel_button('⚙️ Лоты','lots'), panel_button('🕹 Управление арендой','rentals'))
-    kb.row(panel_button('🎁 Бонусы','bonuses'), panel_button('📊 Статистика','stats'))
-    kb.row(panel_button('📜 История заказов','c_history:0'), panel_button('📥 Разбор заказов','orders'))
-    kb.row(panel_button('⭐ Отзывы','reviews'))
-    kb.row(panel_button('🤝 Заявки в друзья','friends'))
-    kb.row(panel_button('✉️ Шаблоны сообщений','templates'))
-    kb.row(panel_button('⚙️ Настройки','settings'), panel_button('📖 Инструкция','guide'))
-    kb.row(Button('👨‍💻 Автор', url=AUTHOR_URL), Button('📣 Канал автора', url=DEVELOPER_URL))
-    kb.row(panel_button('🔄 Обновить панель', 'main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def simple_list_menu(bot, chat_id, message_id, kind, page=0):
-    db = database()
-    definitions = {
-        'accounts': ('accounts', 'id>0 AND enabled=1', 'id', '👥 Управление аккаунтами', 'add_account'),
-        'servers': ('servers', 'enabled=1 AND category_id IS NULL', 'server_id', '🖥 Общие серверы', 'add_server'),
-        'cats': ('categories', '1=1', 'id', '📁 Категории серверов', 'add_category'),
-        'lots': ('lots', '1=1', 'lot_id', '⚙️ Настройка лотов', 'add_lot'),
-    }
-    table, where, key, title, add_action = definitions[kind]
-    total = db.row(f'SELECT COUNT(*) n FROM {table} WHERE {where}')['n']
-    page, pages = classic_page(total, page)
-    rows = db.rows(f'SELECT * FROM {table} WHERE {where} ORDER BY {key} LIMIT 8 OFFSET ?', (page*8,))
-    text = f'<b>{title}</b>\n\nВсего: {total} · Страница {page+1}/{pages}\n\n'
-    if kind == 'servers':
-        text += 'Серверы вне категорий. Для разных игр откройте «Категории серверов».\n\n'
-    elif kind == 'cats':
-        text += 'Одна игра — одна категория. Выберите категорию, чтобы добавить в неё серверы.\n\n'
-    elif kind == 'accounts':
-        text += 'Выберите аккаунт для обновления cookie или удаления.\n\n'
-    if not rows:
-        text += 'Пока ничего не добавлено. Нажмите кнопку ниже.'
-    kb = Keyboard(row_width=2)
-    for row in rows:
-        identity = row[key]
-        if kind == 'accounts':
-            label = '👤 ' + str(row['username'] or identity)
-            action = f'c_account:{identity}'
-        elif kind == 'servers':
-            label = ('🟢 ' if row['status']=='free' else '🟠 ') + str(identity)
-            action = f'c_server:{identity}'
-        elif kind == 'cats':
-            count = db.row('SELECT COUNT(*) n FROM servers WHERE enabled=1 AND category_id=?', (identity,))['n']
-            label, action = f'📁 {row["name"]} · {count} серв.', f'c_cat:{identity}:0'
-        else:
-            label = ('⏸ ' if row['paused'] else '📦 ') + str(row['name'] or identity)
-            action = f'lot:{identity}'
-        kb.row(classic_button(label, action))
-    classic_nav(kb, page, pages, 'listpage:' + kind)
-    label = {'accounts':'аккаунт','servers':'общий сервер','cats':'категорию','lots':'лот'}[kind]
-    kb.row(panel_button('➕ Добавить ' + label, 'c_wizard:' + add_action))
-    kb.row(panel_button('⬅️ Главное меню', 'main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def rentals_menu(bot, chat_id, message_id, page=0, history=False):
-    where = "status NOT IN ('issuing','delivering','active','refunding','cleaning','cleanup_failed')" if history else "status IN ('issuing','delivering','active','refunding','cleaning','cleanup_failed')"
-    total = database().row('SELECT COUNT(*) n FROM rentals WHERE ' + where)['n']
-    page, pages = classic_page(total, page, 7)
-    rows = database().rows('SELECT * FROM rentals WHERE ' + where + ' ORDER BY end_time DESC LIMIT 7 OFFSET ?', (page*7,))
-    text = f'{"📜 История заказов" if history else "🕹 Управление арендой"}\n\nВсего: {total} · Страница {page+1}/{pages}\n\n'
-    kb = Keyboard(row_width=2)
-    labels = {'active':'Активна','delivering':'Отправка ссылки','issuing':'Подготовка','refunding':'Возврат','cleaning':'Очистка','cleanup_failed':'Нужен повтор очистки','completed':'Завершена','cancelled':'Отменена','refunded':'Возвращена','issue_failed':'Не выдана'}
-    for index, rental in enumerate(rows, page*7+1):
-        order = payment_label(rental['rental_id'])
-        status = labels.get(rental['status'], rental['status'])
-        text += f'{index}. #{esc(order)} · {esc(status)}\nСервер: {esc(rental["server_id"])}'
-        if rental['status']=='active':
-            text += ' · ' + format_left(rental['end_time']-time.time())
-        text += '\n\n'
-        kb.row(classic_button(f'#{order} · сервер {rental["server_id"]}', f'rental:{rental["rental_id"]}'))
-    if not rows:
-        text += 'Пока нет записей.'
-    classic_nav(kb, page, pages, 'c_history' if history else 'rentpage')
-    kb.row(panel_button('⬅️ Главное меню', 'main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def rental_details(bot, call, rental_id):
-    r = database().row('SELECT * FROM rentals WHERE rental_id=?', (rental_id,))
-    if not r:
-        raise ValueError('Аренда не найдена')
-    payments = database().rows('SELECT order_id,state,price,currency FROM payments WHERE rental_id=? ORDER BY created_at', (rental_id,))
-    lines = '\n'.join(f'#{esc(p["order_id"])}: {esc(p["state"])} · {p["price"]:g} {esc(p["currency"])}' for p in payments[-10:])
-    text = (f'🕹 <b>Аренда #{esc(payment_label(rental_id))}</b>\nЛот: {r["lot_id"]}\n'
-        f'Сервер: <code>{esc(r["server_id"])}</code>\nПокупатель: {esc(r["buyer_id"])}\n'
-        f'Осталось: {format_left(r["end_time"]-time.time())}\nСтатус: <code>{esc(r["status"])}</code>\n'
-        f'Причина завершения: {esc(r["cleanup_reason"] or "—")}\nОшибка: {esc(r["last_error"] or "нет")}\n\n'
-        f'Платежи (последние 10 из {len(payments)}):\n{lines}\n\nВозврат возвращает все платежи этой аренды. Отменить — без возврата.')
-    kb = Keyboard(row_width=2)
+def rental_lock(rental_id: str) -> threading.RLock:
     with GUARD:
-        busy = 'rental:' + rental_id in RUNNING
-    if busy or r['status'] in ('issuing','cleaning','refunding'):
-        kb.add(Button('⏳ Выполняется операция', callback_data=f'{PREFIX}:busy'))
-    else:
-        if r['status'] == 'active' and r['end_time'] > time.time():
-            kb.add(Button('➕ Продлить', callback_data=f'{PREFIX}:input:extend:{rental_id}'))
-        if r['status'] in ('active','delivering'):
-            kb.add(Button('✅ Завершить', callback_data=f'{PREFIX}:stop:{rental_id}'), Button('❌ Отменить', callback_data=f'{PREFIX}:cancelrent:{rental_id}'))
-        if r['status'] == 'cleanup_failed':
-            kb.add(Button('🔁 Повторить очистку', callback_data=f'{PREFIX}:retry:{rental_id}'))
-        if any(p['state'] not in ('refunded','partial_refund') for p in payments):
-            kb.add(Button('💸 Возврат всех платежей', callback_data=f'{PREFIX}:refund:{rental_id}'))
-    kb.add(Button('🔄 Обновить', callback_data=f'{PREFIX}:rental:{rental_id}'), Button('◀️ Аренды', callback_data=f'{PREFIX}:rentals'))
-    edit_or_send(bot, call.message.chat.id, text, kb, call.message.message_id)
+        return LOCKS.setdefault("rental:" + rental_id, threading.RLock())
 
 
-def stats_menu(bot, chat_id, message_id):
-    rows = database().rows('SELECT state,currency,COUNT(*) n,SUM(price) total FROM payments GROUP BY state,currency ORDER BY currency,state')
-    text = '📊 <b>Платежи по валютам и состояниям</b>\n\n'
-    for r in rows:
-        text += f'{esc(r["currency"])} · {esc(r["state"])}: {r["n"]} шт. / {r["total"]:.2f}\n'
-    text += '\nissued/extended — доставлено; delivery_pending/extension_pending — ожидает сообщения; refund_pending — возврат не подтверждён; refunded — возвращено. Частичные возвраты требуют сверки суммы.'
-    edit_or_send(bot, chat_id, text, Keyboard().add(Button('◀️ В меню', callback_data=f'{PREFIX}:main')), message_id)
-
-
-def bonuses_menu(bot, chat_id, message_id, page=0):
-    total = database().row('SELECT COUNT(*) n FROM wholesale_bonuses')['n']
-    page, pages = classic_page(total, page)
-    rules = database().rows('SELECT * FROM wholesale_bonuses ORDER BY buy_hours,id LIMIT 8 OFFSET ?', (page*8,))
-    text = f'🎁 <b>Оптовые бонусы</b>\n\nСтраница {page+1}/{pages}\nЗа каждый полный набор часов из выбранного правила добавляется подарок. Применяется одно правило с наибольшим достигнутым порогом.\n'
-    kb = Keyboard(row_width=2)
-    for rule in rules:
-        text += f'\nКупи {rule["buy_hours"]:g} ч. → +{rule["get_hours"]:g} ч.'
-        kb.row(panel_button(f'✏️ {rule["buy_hours"]:g} → +{rule["get_hours"]:g}', f'c_wizard:edit_bonus:{rule["id"]}'),
-               panel_button('🗑 Удалить', f'c_confirm:bonus:{rule["id"]}'))
-    if not rules:
-        text += '\nПравил пока нет.'
-    classic_nav(kb, page, pages, 'c_bonuses')
-    kb.row(panel_button('➕ Добавить правило', 'c_wizard:bonus'))
-    kb.row(panel_button('⭐ Бонус за отзыв', 'reviews'), panel_button('⬅️ Главное меню','main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def settings_menu(bot, chat_id, message_id):
-    text = ('⚙️ <b>Настройки магазина</b>\n\n'
-            '🟢 Включено  ·  ⚪ Выключено\nНажмите переключатель, чтобы изменить настройку.\n\n'
-            '<b>Автолоты</b> — скрывать лоты без свободных серверов.\n'
-            '<b>Автовозврат</b> — возвращать платёж при невыдаче.\n'
-            '<b>Команды покупателя</b> — !команды или !command. Русские VIP-команды работают без отдельного переключателя.')
-    kb = Keyboard(row_width=2)
-    kb.row(switch_button('lot_management','Автолоты','settings'), switch_button('auto_refund','Автовозврат','settings'))
-    kb.row(panel_button('🤝 Друзья','friends'), panel_button('⭐ Отзывы','reviews'))
-    kb.row(panel_button('💬 Сообщения','templates'), panel_button('🌐 Прокси','proxy'))
-    kb.row(panel_button('🔎 Диагностика команд','command_diagnostics'))
-    kb.row(panel_button('◀️ Главное меню','main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def begin_input(tg, bot, call, action, *extra):
-    if action not in INPUTS:
-        raise ValueError('Неизвестное действие')
-    if action == 'extend':
-        r = database().row("SELECT 1 FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (extra[0] if extra else '', time.time()))
-        with GUARD:
-            busy = 'rental:' + (extra[0] if extra else '') in RUNNING
-        if not r or busy:
-            raise ValueError('Аренда уже завершена или занята операцией')
-    prompt = INPUTS[action]
-    if extra and action != 'extend':
-        prompt += '\nВыбранный ID: ' + extra[0]
-    message = bot.send_message(call.message.chat.id, esc(prompt), parse_mode='HTML', reply_markup=Keyboard().add(Button('❌ Отмена ввода', callback_data=f'{PREFIX}:main')))
-    tg.set_state(call.message.chat.id, message.message_id, call.from_user.id, STATE_PREFIX + action, {'extra': list(extra), 'at': time.time()})
-
-
-def current_state(tg, message):
-    state = tg.get_state(message.chat.id, message.from_user.id) or {}
-    if state.get('state') == STATE_PREFIX + 'classic':
-        return 'classic', state.get('data') or {}
-    for name in INPUTS:
-        if tg.check_state(message.chat.id, message.from_user.id, STATE_PREFIX + name):
-            return name, state.get('data') or {}
-    return None
-
-
-def handle_input(tg, bot, message):
-    if CARDINAL is None or not is_cardinal_admin(CARDINAL, message.from_user.id) or not is_plugin_enabled(CARDINAL):
-        return
-    found = current_state(tg, message)
-    if not found or not message.text:
-        return
-    if found[0] == 'classic':
-        classic_input(tg, bot, message, found[1])
-        return
-    action, data = found
-    if message.text.startswith('/'):
-        tg.clear_state(message.chat.id, message.from_user.id, True)
-        return
-    if data.get('at', time.time()) + 1800 < time.time():
-        tg.clear_state(message.chat.id, message.from_user.id, True)
-        bot.reply_to(message, 'Время ожидания ввода истекло. Откройте действие снова.')
-        return
-    try:
-        reply = update_configuration(action, message.text.strip(), data.get('extra') or [])
-        tg.clear_state(message.chat.id, message.from_user.id, True)
-        bot.reply_to(message, reply, parse_mode='HTML')
-        if action in ('add_account','update_account','proxy'):
-            try:
-                bot.delete_message(message.chat.id, message.message_id)
-            except Exception:
-                pass
-    except (ValueError, IndexError, TypeError, sqlite3.IntegrityError) as exc:
-        # Never echo credentials or SQLite input values in an error.
-        detail = str(exc) if action not in ('add_account','update_account','proxy') and isinstance(exc, ValueError) else 'Проверьте формат, данные и подключение.'
-        bot.reply_to(message, '❌ ' + esc(detail), parse_mode='HTML')
-    except Exception:
-        LOG.error('AutoVIP: не удалось выполнить настройку %s', action)
-        bot.reply_to(message, '❌ Не удалось выполнить действие. Настройки не подтверждены; повторите после проверки подключения.')
-
-
-def init_telegram(cardinal):
-    if not cardinal.telegram:
-        return
-    tg, bot = cardinal.telegram, cardinal.telegram.bot
-    def clear_own(chat, user):
-        state = tg.get_state(chat, user) or {}
-        if str(state.get('state', '')).startswith(STATE_PREFIX):
-            tg.clear_state(chat, user, True)
-    def open_panel(message):
-        if not is_cardinal_admin(cardinal, message.from_user.id):
-            return
-        clear_own(message.chat.id, message.from_user.id)
-        main_menu(bot, message.chat.id)
-    def callback(call):
-        try:
-            if not is_cardinal_admin(cardinal, call.from_user.id):
-                bot.answer_callback_query(call.id, 'Нет доступа', show_alert=True)
-                return
-            if not is_plugin_enabled(cardinal):
-                bot.answer_callback_query(call.id, 'Плагин выключен. Включите его в Cardinal.', show_alert=True)
-                return
-            bot.answer_callback_query(call.id)
-            chat, mid = call.message.chat.id, call.message.message_id
-            parts = call.data.split(':')
-            action = parts[1]
-            if action.startswith('c_'):
-                with operation_lock(f'admin-input:{chat}:{call.from_user.id}'):
-                    classic_callback(tg, bot, call, parts[1:])
-                return
-            clear_own(chat, call.from_user.id)
-            if action == 'main':
-                main_menu(bot, chat, mid)
-            elif action in ('accounts','servers','cats','lots'):
-                simple_list_menu(bot, chat, mid, action)
-            elif action == 'listpage':
-                if parts[2] not in ('accounts','servers','cats','lots'):
-                    raise ValueError('Неизвестный список')
-                simple_list_menu(bot, chat, mid, parts[2], int(parts[3]))
-            elif action in ('rentals','rentpage'):
-                rentals_menu(bot, chat, mid, int(parts[2]) if len(parts)>2 else 0)
-            elif action == 'rental':
-                rental_details(bot, call, parts[2])
-            elif action == 'lot':
-                lot_details(bot, chat, mid, int(parts[2]))
-            elif action == 'pause':
-                with ORDER_LOCK, database().lock, database().conn() as con:
-                    if con.execute('UPDATE lots SET paused=1-paused WHERE lot_id=?', (int(parts[2]),)).rowcount != 1:
-                        raise ValueError('Лот не найден')
-                lot_details(bot, chat, mid, int(parts[2]))
-            elif action in ('orders','orderpage'):
-                orders_menu(bot, chat, mid, int(parts[2]) if len(parts)>2 else 0)
-            elif action == 'guidepage':
-                guide_menu(bot, chat, mid, parts[2])
-            elif action == 'command_diagnostics':
-                command_diagnostics_menu(bot, chat, mid)
-            elif action in ('stats','bonuses','settings','guide','friends','reviews','templates'):
-                {'stats': stats_menu, 'bonuses': bonuses_menu, 'settings': settings_menu, 'guide': guide_menu,
-                 'friends':friends_menu, 'reviews':reviews_menu, 'templates':templates_menu}[action](bot, chat, mid)
-            elif action == 'input':
-                begin_input(tg, bot, call, parts[2], *parts[3:])
-            elif action == 'proxy':
-                begin_input(tg, bot, call, 'proxy')
-            elif action == 'reset_templates':
-                for key, value in DEFAULTS.items():
-                    if key.startswith('msg_'):
-                        database().set_setting(key, value)
-                templates_menu(bot, chat, mid)
-            elif action == 'toggle':
-                key = parts[2]
-                if key == 'legacy_commands':
-                    settings_menu(bot, chat, mid)
-                    return
-                if key not in ('lot_management','auto_refund','friends_auto_remove','friends_module_active','legacy_commands','review_bonus_active'):
-                    raise ValueError('Неизвестная настройка')
-                destination = parts[3] if len(parts)>3 else 'settings'
-                if destination not in ('settings','friends','reviews'):
-                    raise ValueError('Неизвестный раздел настроек')
-                database().set_setting(key, '0' if database().setting(key) == '1' else '1')
-                {'settings':settings_menu,'friends':friends_menu,'reviews':reviews_menu}[destination](bot, chat, mid)
-            elif action == 'mode':
-                with GUARD:
-                    if 'prices' in RUNNING:
-                        raise ValueError('Цены уже обновляются')
-                    database().set_setting('event_mode', '0' if database().setting('event_mode') == '1' else '1')
-                    run_once('prices', apply_prices, cardinal)
-                main_menu(bot, chat, mid)
-            elif action in ('stop','cancelrent','retry','refund'):
-                rid = parts[2]
-                r = database().row('SELECT * FROM rentals WHERE rental_id=?', (rid,))
-                if not r or r['status'] in ('issuing','cleaning','refunding'):
-                    raise ValueError('Аренда не найдена или занята операцией')
-                if action in ('stop','cancelrent') and r['status'] not in ('active','delivering'):
-                    raise ValueError('Аренда уже завершена')
-                if action == 'retry' and r['status'] != 'cleanup_failed':
-                    raise ValueError('Повтор очистки сейчас не нужен')
-                if action == 'refund':
-                    started = run_once('rental:' + rid, refund_rental, cardinal, rid)
-                else:
-                    reason = {'stop':'manual','cancelrent':'cancelled','retry':r['cleanup_reason'] or 'expired'}[action]
-                    started = run_once('rental:' + rid, cleanup_rental, cardinal, rid, reason)
-                if not started:
-                    raise ValueError('Операция уже выполняется')
-                rental_details(bot, call, rid)
-            elif action != 'busy':
-                raise ValueError('Неизвестное действие')
-        except ValueError as exc:
-            bot.send_message(call.message.chat.id, '❌ ' + esc(exc), parse_mode='HTML')
-        except Exception:
-            LOG.error('AutoVIP: ошибка Telegram-действия')
-            bot.send_message(call.message.chat.id, '❌ Не удалось выполнить действие. Обновите карточку.')
-    def cancel(message):
-        if is_cardinal_admin(cardinal, message.from_user.id):
-            clear_own(message.chat.id, message.from_user.id)
-    tg.msg_handler(open_panel, commands=['vip','vip_config'])
-    tg.msg_handler(cancel, commands=['cancel'], func=lambda m: current_state(tg, m) is not None)
-    tg.cbq_handler(callback, lambda c: bool(c.data) and c.data.startswith(PREFIX + ':'))
-    tg.msg_handler(lambda m: handle_input(tg, bot, m), func=lambda m: current_state(tg, m) is not None)
-    cardinal.add_telegram_commands(UUID, [('vip_config','панель Auto VIP Roblox',True), ('vip','панель Auto VIP Roblox',True)])
-
-
-def init_plugin(cardinal):
-    global DB, CARDINAL, INSTANCE_LOCK
-    if INSTANCE_LOCK is not None:
-        raise RuntimeError('Auto VIP уже запущен в этом процессе')
-    handle = open(DB_PATH + '.lock', 'a+b')
-    try:
-        if os.name == 'nt':
-            import msvcrt
-            if os.path.getsize(DB_PATH + '.lock') == 0:
-                handle.write(b'0')
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, IOError):
-        handle.close()
-        raise RuntimeError('Эта база Auto VIP уже используется другим процессом. Остановите второй экземпляр.') from None
-    try:
-        DB = PluginDB(DB_PATH)
-        CARDINAL = cardinal
-        INSTANCE_LOCK = handle
-        init_telegram(cardinal)
-    except Exception:
-        INSTANCE_LOCK = None
-        handle.close()
-        raise
-    LOG.info('Auto VIP Roblox v%s initialized', VERSION)
-
-
-def start_worker(cardinal: Any) -> None:
-    global WORKER
-    if WORKER and WORKER.is_alive():
-        return
-    STOP.clear()
-    WORKER = threading.Thread(target=worker_loop, args=(cardinal,), daemon=True, name="AutoVIP-cleanup")
-    WORKER.start()
-
-
-def on_new_order(cardinal, event):
-    if not is_plugin_enabled(cardinal):
-        return
-    compact = event.order
-    order_id = str(getattr(compact, 'id', '')).lstrip('#')
-    if not re.fullmatch(r'[A-Za-z0-9-]{1,64}', order_id):
-        return
-    amount = getattr(compact, 'amount', None)
-    # Preserve invalid values for strict validation; never silently truncate or
-    # convert NaN to SQLite NULL and accidentally lose the original evidence.
-    amount = str(amount) if amount is not None else None
-    price = getattr(compact, 'price', None)
-    price = str(price) if price is not None else None
-    event_lot_id, event_error = None, None
-    try:
-        ids = native_lot_ids(compact)
-        if len(ids) > 1:
-            raise ValueError('Противоречивые ID предложения в событии FunPay')
-        event_lot_id = next(iter(ids), None)
-    except ValueError as exc:
-        event_error = str(exc)
-    with database().lock, database().conn() as con:
-        con.execute('INSERT OR IGNORE INTO incoming_orders(order_id,amount,price,created_at) VALUES(?,?,?,?)', (order_id, amount, price, time.time()))
-        saved = con.execute('SELECT event_lot_id FROM incoming_orders WHERE order_id=?', (order_id,)).fetchone()
-        if saved['event_lot_id'] and event_lot_id and int(saved['event_lot_id']) != event_lot_id:
-            event_error = 'Повторное событие FunPay содержит другой ID предложения'
-        con.execute('''UPDATE incoming_orders SET event_lot_id=COALESCE(event_lot_id,?),
-            event_error=COALESCE(event_error,?),amount=COALESCE(amount,?),price=COALESCE(price,?)
-            WHERE order_id=?''', (event_lot_id, event_error, amount, price, order_id))
-    run_once('order:' + order_id, process_order, cardinal, event)
-
-
-def on_new_message(cardinal, event):
-    if is_plugin_enabled(cardinal):
-        message = event.message
-        if not (parse_chat_command(getattr(message, 'text', '')) is not None or
-                (str(getattr(message, 'author_id', '')) == '0' and MessageTypes is not None and
-                 getattr(message, 'type', None) in (getattr(MessageTypes, 'NEW_FEEDBACK', None), getattr(MessageTypes, 'FEEDBACK_CHANGED', None)))):
-            return
-        trace_command('receive', 'Получено полное сообщение NEW_MESSAGE')
-        started = run_once('message:' + str(getattr(message, 'chat_id', '')) + ':' + str(getattr(message, 'id', uuid.uuid4())), process_message_safe, cardinal, event)
-        if not started:
-            trace_command('process', 'Задание уже выполняется или очередь операций занята')
-
-
-def on_legacy_message(cardinal, event):
-    if not is_plugin_enabled(cardinal):
-        return
-    obj = event.chat
-    if parse_chat_command(getattr(obj, 'last_message_text', '')) is None or getattr(obj, 'last_by_bot', False):
-        return
-    trace_command('receive', 'Получено превью LAST_CHAT_MESSAGE_CHANGED')
-    started = run_once('legacy:' + str(getattr(obj, 'id', '')) + ':' + str(getattr(obj, 'node_msg_id', '')),
-                       process_legacy_message, cardinal, event)
-    if not started:
-        trace_command('process', 'Чтение истории уже выполняется или очередь операций занята')
-
-
-def on_order_status_changed(cardinal, event):
-    order = getattr(event, 'order', None)
-    order_id = str(getattr(order, 'id', '')).lstrip('#')
-    if not database().row('SELECT 1 FROM payments WHERE order_id=?', (order_id,)):
-        return
-    if status_name(order) == 'refunded':
-        run_once('refund-event:' + order_id, reconcile_refund_event, cardinal, order_id)
-    elif 'partial' in status_name(order):
-        with database().lock, database().conn() as con:
-            con.execute("UPDATE payments SET state='partial_refund',last_error='Нужна сверка суммы частичного возврата' WHERE order_id=? AND state!='refunded'", (order_id,))
-        notify_admins(cardinal, f'⚠️ Частичный возврат #{esc(order_id)}: проверьте сумму и оставшееся время. Полная аренда автоматически не отменяется.')
-
-
-def stop_plugin(cardinal, *args):
-    global INSTANCE_LOCK
-    if DB is not None and (database().row("SELECT 1 FROM rentals WHERE status IN ('issuing','delivering','active','refunding','cleaning','cleanup_failed')") or database().row("SELECT 1 FROM payments WHERE state='refund_pending'")):
-        raise RuntimeError('Сначала завершите аренды, очистку и возвраты Auto VIP, затем удалите плагин.')
+def named_lock(name: str) -> threading.RLock:
     with GUARD:
-        if RUNNING:
-            raise RuntimeError('Дождитесь завершения операций Auto VIP перед удалением.')
-    STOP.set()
-    if WORKER and WORKER.is_alive():
-        WORKER.join(timeout=5)
-    if INSTANCE_LOCK is not None:
-        INSTANCE_LOCK.close()
-        INSTANCE_LOCK = None
+        return LOCKS.setdefault(name, threading.RLock())
 
 
-BIND_TO_PRE_INIT = [init_plugin]
-BIND_TO_POST_START = [start_worker]
-BIND_TO_NEW_ORDER = [on_new_order]
-BIND_TO_NEW_MESSAGE = [on_new_message]
-BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [on_legacy_message]
-BIND_TO_ORDER_STATUS_CHANGED = [on_order_status_changed]
-BIND_TO_DELETE = stop_plugin
-
-GUARD = threading.RLock()
-
-LOCKS = {}
-
-ORDER_LOCK = threading.RLock()
-
-FP_LOT_LOCK = threading.Lock()
-
-RUNNING = set()
-
-HANDLED_MESSAGES = {}
-
-COMMAND_TRACE = {}
-
-BUSY_STATUSES = ('issuing', 'delivering', 'active', 'refunding', 'cleaning', 'cleanup_failed')
-
-INSTANCE_LOCK = None
-
-from concurrent.futures import ThreadPoolExecutor
-
-from contextlib import ExitStack
-
-EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix='AutoVIP')
-
-
-def operation_lock(key):
+def run_once(key: str, func, *args) -> bool:
     with GUARD:
-        return LOCKS.setdefault(str(key), threading.RLock())
-
-
-def run_once(key, function, *args):
-    with GUARD:
-        if key in RUNNING or len(RUNNING) >= 128:
+        if key in RUNNING:
             return False
         RUNNING.add(key)
-    def run():
+
+    def job():
         try:
-            function(*args)
+            func(*args)
         except Exception:
-            LOG.error('AutoVIP: операция %s завершилась ошибкой', key)
-            if key.startswith('order:') and DB is not None:
-                with database().lock, database().conn() as con:
-                    con.execute("UPDATE incoming_orders SET state='attention',error='Ошибка обработки; требуется повтор из панели' WHERE order_id=? AND state='pending'", (key[6:],))
+            LOG.exception("AutoVIP: ошибка операции %s", key)
         finally:
             with GUARD:
                 RUNNING.discard(key)
     try:
-        EXECUTOR.submit(run)
+        EXECUTOR.submit(job)
     except RuntimeError:
         with GUARD:
             RUNNING.discard(key)
@@ -1801,1480 +1065,2395 @@ def run_once(key, function, *args):
     return True
 
 
-def source_key(lot):
-    kind = lot['bind_type']
-    if kind == 'category' and lot['category_id'] and not lot['server_id']:
-        return 'category:' + str(lot['category_id'])
-    if kind == 'server' and lot['server_id'] and not lot['category_id']:
-        return 'server:' + str(lot['server_id'])
-    if kind == 'random' and not lot['server_id'] and not lot['category_id']:
-        return 'random'
+def request_lot_sync() -> None:
+    SYNC_REQUEST.set()
+
+
+# --- работа с лотами FunPay ---------------------------------------------
+def renew_and_save(fields: Any) -> None:
+    renew = getattr(fields, "renew_fields", None)
+    if callable(renew):
+        renew()
+    CARDINAL.account.save_lot(fields)
+
+
+def lot_title_from_funpay(lot_id: int) -> str:
+    fields = CARDINAL.account.get_lot_fields(int(lot_id))
+    raw = getattr(fields, "fields", None) or {}
+    title = getattr(fields, "title_ru", None) or raw.get("fields[summary][ru]") or getattr(fields, "title_en", None) \
+        or raw.get("fields[summary][en]")
+    title = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not title:
+        raise ValueError("пустое название")
+    return title[:250]
+
+
+def fp_post_offer(fields: Dict[str, str]) -> Dict[str, Any]:
+    headers = {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+               "x-requested-with": "XMLHttpRequest"}
+    payload = dict(fields)
+    payload.setdefault("location", "trade")
+    response = CARDINAL.account.method("post", "lots/offerSave", headers, payload, raise_not_200=True)
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("FunPay вернул некорректный ответ") from None
+    errors = data.get("errors")
+    if data.get("error") or errors:
+        details = []
+        if isinstance(errors, list):
+            details = [": ".join(str(x) for x in e) if isinstance(e, (list, tuple)) else str(e) for e in errors]
+        elif isinstance(errors, dict):
+            details = [f"{k}: {v}" for k, v in errors.items()]
+        message = str(data.get("error") or "") + (" " + "; ".join(details) if details else "")
+        raise RuntimeError(("FunPay: " + message.strip())[:400] or "FunPay отклонил сохранение лота")
+    return data
+
+
+def _offer_form(node_id: str) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    if BeautifulSoup is None:
+        raise RuntimeError("не установлен bs4")
+    response = CARDINAL.account.method("get", f"lots/offerEdit?node={node_id}", {"accept": "text/html"}, {},
+                                       raise_not_200=True)
+    soup = BeautifulSoup(response.text, "html.parser")
+    form = soup.select_one("form.form-offer-editor") or soup.find("form", attrs={"action": re.compile("offerSave")})
+    if form is None:
+        lead = soup.find("p", class_="lead")
+        raise RuntimeError("FunPay не отдал форму создания лота" + (": " + lead.get_text(strip=True) if lead else ""))
+    fields: Dict[str, str] = {}
+    meta: List[Dict[str, Any]] = []
+    for el in form.find_all(["input", "textarea", "select"]):
+        name = el.get("name")
+        if not name:
+            continue
+        group = el.find_parent(class_="form-group")
+        label_el = group.find("label") if group else None
+        label = label_el.get_text(" ", strip=True) if label_el else ""
+        options = None
+        if el.name == "input":
+            kind = (el.get("type") or "text").lower()
+            if kind in ("submit", "button", "file", "image", "reset"):
+                continue
+            if kind in ("checkbox", "radio"):
+                if el.has_attr("checked"):
+                    fields[name] = el.get("value") or "on"
+                continue
+            fields[name] = el.get("value") or ""
+        elif el.name == "textarea":
+            fields[name] = el.get_text() or ""
+        else:
+            options = [(o.get("value") or "", o.get_text(" ", strip=True)) for o in el.find_all("option")]
+            selected = el.find("option", selected=True)
+            fields[name] = (selected.get("value") if selected else (options[0][0] if options else "")) or ""
+        meta.append({"name": name, "label": label, "tag": el.name, "options": options})
+    return fields, meta
+
+
+def _pick_option(options: List[Tuple[str, str]], wanted: str, fallbacks: Tuple[str, ...]) -> Optional[str]:
+    def clean(x: str) -> str:
+        return norm_name(re.sub(r"[\[\]()]", "", x))
+    choices = [(v, t) for v, t in options if v]
+    target = clean(wanted)
+    for value, text in choices:
+        if clean(text) == target or clean(value) == target:
+            return value
+    for value, text in choices:
+        if target and (target in clean(text) or clean(text) in target):
+            return value
+    for word in fallbacks:
+        for value, text in choices:
+            if word in clean(text):
+                return value
+    return choices[0][0] if choices else None
+
+
+def _find_offer_by_tag(node_id: str, tag: str) -> Optional[str]:
+    if BeautifulSoup is None:
+        return None
+    response = CARDINAL.account.method("get", f"lots/{node_id}/trade", {"accept": "text/html"}, {}, raise_not_200=True)
+    soup = BeautifulSoup(response.text, "html.parser")
+    for item in soup.select("a.tc-item, a[href*='offerEdit?offer=']"):
+        if tag in item.get_text(" ", strip=True):
+            match = re.search(r"offer(?:Edit\?offer|\?id)=(\d+)", item.get("href") or "")
+            return item.get("data-offer") or (match.group(1) if match else None)
     return None
 
 
-def enqueue(con, key, chat_id, text, rental_id=None, order_id=None, kind='notice'):
-    con.execute('''INSERT OR IGNORE INTO outbox(dedupe,chat_id,text,rental_id,order_id,kind,created_at)
-        VALUES(?,?,?,?,?,?,?)''', (key, str(chat_id), text, rental_id, order_id, kind, time.time()))
-
-
-def notice(key, chat_id, text, rental_id=None):
-    with database().lock, database().conn() as con:
-        enqueue(con, key, chat_id, text, rental_id)
-
-
-def status_name(order):
-    status = getattr(order, 'status', '')
-    return str(getattr(status, 'name', status)).split('.')[-1].lower()
-
-
-def native_lot_ids(obj):
-    # Never scan free text/HTML, buyer fields, links or node_id (subcategory).
-    result = set()
-    for name in ('lot_id', 'offer_id'):
-        value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
-        if value is not None:
-            if not re.fullmatch(r'[1-9][0-9]*', str(value)):
-                raise ValueError('Неверный ID предложения в заказе')
-            result.add(int(value))
-    return result
-
-
-def add_credit(con, rental_id, order_id, hours, start):
-    end = start + hours * 3600
-    con.execute('INSERT INTO time_credits(rental_id,order_id,hours,start_time,end_time) VALUES(?,?,?,?,?)',
-                (rental_id, order_id, hours, start, end))
-    return end
-
-
-def deliver_outbox(cardinal, outbox_id):
-    db = database()
-    item = db.row('SELECT * FROM outbox WHERE id=?', (outbox_id,))
-    if not item:
-        return
-    lock = operation_lock('rental:' + item['rental_id']) if item['rental_id'] else operation_lock('outbox:' + str(outbox_id))
-    with lock:
-        with db.lock, db.conn() as con:
-            item = con.execute("SELECT * FROM outbox WHERE id=? AND state='pending'", (outbox_id,)).fetchone()
-            if not item:
-                return
-            rental = con.execute('SELECT * FROM rentals WHERE rental_id=?', (item['rental_id'],)).fetchone()
-            if item['kind'] in ('issue', 'extension'):
-                expected = 'delivery_pending' if item['kind'] == 'issue' else 'extension_pending'
-                payment = con.execute('SELECT state FROM payments WHERE order_id=?', (item['order_id'],)).fetchone()
-                if not payment or payment['state'] != expected:
-                    con.execute("UPDATE outbox SET state='cancelled' WHERE id=?", (outbox_id,))
-                    return
-            if item['kind'] in ('issue', 'extension', 'link') and (not rental or rental['status'] not in ('active', 'delivering') or (rental['status'] == 'active' and rental['end_time'] <= time.time())):
-                con.execute("UPDATE outbox SET state='cancelled' WHERE id=?", (outbox_id,))
-                return
-            con.execute("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=?", (outbox_id,))
-        ok = send_fp(cardinal, item['chat_id'], item['text'])
-        with db.lock, db.conn() as con:
-            if not ok:
-                con.execute("UPDATE outbox SET state='pending',next_at=?,last_error='Нет подтверждения отправки' WHERE id=?", (time.time() + min(300, 10 * (item['attempts'] + 1)), outbox_id))
-            else:
-                con.execute("UPDATE outbox SET state='sent',last_error=NULL WHERE id=?", (outbox_id,))
-                if item['kind'] == 'issue':
-                    now = time.time()
-                    if rental['status'] == 'delivering':
-                        con.execute("UPDATE rentals SET status='active',start_time=?,end_time=?+hours*3600 WHERE rental_id=?", (now, now, rental['rental_id']))
-                        con.execute('UPDATE time_credits SET start_time=start_time+?,end_time=end_time+? WHERE rental_id=? AND revoked=0', (now, now, rental['rental_id']))
-                        con.execute("UPDATE servers SET status='occupied' WHERE server_id=?", (rental['server_id'],))
-                    con.execute("UPDATE payments SET state='issued' WHERE order_id=? AND state='delivery_pending'", (item['order_id'],))
-                elif item['kind'] == 'extension':
-                    con.execute("UPDATE payments SET state='extended' WHERE order_id=? AND state='extension_pending'", (item['order_id'],))
-        if not ok and item['attempts'] in (0, 9):
-            notify_admins(cardinal, f'⚠️ Auto VIP: сообщение #{esc(item["order_id"] or "")} не доставлено. Сохранён повтор отправки.')
-
-
-def cleanup_managed_friends(api):
-    db = database()
-    if db.setting('friends_auto_remove') != '1':
-        return
-    with operation_lock('owner:' + str(api.account.id)):
-        for friend in db.rows('SELECT roblox_id FROM managed_friends WHERE account_id=?', (api.account.id,)):
-            used = db.row("""SELECT 1 FROM rental_friends f JOIN rentals r USING(rental_id)
-                WHERE r.owner_account_id=? AND f.roblox_id=? AND f.state!='removed'
-                AND r.status IN ('issuing','delivering','active','cleaning','cleanup_failed','refunding')""", (api.account.id, friend['roblox_id']))
-            if not used:
-                if not api.unfriend(friend['roblox_id']):
-                    raise RuntimeError('Roblox не подтвердил удаление дружбы')
-                with db.lock, db.conn() as con:
-                    con.execute('DELETE FROM managed_friends WHERE account_id=? AND roblox_id=?', (api.account.id, friend['roblox_id']))
-
-
-def request_refund(order_id):
-    db = database()
-    payment = db.row('SELECT rental_id FROM payments WHERE order_id=?', (order_id,))
-    if not payment:
-        return
-    with operation_lock('rental:' + str(payment['rental_id'])):
-        with db.lock, db.conn() as con:
-            con.execute("""UPDATE payments SET refund_previous_state=state,state='refund_pending',next_refund_at=0
-                WHERE order_id=? AND state NOT IN ('refunded','refund_pending','partial_refund')""", (order_id,))
-
-
-def mark_refunded(order_id):
-    db = database()
-    payment = db.row('SELECT * FROM payments WHERE order_id=?', (order_id,))
-    if not payment:
-        return
-    with operation_lock('rental:' + str(payment['rental_id'])):
-        with db.lock, db.conn() as con:
-            con.execute('BEGIN IMMEDIATE')
-            payment = con.execute('SELECT * FROM payments WHERE order_id=?', (order_id,)).fetchone()
-            if payment['state'] == 'refunded':
-                return
-            con.execute("UPDATE payments SET state='refunded',last_error=NULL WHERE order_id=?", (order_id,))
-            con.execute("UPDATE outbox SET state='cancelled' WHERE order_id=? AND state='pending' AND kind IN ('issue','extension')", (order_id,))
-            rental = con.execute('SELECT * FROM rentals WHERE rental_id=?', (payment['rental_id'],)).fetchone()
-            if rental:
-                now = time.time() if rental['start_time'] else 0
-                shift = 0.0
-                for credit in con.execute('SELECT * FROM time_credits WHERE rental_id=? AND revoked=0 ORDER BY start_time,id', (rental['rental_id'],)).fetchall():
-                    start, end = float(credit['start_time']), float(credit['end_time'])
-                    if credit['order_id'] == order_id:
-                        shift += max(0, end - max(now, start))
-                        con.execute('UPDATE time_credits SET revoked=1 WHERE id=?', (credit['id'],))
-                    elif shift:
-                        con.execute('UPDATE time_credits SET start_time=?,end_time=? WHERE id=?', (max(now, start-shift), max(now, end-shift), credit['id']))
-                new_end = max(now, float(rental['end_time']) - shift) if rental['start_time'] else 0
-                con.execute('UPDATE rentals SET end_time=?,hours=MAX(0,hours-?),price=MAX(0,price-?) WHERE rental_id=?', (new_end, shift/3600, payment['price'], rental['rental_id']))
-                remaining = con.execute("SELECT 1 FROM payments WHERE rental_id=? AND state!='refunded'", (rental['rental_id'],)).fetchone()
-                if rental['status'] in ('active', 'delivering') and (not remaining or (rental['start_time'] and new_end <= now)):
-                    con.execute("UPDATE rentals SET status='cleanup_failed',cleanup_reason='refund',next_cleanup_at=0 WHERE rental_id=?", (rental['rental_id'],))
-                elif not remaining and rental['status'] not in BUSY_STATUSES:
-                    con.execute("UPDATE rentals SET status='refunded' WHERE rental_id=?", (rental['rental_id'],))
-            enqueue(con, 'refunded:' + order_id, payment['chat_id'], f'💸 Возврат заказа #{order_id} подтверждён FunPay. Неиспользованное время этого заказа снято.', payment['rental_id'])
-
-
-def perform_refund(cardinal, order_id):
-    payment = database().row('SELECT rental_id FROM payments WHERE order_id=?', (order_id,))
-    if not payment:
-        return
-    # Keep delivery/renewal from racing the financial operation and reconciliation.
-    with operation_lock('rental:' + str(payment['rental_id'])):
-        return perform_refund_locked(cardinal, order_id)
-
-
-def perform_refund_locked(cardinal, order_id):
-    db = database()
-    with operation_lock('refund:' + order_id):
-        payment = db.row("SELECT * FROM payments WHERE order_id=? AND state='refund_pending'", (order_id,))
-        if not payment:
-            return
-        try:
-            order = cardinal.account.get_order(order_id)
-            if str(getattr(order, 'seller_id', '')) != str(cardinal.account.id):
-                raise RuntimeError('Другой продавец')
-            if status_name(order) == 'refunded':
-                mark_refunded(order_id)
-                return
-            if status_name(order) not in ('paid', 'closed'):
-                raise RuntimeError('Возврат требует ручной сверки статуса')
-            cardinal.account.refund(order_id)
-            if status_name(cardinal.account.get_order(order_id)) != 'refunded':
-                raise RuntimeError('FunPay ещё не подтвердил возврат')
-            mark_refunded(order_id)
-        except Exception:
-            with db.lock, db.conn() as con:
-                con.execute("UPDATE payments SET last_error='Возврат не подтверждён FunPay',next_refund_at=? WHERE order_id=? AND state='refund_pending'", (time.time() + 120, order_id))
-            if not payment['last_error']:
-                notify_admins(cardinal, f'⚠️ Auto VIP: возврат #{esc(order_id)} ожидает подтверждения FunPay. Будет повторная сверка.')
-
-
-def refund_rental(cardinal, rental_id):
-    with operation_lock('rental:' + rental_id):
-        with database().lock, database().conn() as con:
-            rental = con.execute('SELECT * FROM rentals WHERE rental_id=?', (rental_id,)).fetchone()
-            if not rental or rental['status'] in ('issuing', 'cleaning', 'refunding'):
-                return False
-            payments = con.execute("SELECT order_id FROM payments WHERE rental_id=? AND state NOT IN ('refunded','partial_refund')", (rental_id,)).fetchall()
-            if not payments:
-                return False
-            con.execute("UPDATE payments SET refund_previous_state=state,state='refund_pending',next_refund_at=0 WHERE rental_id=? AND state NOT IN ('refunded','refund_pending','partial_refund')", (rental_id,))
-            if rental['status'] in BUSY_STATUSES:
-                con.execute("UPDATE rentals SET status='refunding',cleanup_reason='refund' WHERE rental_id=?", (rental_id,))
-        cleanup_rental(cardinal, rental_id, 'refund')
-    for payment in payments:
-        perform_refund(cardinal, payment['order_id'])
-    return True
-
-
-def extend_rental(rental_id, hours):
-    hours = positive_float(hours, 'Продление')
-    with GUARD:
-        if 'rental:' + rental_id in RUNNING:
-            raise ValueError('С этой арендой уже выполняется операция')
-    with operation_lock('rental:' + rental_id):
-        with database().lock, database().conn() as con:
-            con.execute('BEGIN IMMEDIATE')
-            rental = con.execute("SELECT * FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (rental_id, time.time())).fetchone()
-            if not rental:
-                raise ValueError('Аренда уже завершена или выполняется другая операция')
-            end = add_credit(con, rental_id, None, hours, float(rental['end_time']))
-            con.execute('UPDATE rentals SET end_time=?,hours=hours+? WHERE rental_id=?', (end, hours, rental_id))
-            enqueue(con, 'manual:' + str(uuid.uuid4()), rental['chat_id'], f'✅ Продавец продлил аренду #{payment_label(rental_id)} на {hours:g} ч.', rental_id)
-
-
-def command_text(raw):
-    text = str(raw or '').strip().lstrip('\ufeff\u200b\u200e\u200f').strip()
-    return re.sub(r'^!\s+', '!', text)
-
-
-def trace_command(stage, result):
-    # Only fixed labels / exception classes. Never save message text or secrets.
-    with GUARD:
-        COMMAND_TRACE[stage] = (time.time(), result)
-
-
-def parse_chat_command(raw):
-    parts = command_text(raw).split()
-    if not parts:
-        return None
-    token = parts.pop(0).lower()
-    if token == 'получить' and parts and parts[0].lower() == 'вип':
-        token = 'получить вип'
-        parts.pop(0)
-    aliases = {
-        '!vip_time':'time', '!время':'time', '!time':'time', 'время':'time',
-        '!vip_link':'link', '!ссылка':'link', '!link':'link', 'ссылка':'link',
-        '!vip':'link', '!вип':'link', 'vip':'link', 'вип':'link', 'получить вип':'link',
-        '!vip_friends':'friends', '!друзья':'friends', '!friend':'friends', '!friends':'friends', 'друзья':'friends',
-        '!vip_help':'help', '!команды':'help', '!command':'help', '!commands':'help',
-        '/com':'help', '!com':'help', 'com':'help', 'команды_vip':'help',
-        '!vip_stock':'stock', '!бронь':'stock', '!vip_review':'review', '!отзыв':'review', 'отзыв':'review',
+def create_friend_offer(tag: str, price: float) -> str:
+    """Создаёт временный лот доплаты. Возвращает ID созданного лота."""
+    node = S.get("paid_node").strip() or "402"
+    fields, meta = _offer_form(node)
+    title_ru = short(S.get("paid_title_ru"), 58).rstrip("…") + " " + tag
+    title_en = short(S.get("paid_title_en"), 58).rstrip("…") + " " + tag
+    warning_ru = (f"\n\nКод лота: {tag}. Лот создан для конкретного покупателя аренды. "
+                  "Если вы его не запрашивали — не оплачивайте: деньги будут автоматически возвращены.")
+    warning_en = f"\n\nCode: {tag}." + EN_DESC_FILLER
+    desc_en = S.get("paid_desc_en").strip()
+    if len(desc_en) < 120:
+        desc_en = (desc_en + EN_DESC_FILLER).strip()
+    values = {
+        "fields[summary][ru]": title_ru[:70], "fields[summary][en]": title_en[:70],
+        "fields[desc][ru]": S.get("paid_desc_ru").strip() + warning_ru,
+        "fields[desc][en]": desc_en + warning_en,
+        "fields[payment_msg][ru]": S.get("paid_pay_msg_ru"), "fields[payment_msg][en]": S.get("paid_pay_msg_en"),
+        "price": fmt_num(price), "amount": "100", "active": "on", "offer_id": "0", "node_id": node,
     }
-    if token == '!help' and database().setting('legacy_commands') == '1':
-        aliases[token] = 'help'
-    action = aliases.get(token)
-    if action is None:
-        return None
-    # Bare aliases match an entire command, not ordinary sentences containing it.
-    if not token.startswith(('!', '/')) and action != 'friends' and any(not p.startswith('#') for p in parts):
-        return None
-    return action, parts
-
-
-def deliver_command_replies(cardinal, rental_id, kind=None, dedupe=None):
-    # First attempt immediately; the durable queue remains responsible for retries.
-    query = "SELECT id FROM outbox WHERE rental_id=? AND state='pending'"
-    values = [rental_id]
-    if kind:
-        query += ' AND kind=?'
-        values.append(kind)
-    if dedupe:
-        query += ' AND dedupe=?'
-        values.append(dedupe)
-    for row in database().rows(query + ' ORDER BY id', tuple(values)):
-        deliver_outbox(cardinal, row['id'])
-
-
-def grant_review(cardinal, order):
-    db = database()
-    if db.setting('review_bonus_active') != '1' or status_name(order) not in ('paid', 'closed') or getattr(getattr(order, 'review', None), 'stars', 0) != 5:
-        return False
-    p = db.row('SELECT * FROM payments WHERE order_id=?', (str(order.id),))
-    if not p or not p['rental_id']:
-        return False
-    with GUARD:
-        if 'rental:' + p['rental_id'] in RUNNING:
-            return False
-    with operation_lock('rental:' + p['rental_id']):
-        with db.lock, db.conn() as con:
-            con.execute('BEGIN IMMEDIATE')
-            p = con.execute("SELECT * FROM payments WHERE order_id=? AND state IN ('issued','extended','extension_pending') AND review_bonus_given=0", (str(order.id),)).fetchone()
-            rental = con.execute("SELECT * FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (p['rental_id'], time.time())).fetchone() if p else None
-            if not rental:
-                return False
-            bonus = positive_float(db.setting('review_bonus_hours'), 'Бонус')
-            end = add_credit(con, rental['rental_id'], str(order.id), bonus, float(rental['end_time']))
-            con.execute('UPDATE payments SET review_bonus_given=1 WHERE order_id=?', (str(order.id),))
-            con.execute('UPDATE rentals SET hours=hours+?,end_time=? WHERE rental_id=?', (bonus, end, rental['rental_id']))
-            enqueue(con, 'review:' + str(order.id), rental['chat_id'], db.setting('msg_review_bonus').replace('{bonus_hours}', f'{bonus:g}'), rental['rental_id'])
-    return True
-
-
-def process_message_safe(cardinal, event):
-    message = event.message
-    chat, mid = str(getattr(message, 'chat_id', '') or ''), str(getattr(message, 'id', '') or '')
-    key = chat + ':' + mid
-    # Both Cardinal hooks may describe the same message. Serialize and suppress
-    # completed duplicate events so a single !link never rotates the code twice.
-    with operation_lock('message-dispatch:' + key):
-        if mid:
-            now = time.monotonic()
-            with GUARD:
-                for old in [k for k, at in HANDLED_MESSAGES.items() if now-at > 600]:
-                    HANDLED_MESSAGES.pop(old, None)
-                if key in HANDLED_MESSAGES:
-                    trace_command('process', 'Повтор уже обработанного сообщения пропущен')
-                    return
+    fields.update(values)
+    fields.pop("deactivate_after_sale", None)
+    for item in meta:
+        label = norm_name(item["label"])
+        name = item["name"]
+        if item["tag"] == "select" and item["options"]:
+            if "игр" in label and "назван" not in label:
+                choice = _pick_option(item["options"], S.get("paid_game"), ("прочие", "другое"))
+            elif label.startswith("тип") or " тип" in label:
+                choice = _pick_option(item["options"], S.get("paid_type"), ("услуг", "прочее"))
+            elif not fields.get(name):
+                choice = _pick_option(item["options"], "", ("прочие", "услуг"))
+            else:
+                choice = None
+            if choice is not None:
+                fields[name] = choice
+        elif item["tag"] == "input" and "назван" in label and "игр" in label:
+            fields[name] = S.get("paid_game_name_en") if "[en]" in name else S.get("paid_game_name_ru")
+    data = fp_post_offer(fields)
+    match = re.search(r"offer(?:Edit\?offer|\?id)=(\d+)", str(data.get("url") or ""))
+    offer_id = match.group(1) if match else None
+    for _ in range(3):
+        if offer_id:
+            break
+        time.sleep(1.5)
         try:
-            process_review(cardinal, event)
+            offer_id = _find_offer_by_tag(node, tag)
         except Exception:
-            LOG.warning('AutoVIP: не удалось проверить отзыв')
+            LOG.debug("AutoVIP: поиск созданного лота", exc_info=True)
+    if not offer_id:
+        raise RuntimeError(f"лот создан, но FunPay не вернул его ID — удалите вручную лот с тегом {tag}")
+    return str(offer_id)
+
+
+def delete_offer(offer_id: Any) -> None:
+    account = CARDINAL.account
+    deleter = getattr(account, "delete_lot", None)
+    if callable(deleter):
         try:
-            process_chat_message(cardinal, event)
-        except Exception as exc:
-            # Report only exception type; response bodies may contain credentials.
-            LOG.error('AutoVIP: ошибка команды в чате %s (%s)', chat, type(exc).__name__)
-            trace_command('process', 'Ошибка обработки: ' + type(exc).__name__)
-            author = str(getattr(message, 'author_id', '') or '')
-            if parse_chat_command(getattr(message, 'text', '')) is not None and author.isdigit() and author not in ('0', str(cardinal.account.id)) and not getattr(message, 'by_bot', False):
-                send_fp(cardinal, chat, '❌ Не удалось выполнить VIP-команду. Повторите её позже; продавцу доступна ошибка в журнале Cardinal.')
-        if mid:
-            with GUARD:
-                HANDLED_MESSAGES[key] = time.monotonic()
-                while len(HANDLED_MESSAGES) > 4096:
-                    HANDLED_MESSAGES.pop(next(iter(HANDLED_MESSAGES)))
-
-
-def reconcile_refund_event(cardinal, order_id):
-    if status_name(cardinal.account.get_order(order_id)) == 'refunded':
-        mark_refunded(order_id)
-
-
-def process_legacy_message(cardinal, event):
-    obj = event.chat
-    chat = getattr(obj, 'id', None)
-    expected_id = getattr(obj, 'node_msg_id', None)
-    try:
-        # ChatShortcut has no author_id. Fetch the real message, never infer the
-        # sender from chat participants or act on truncated preview text.
-        history = cardinal.account.get_chat_history(chat)
-        if expected_id:
-            message = next((m for m in history if str(getattr(m, 'id', '')) == str(expected_id)), None)
-        else:
-            message = max(history, key=lambda m: as_int(getattr(m, 'id', 0)), default=None)
-            if message and command_text(getattr(message, 'text', '')) != command_text(getattr(obj, 'last_message_text', '')):
-                message = None
-        if message is None or str(getattr(message, 'chat_id', '')) != str(chat):
-            trace_command('process', 'История не подтвердила сообщение из превью')
-            LOG.warning('AutoVIP: не удалось подтвердить сообщение старого режима в чате %s', chat)
+            deleter(int(offer_id))
             return
-        process_message_safe(cardinal, SimpleNamespace(message=message))
-    except Exception as exc:
-        trace_command('process', 'Ошибка чтения истории: ' + type(exc).__name__)
-        LOG.warning('AutoVIP: чтение команды старого режима в чате %s (%s)', chat, type(exc).__name__)
-
-
-def recover_idle_operations():
-    """Recover abandoned persisted claims without disturbing a running/queued job.
-    This covers e.g. a transient database error inside the normal error handler.
-    The instance file lock guarantees another v16 process cannot own the claim.
-    """
-    db = database()
-    for rental in db.rows("SELECT * FROM rentals WHERE status IN ('issuing','cleaning','refunding') LIMIT 50"):
-        rid = rental['rental_id']
-        payments = db.rows('SELECT order_id FROM payments WHERE rental_id=?', (rid,))
-        with GUARD:
-            owned = ('rental:' + rid in RUNNING or any('order:' + p['order_id'] in RUNNING for p in payments))
-        if owned:
-            continue
-        lock = operation_lock('rental:' + rid)
-        if not lock.acquire(blocking=False):
-            continue
-        try:
-            with db.lock, db.conn() as con:
-                changed = con.execute("""UPDATE rentals SET status='cleanup_failed',
-                    cleanup_reason=COALESCE(cleanup_reason,'issue_failed'),next_cleanup_at=0,
-                    last_error='Возобновление прерванной операции'
-                    WHERE rental_id=? AND status=?""", (rid, rental['status']))
-                if changed.rowcount:
-                    con.execute("UPDATE payments SET state='issue_failed' WHERE rental_id=? AND state='issuing'", (rid,))
-                    con.execute("UPDATE servers SET status='cleaning' WHERE server_id=?", (rental['server_id'],))
-        finally:
-            lock.release()
-    for item in db.rows("SELECT id,rental_id FROM outbox WHERE state='sending' LIMIT 50"):
-        with GUARD:
-            if 'outbox:' + str(item['id']) in RUNNING:
-                continue
-        lock = operation_lock('rental:' + item['rental_id']) if item['rental_id'] else operation_lock('outbox:' + str(item['id']))
-        if not lock.acquire(blocking=False):
-            continue
-        try:
-            with db.lock, db.conn() as con:
-                con.execute("UPDATE outbox SET state='pending',next_at=0 WHERE id=? AND state='sending'", (item['id'],))
-        finally:
-            lock.release()
-
-
-"""Guide pages embedded into the standalone plugin by rebuild.py."""
-
-GUIDE_SECTIONS = (
-    ('start', '🚀 Начало и установка', '''<b>Что подготовить</b>
-Нужны работающий FunPay Cardinal, доступ администратора к его Telegram-боту, аккаунт Roblox — владелец VIP-сервера, сам сервер и предложение на FunPay.
-
-<b>Установка</b>
-1. Остановите Cardinal и сохраните копию старого плагина и его базы.
-2. Поместите <code>AutoVipRoblox_LuckyFunpay.py</code> в папку <code>plugins</code>. Старую версию уберите из этой папки.
-3. Существующую <code>AutoVIPRoblox_Monolith.db</code> оставьте рядом с файлом. Не запускайте две версии одновременно.
-4. Запустите Cardinal, включите плагин и откройте <code>/vip_config</code> или <code>/vip</code>. Если Cardinal был запущен с выключенным плагином, после включения перезапустите Cardinal: его стартовые обработчики не выполняются повторно при нажатии переключателя.
-
-<b>Порядок настройки</b>
-Прокси при необходимости → аккаунты → серверы → категории → лоты → друзья и сообщения → проверочная аренда.
-
-Используйте Python 3.10+ и зависимости окружения Cardinal: requests, pyTelegramBotAPI; для SOCKS нужен PySocks. FunPayAPI берётся из Cardinal.
-
-<b>Как вводить данные</b>
-Откройте нужную карточку и нажмите действие. Бот спрашивает по одному значению: выбранный аккаунт, сервер или лот уже запомнен, повторять его ID не нужно. В многошаговом вводе есть «Предыдущий шаг» и «Отмена». Дробные часы пишите через точку: <code>1.5</code>. <code>/cancel</code> или переход в меню отменяет ожидание ввода. Незавершённый ввод действует 30 минут.
-
-При обновлении существующие настройки и аренды сохраняются в прежней базе. Меню возвращено к организации первой версии: общие серверы отдельно, серверы игр — внутри категорий.''', 'main'),
-    ('ids', '🔢 Где взять ID', '''<b>Не путайте идентификаторы</b>
-• <b>VIP Server ID</b> — конкретный приватный сервер Roblox, которым будет управлять плагин.
-• <b>Place ID</b> — корневое место игры. Universe ID — другой номер, он сюда не подходит.
-• <b>Roblox User ID</b> — номер пользователя Roblox, указанный в карточке аккаунта. Владельца сервера бот определяет сам.
-• Внутренние номера аккаунтов и категорий вводить не требуется: выбирайте объект кнопкой.
-• <b>LOT_ID</b> — ID купленного предложения FunPay, а не раздела магазина.
-• <b>ORDER_ID</b> — номер конкретной покупки, например <code>AB12CD34</code>.
-
-<b>VIP Server ID</b>
-Откройте игру Roblox → Servers → свой приватный сервер → три точки → Configure. В адресе вида <code>https://www.roblox.com/games/configure?id=1234567890</code> возьмите цифры после <code>id=</code>.
-
-<b>Place ID</b>
-Откройте главную страницу игры. В адресе <code>https://www.roblox.com/games/109983668079237/...</code> это число после <code>/games/</code>. При добавлении сервера плагин сверяет его с корневым Place ID из Roblox.
-
-<b>LOT_ID</b>
-Откройте именно своё предложение FunPay и скопируйте его числовой ID из ссылки на предложение. Номер категории и номер заказа не подходят.
-
-Все числа в примерах справки условные: подставляйте свои.''', 'main'),
-    ('accounts', '👤 Аккаунты и cookie', '''<b>Получение cookie</b>
-1. В браузере войдите на roblox.com под владельцем сервера.
-2. Откройте инструменты разработчика: F12 → Application (Приложение) → Storage/Cookies → https://www.roblox.com.
-3. Найдите <code>.ROBLOSECURITY</code> и скопируйте его полное значение, включая начальное предупреждение.
-4. В личном чате своего бота откройте «Аккаунты» → «Добавить аккаунт» и отправьте только значение cookie.
-
-<b>Что должно произойти</b>
-После проверки появится кнопка с ником Roblox. Откройте её: в карточке показаны Roblox ID и число серверов. Добавьте каждого владельца, если серверы куплены на разных аккаунтах. При добавлении серверов владелец определяется автоматически.
-
-<b>Обновление cookie</b>
-Откройте «Аккаунты» → выберите ник → «Обновить cookie». Отправьте только новое полное значение cookie. ID аккаунта вводить не нужно.
-Новый cookie должен принадлежать прежнему Roblox-пользователю. Повторное добавление того же пользователя также обновляет cookie и сохраняет привязки.
-
-<b>Если проверка не прошла</b>
-Проверьте полноту значения, правильность аккаунта и соединение с Roblox. При истечении сессии получите новый cookie.
-
-Cookie даёт доступ к аккаунту. Не отправляйте его покупателям или в поддержку. Сообщение удаляется ботом по возможности; база и резервные копии тоже содержат cookie и должны храниться приватно.''', 'accounts'),
-    ('proxy', '🌐 Прокси', '''<b>Когда нужен</b>
-Если хост Cardinal не может нормально обращаться к Roblox напрямую. Сначала настройте прокси, затем добавляйте аккаунты.
-
-<b>Главное меню → Прокси</b>
-Допустимые примеры:
-<code>127.0.0.1:8080</code>
-<code>login:password@host:8080</code>
-<code>http://login:password@host:8080</code>
-<code>socks5://login:password@host:1080</code>
-Поддерживается также socks5h. Для SOCKS установите PySocks в окружение Cardinal.
-
-Протокол сохраняется. Значения в примерах не являются готовыми рабочими прокси — нужны ваши данные.
-
-<b>Замена и удаление</b>
-Отправьте новые данные в том же разделе. Настройка применяется ко всем добавленным аккаунтам Roblox. Для удаления отправьте <code>-</code>.
-
-<b>Как проверить</b>
-Надпись «настроен» означает, что настройка сохранена. Она не подтверждает доступность сети. Проверка аккаунта и добавление сервера должны успешно завершиться.
-
-Если соединение не работает, проверьте адрес, порт, пароль, срок действия прокси и доступность Roblox с вашего хоста. Не публикуйте пароль от прокси в скриншотах.''', 'proxy'),
-    ('servers', '🖥 Добавление серверов', '''<b>Главное меню → Серверы → Добавить сервер</b>
-Отправьте VIP Server ID:
-<code>1234567890</code>
-Плагин проверит добавленные аккаунты и определит владельца и игру.
-
-Можно отправить до 20 ID через пробел или с новой строки. Каждый сервер проверяется отдельно. Если обработка остановилась на ошибке, проверьте список: предыдущие серверы уже могли сохраниться. Повторите добавление только отсутствующих.
-
-<b>После сохранения</b>
-В списке должны быть верный сервер, владелец и Place ID. Сервер без категории и прямой привязки к лоту относится к общему пулу.
-
-<b>После обновления со старой версии</b>
-Откройте карточку сервера → «Проверить владельца». Никаких дополнительных полей вводить не нужно. Проверка владельца обязательна для новых продаж. Занятую аренду сначала дождитесь или завершите штатной кнопкой.
-
-<b>Если владелец не определён</b>
-Проверьте, что этот Roblox-аккаунт действительно владеет сервером, cookie действует, VIP Server ID взят из Configure, а Place ID относится к той же игре.
-
-Не используйте продаваемый сервер для посторонней игры: подготовка новой аренды закрывает прежний доступ и отключает игроков. Подпиской и балансом Robux управляйте в Roblox — плагин их не продлевает.''', 'servers'),
-    ('categories', '🗂 Категории и пулы', '''<b>Одна игра — одна категория</b>
-Создайте отдельный пул для каждой игры, чтобы её лоты выдавали только подходящие серверы.
-
-1. «Категории серверов» → «Добавить категорию» → отправьте только название, например <code>Моя игра</code>.
-2. Откроется её карточка. Нажмите «Добавить серверы».
-3. Отправьте ID VIP-сервера или несколько ID через пробел: <code>1234567890 1234567891</code>. За один ввод — до 20 ID.
-4. Владельца и игру бот определит сам. Игра категории закрепляется по первому серверу; сервер другой игры добавить нельзя.
-
-Серверы категории доступны внутри её карточки. В разделе «Сервера» главного меню показаны только серверы вне категорий.
-
-<b>Перенос существующего свободного сервера</b>
-Откройте карточку сервера → «Перенести в категорию» → нажмите название нужной категории.
-Для возврата нажмите «В общий пул» в карточке сервера.
-Сначала снимите прямую привязку лота, если она есть.
-
-<b>Изменить название или игру</b>
-В карточке категории нажмите «Переименовать» и отправьте новое название. Кнопка «Привязать игру» спрашивает только Place ID. Игра должна совпадать со всеми серверами категории.
-
-Удалить можно пустую категорию без привязанных лотов. Сначала перенастройте лоты и перенесите серверы. Удаление не переводит продажи в случайный пул.''', 'cats'),
-    ('lots', '⚙️ Лоты и время', '''<b>1. Добавьте своё предложение</b>
-«Лоты» → «Добавить лот».
-Шаг 1: отправьте только ID предложения, например <code>123456</code>. Бот проверит его на FunPay и подставит название.
-Шаг 2: отправьте часы за одну штуку, например <code>1.5</code>. За 2 штуки в этом примере выдаётся 3 часа плюс применимый бонус.
-Если ошиблись на первом шаге, нажмите «Предыдущий шаг». До завершения ввода лот не сохраняется.
-
-<b>2. Выберите источник</b>
-В открывшейся карточке лота нажмите один вариант:
-• «Привязать категорию» → выберите её название кнопкой. Выдаётся только свободный сервер этой категории.
-• «Привязать один сервер» → выберите сервер кнопкой. Выдаётся только он.
-• «Общий пул» → используются только серверы без категории и прямых привязок. Для разных игр используйте категории.
-
-Новый лот приостановлен до выбора источника. Привязка снимает паузу. Ошибка источника не разрешает выдачу из другого пула.
-
-<b>3. Проверьте продажи</b>
-В «Настройки» включите «Автолоты». Сверка наличия с FunPay выполняется примерно раз в минуту: нет свободного сервера — лот скрывается. Проверьте статус на самом FunPay.
-
-«Пауза / включение» временно блокирует новые выдачи. При выключенных «Автолотах» видимостью предложения на FunPay управляйте вручную.
-
-Для изменения времени: «Изменить время» → отправьте только число часов, например <code>2</code>. Новое значение действует на будущие платежи. Покупка того же лота может продлить действующую аренду при сохранённом источнике; другой лот создаёт отдельную аренду.''', 'lots'),
-    ('friends', '🤝 Друзья и команды', '''<b>Настройка продавцом</b>
-«Друзья» → включите модуль. Общий лимит: положительное целое, <code>0</code> или <code>-</code> — без лимита плагина.
-В карточке лота → «Лимит друзей»:
-<code>3</code> — до трёх пользователей;
-<code>0</code> — без лимита плагина;
-<code>-</code> — общий лимит. ID лота повторять не нужно.
-
-<b>Действия покупателя</b>
-1. Открыть профиль владельца из сообщения выдачи.
-2. Отправить ему заявку в Roblox.
-3. В чате покупки FunPay написать:
-<code>!друзья #AB12CD34 НикRoblox</code>
-Вместо ника можно передать User ID или ссылку на профиль. Для каждого друга повторить шаги отдельно.
-
-<b>Команды в чате FunPay</b>
-<code>!vip_help</code> — справка;
-<code>!vip_time #AB12CD34</code> — остаток времени;
-<code>!vip_link #AB12CD34</code> — новый код ссылки, без продления;
-<code>!vip_friends #AB12CD34 Ник</code> — доступ другу;
-<code>!vip_stock</code> — число свободных в общем пуле, без бронирования;
-<code>!vip_review #AB12CD34</code> — проверка отзыва.
-Русские варианты доступны без переключателя: !команды, !время, !ссылка, !друзья, !бронь, !отзыв. Справка также открывается командами !command и !commands.
-
-Совместимость первой версии: /com, !com, com, команды_vip — справка; !time и время — остаток; !link и ссылка — новая ссылка; !вип, vip, вип, получить вип — VIP-ссылка; !friend Ник и друзья Ник — доступ другу; отзыв — проверка отзыва. Слова без префикса должны составлять команду целиком.
-
-Команды отправляет покупатель из своего аккаунта FunPay. Сообщения продавца и самого бота не выполняются. Старая настройка русских команд больше не блокирует VIP-команды после обновления; !vip_help показывает доступные варианты. Перед запросом к Roblox приходит ответ о ходе операции.
-
-При одной аренде номер заказа можно опустить; при нескольких указывайте нужный. После аренды доступ к серверу отзывается всегда. «Удалять друзей» касается только дружбы Roblox. Ограничения приватности Roblox продолжают действовать.''', 'friends'),
-    ('bonuses', '🎁 Бонусы и цены', '''<b>Бонус за количество часов</b>
-«Бонусы» → «Добавить правило». Сначала отправьте порог покупки: <code>5</code>. На следующем шаге — подарок: <code>1</code>.
-За каждые полные 5 оплаченных часов добавляется 1 час. Покупка 10 часов получает +2 часа. При нескольких правилах применяется наибольший достигнутый порог, правила не складываются.
-Для изменения нажмите кнопку правила и ответьте на два вопроса. Для удаления нажмите «Удалить» в его строке и подтвердите. В длинном списке используйте страницы.
-
-<b>За отзыв</b>
-«Отзывы» → включите бонус → «Размер бонуса», например <code>1.5</code>. После отзыва 5★ покупатель пишет <code>!отзыв #AB12CD34</code> или <code>!vip_review #AB12CD34</code>. Бонус начисляется один раз на оплаченный заказ, пока его аренда активна. Повторная команда не даёт ещё один бонус.
-
-<b>Обычные и евент-цены</b>
-В карточке каждого лота задайте обе цены:
-«Обычная цена» → отправьте <code>50</code>.
-«Евент-цена» → отправьте <code>75</code>.
-Цена задаётся за штуку в валюте предложения. Сохранение значения не является применением на FunPay.
-
-Нажмите переключатель режима на главной странице. Дождитесь уведомления и проверьте цены на FunPay. Лоты без заданной положительной цены выбранного режима пропускаются. Изменение цены не меняет часы за штуку и уже оплаченные аренды.''', 'bonuses'),
-    ('messages', '💬 Шаблоны сообщений', '''<b>Главное меню → Сообщения</b>
-Выберите нужный текст и отправьте его целиком. Не более 2500 символов. FunPay получает обычный текст; HTML-разметка здесь не нужна.
-
-<b>Поля выдачи</b>
-<code>{link}</code> — ссылка, обязательна;
-<code>{hours}</code> — часы с бонусом;
-<code>{order_id}</code> — номер заказа;
-<code>{bonus_line}</code> — строка бонуса, если он есть;
-<code>{owner_url}</code> — профиль владельца.
-
-<b>Пример выдачи</b>
-<code>🎮 Ваш VIP-сервер готов!
-Ссылка: {link}
-Время: {hours} ч.
-Заказ: #{order_id}{bonus_line}
-Владелец: {owner_url}
-Отправьте ему заявку и напишите:
-!vip_friends #{order_id} ВашНик</code>
-
-<b>Поля остальных текстов</b>
-Конец аренды: <code>{order_id}</code>.
-Друг добавлен: <code>{friend_name}</code>.
-Нет заявки: <code>{input}</code>.
-Лимит друзей: <code>{limit}</code>.
-Отзыв: <code>{bonus_hours}</code>.
-Используйте поля только в соответствующем шаблоне.
-
-«Сбросить шаблоны» заменяет все ваши тексты стандартными. Сохраните собственные тексты перед сбросом. После обновления старые тексты из базы сохраняются, поэтому проверьте их вручную.''', 'templates'),
-    ('rentals', '🕹 Аренды и возвраты', '''<b>Главное меню → Аренды → нужный заказ</b>
-В карточке проверьте покупателя, лот, сервер, статус, остаток времени и список платежей.
-
-<b>Продлить</b> — добавить часы к действующей аренде; после нажатия отправьте, например, <code>2.5</code>. Уведомление покупателю попадёт в очередь.
-<b>Завершить</b> — досрочно закрыть доступ и записать завершение.
-<b>Отменить</b> — закрыть доступ со статусом отмены.
-Оба действия сами по себе деньги не возвращают.
-<b>Возврат всех платежей</b> — возврат первоначальной покупки и всех продлений этой аренды. Это реальное финансовое действие. Результат каждого платежа проверяется отдельно.
-<b>Обновить</b> — получить актуальное состояние.
-
-Во время операции повторные действия блокируются. Если кнопки старые, откройте карточку заново.
-
-<b>Что происходит при окончании</b>
-Плагин закрывает сервер, отзывает доступ, отключает игроков и меняет код ссылки. Пока очистка не подтверждена, сервер не продаётся заново. При ошибке появляются статус cleanup_failed и повтор очистки.
-
-<b>Возврат отдельной покупки</b>
-Возврат одного заказа на FunPay убирает только его оставшееся время и неиспользованный бонус. Другие оплаченные продления сохраняются. Частичный денежный возврат требует ручной сверки суммы и времени.
-
-Карточка аренды не создаёт новую аренду из прямого перевода: «Продлить» работает для уже действующей.''', 'rentals'),
-    ('orders', '📥 Разбор заказов', '''<b>Почему заказ здесь</b>
-FunPayAPI не всегда передаёт точный ID купленного предложения. Плагин не угадывает его по названию, разделу или ссылке из сообщения покупателя.
-
-<b>Привязать заказ и выдать</b>
-1. Откройте заказ на FunPay и сверьте именно купленное предложение.
-2. Убедитесь, что этот лот настроен в плагине, источник выбран и сервер доступен.
-3. Нажмите «Привязать заказ и выдать» и по очереди ответьте на три вопроса: номер заказа (<code>AB12CD34</code>), ID предложения (<code>123456</code>), количество штук из заказа (<code>2</code>).
-Последнее значение — штуки, а не часы. После последнего ответа запускается обработка и выдача. Проверьте количество на FunPay перед отправкой.
-
-<b>Повторить чтение заказа</b>
-Отправьте только ORDER_ID. Используйте после восстановления связи с FunPay. Если API по-прежнему не отдаёт ID лота, повтор сам по себе не решит привязку.
-
-<b>Убрать чужой заказ</b>
-Только для покупки, не относящейся к этому плагину. Она исключается из его очереди без выдачи и возврата.
-
-<b>Ссылка ещё не пришла</b>
-Откройте аренду. delivering / delivery_pending означает ожидание отправки. Сообщение сохранено в базе и повторяется; новую аренду для той же покупки вручную не создавайте. Время новой аренды начинается после подтверждения отправки в FunPay, а не после прочтения покупателем.
-
-Неопределённый заказ не получает случайный сервер и не возвращается автоматически.''', 'orders'),
-    ('check', '✅ Проверка перед продажами', '''<b>Сначала один лот и один сервер</b>
-1. Проверьте владельца, Place ID и источник лота. На время настройки держите предложение скрытым на FunPay.
-2. Отключите другие выдачи для этого же предложения: штатную выдачу Cardinal, встроенную выдачу FunPay и конкурирующие плагины.
-3. Проверьте «Автолоты», «Автовозврат», лимиты друзей, бонусы, цены и сообщения.
-4. Проведите согласованную проверочную покупку. Это реальная покупка; способ проверки и расчёты организуйте самостоятельно.
-5. Убедитесь, что выдан нужный сервер и правильное число часов. Если заказ попал в разбор — сверьте предложение и привяжите вручную.
-6. Проверьте вход, !vip_time и добавление друга после заявки.
-7. Проверьте продление того же лота и отдельную аренду другого лота. Команды с номером заказа должны выбирать нужную аренду.
-8. Завершите аренду штатной кнопкой. Проверьте отключение игроков, отказ старой ссылки и снятие разрешений.
-9. Убедитесь, что сервер снова доступен и лот синхронизирован на FunPay.
-
-<b>Если проверка не прошла</b>
-Приостановите этот лот и исправьте причину из карточки. Не переводите сервер в свободные вручную через базу.
-
-Автотесты проверяют локальную логику и сценарии с имитацией сетевых ответов. Реальный вход, ограничения игры и доступность API нужно проверять на вашем хосте.''', 'settings'),
-    ('problems', '🛠 Частые вопросы', '''<b>Лот не появляется в продаже</b>
-Проверьте паузу, источник, свободные проверенные серверы именно этого пула и «Автолоты». Подождите очередную сверку — примерно минуту. Ошибка FunPay отображается в карточке лота.
-
-<b>Свободные серверы есть, но выдачи нет</b>
-Свободный сервер другой категории не подходит. В random не входят серверы категорий и прямых привязок. Также проверьте «Заказы»: может отсутствовать ID предложения.
-
-<b>Друг не добавляется</b>
-Проверьте модуль, лимит, правильный заказ и ник, заявку именно владельцу выданного сервера. Дружба не отменяет ограничения приватности, возраста и родительских настроек Roblox.
-
-<b>Старая ссылка перестала работать</b>
-Она меняется при !ссылка / !vip_link и при очистке. Пользуйтесь последней ссылкой действующей аренды.
-
-<b>cleanup_failed / сервер не освобождается</b>
-Откройте карточку аренды и прочтите ошибку. Проверьте cookie владельца, соединение и сервер в Roblox; затем повторите очистку. Есть автоматические повторы с увеличением интервала. Не удаляйте базу и не обходите проверку свободным статусом.
-
-<b>refund_pending</b>
-FunPay ещё не подтвердил возврат. Проверьте заказ на FunPay и соединение. Не считайте возврат выполненным только по нажатию кнопки.
-
-<b>Бот не принимает ввод</b>
-Нажмите действие заново: ожидание длится 30 минут и снимается переходом в меню или /cancel.
-
-<b>Команды FunPay не отвечают</b>
-Из аккаунта покупателя отправьте /com. В Telegram откройте «Настройки → Диагностика команд → Обновить»: там видны версия, получение команды, результат обработки и последняя отправка. Если получение отсутствует, проверьте включение плагина и перезапуск Cardinal. Старый режим требует доступа к истории. Для !ссылка и !друзья дождитесь ответа Roblox; при ошибке проверьте cookie и прокси владельца.
-
-Для обращения к автору приложите версию, этап, текст ошибки и ID заказа. Уберите cookie, пароли прокси и действующие приватные ссылки.''', 'main'),
-    ('update', '💾 Обновление и копии', '''<b>Перед заменой файла</b>
-1. Приостановите продажи и остановите Cardinal.
-2. Скопируйте прежний .py и <code>AutoVIPRoblox_Monolith.db</code>. Если рядом есть файлы базы с окончаниями <code>-wal</code> и <code>-shm</code>, сохраните их тоже.
-3. Замените плагин файлом <code>AutoVipRoblox_LuckyFunpay.py</code>. Старый .py уберите из plugins. Базу оставьте рядом.
-4. Запустите Cardinal и проверьте аккаунты, серверы, лоты, незавершённые аренды и очередь заказов.
-
-<b>Переход с v15</b>
-Перед изменением схемы создаётся SQLite-копия <code>*.before-v16-*.bak</code>. Для каждого непроверенного сервера откройте его карточку → «Проверить владельца». Новые продажи допускаются только после проверки владельца. При обновлении с 16.1 повторно создавать аккаунты, категории и лоты не нужно.
-
-<b>После перезапуска</b>
-Очереди сообщений и возвратов сохраняются. Незавершённые операции проверяются и восстанавливаются. Если появилась ошибка очистки, исправьте доступ к Roblox и дождитесь подтверждённой очистки.
-
-Переименование файла не требует пустой базы или повторного создания всех лотов: UUID и имя базы сохранены. Пока Cardinal остановлен, выполнять очистку по таймеру некому — учитывайте это при обслуживании активных аренд.
-
-Для отката остановите Cardinal и восстановите согласованную резервную копию базы вместе с соответствующим старым .py. Не смешивайте несколько независимо изменённых копий базы.''', 'main'),
-)
-
-
-
-INPUTS = {
-    'add_account': 'Отправьте cookie .ROBLOSECURITY. Повторное добавление того же Roblox-аккаунта обновляет cookie; серверы и аренды сохраняются.',
-    'update_account': 'Формат: ACCOUNT_ID | COOKIE. Cookie должен принадлежать прежнему Roblox-пользователю.',
-    'delete_account': 'Введите внутренний ID аккаунта без серверов. Аккаунт будет выключен; история останется.',
-    'add_server': 'Введите VIP_SERVER_ID. Владелец и Place ID определятся по добавленным аккаунтам. Или: VIP_SERVER_ID | ACCOUNT_ID | PLACE_ID.',
-    'add_server_cat': 'Формат: CATEGORY_ID | VIP_SERVER_ID [ещё ID через пробел]. Для явного владельца: CATEGORY_ID | VIP_SERVER_ID | ACCOUNT_ID | PLACE_ID.',
-    'rebind_server': 'Формат: VIP_SERVER_ID | ACCOUNT_ID | PLACE_ID. Roblox проверит владельца и игру. Доступно после миграции и для свободных серверов.',
-    'delete_server': 'Введите ID свободного сервера без привязанных лотов. Сервер будет выключен в пуле; история сохранится.',
-    'add_category': 'Название | PLACE_ID (числа после /games/ в адресе Roblox). Можно ввести только название; игра определится по первому серверу.',
-    'edit_category': 'CATEGORY_ID | название | PLACE_ID. Игра должна совпадать со всеми серверами категории.',
-    'move_server': 'VIP_SERVER_ID | CATEGORY_ID. Вместо категории: - для общего пула. Только свободный сервер.',
-    'delete_category': 'ID пустой категории без привязанных лотов. Сначала измените источники лотов.',
-    'add_lot': 'LOT_ID | ЧАСЫ ЗА ШТУКУ | название (необязательно). По умолчанию лот приостановлен до выбора источника.',
-    'delete_lot': 'ID лота без незавершённых аренд. Он будет деактивирован на FunPay и удалён из настроек плагина.',
-    'bind_lot': 'LOT_ID | category | CATEGORY_ID, LOT_ID | server | SERVER_ID или LOT_ID | random. Источник сохраняется строго; привязка снимает паузу.',
-    'lot_hours': 'LOT_ID | ЧАСЫ ЗА ШТУКУ. Изменение действует на будущие платежи.',
-    'price_normal': 'LOT_ID | ЦЕНА', 'price_event': 'LOT_ID | ЦЕНА',
-    'friend_limit': 'LOT_ID | ЛИМИТ. 0 — без лимита плагина, - или -1 — общий лимит. Лимиты Roblox сохраняются.',
-    'bonus': 'КУПИЛ:БОНУС в часах, например 5:1. Применяется самое большое достигнутое правило за каждый полный порог.',
-    'edit_bonus': 'ID ПРАВИЛА | КУПИЛ:БОНУС', 'delete_bonus': 'ID правила из списка бонусов.',
-    'review_bonus': 'Бонус за 5★ в часах, например 1.5.',
-    'global_friend_limit': '0 или - — без лимита плагина; положительное целое — максимум друзей на аренду.',
-    'template': 'Новый текст. Для выдачи обязательно {link}. Поля: {link}, {hours}, {order_id}, {bonus_line}, {owner_url}. Другие шаблоны: {friend_name}, {input}, {limit}, {bonus_hours}. FunPay показывает обычный текст.',
-    'proxy': 'ip:port, login:pass@host:port, http://… или socks5://… . Для удаления: -.',
-    'extend': 'Количество часов продления действующей аренды.',
-    'bind_order': 'Ручной разбор: ORDER_ID | LOT_ID (или ORDER_ID | LOT_ID | КОЛИЧЕСТВО, если FunPayAPI его не передаёт). Сверьте именно купленное предложение в FunPay. После сохранения начнётся выдача.',
-    'retry_order': 'ID заказа из очереди для повторного чтения FunPay.',
-    'ignore_order': 'ID заказа другого плагина: убрать из очереди Auto VIP без выдачи и возврата.',
-}
-
-
-def panel_button(label, action):
-    return Button(label, callback_data=f'{PREFIX}:{action}')
-
-
-def money_text(amount, currency):
-    currency = str(currency or 'UNKNOWN')
-    symbol = {'RUB':'₽', 'USD':'$', 'EUR':'€', 'UAH':'₴'}.get(currency, esc(currency))
-    return f'{float(amount):,.2f}'.replace(',', ' ').replace('.', ',') + ' ' + symbol
-
-
-def switch_button(key, title, destination):
-    enabled = database().setting(key) == '1'
-    return panel_button(('🟢 ' if enabled else '⚪ ') + title, f'toggle:{key}:{destination}')
-
-
-def friends_menu(bot, chat_id, message_id):
-    db = database()
-    enabled = 'включён' if db.setting('friends_module_active') == '1' else 'выключен'
-    cleanup = 'удалять добавленную дружбу' if db.setting('friends_auto_remove') == '1' else 'сохранять дружбу'
-    limit = as_int(db.setting('friends_default_limit'), 0)
-    text = ('🤝 <b>Друзья и доступ</b>\n\n'
-            f'Модуль: <b>{enabled}</b>\nПосле аренды: <b>{cleanup}</b>\n'
-            f'Общий лимит: <b>{limit if limit else "без ограничений плагина"}</b>\n\n'
-            'Покупатель отправляет заявку владельцу, затем пишет:\n'
-            '<code>!друзья #ЗАКАЗ Ник</code>\n\n'
-            '<i>Доступ к VIP-серверу отзывается всегда. Переключатель удаления касается только дружбы Roblox.</i>')
-    kb = Keyboard(row_width=2)
-    kb.row(switch_button('friends_module_active','Модуль друзей','friends'),
-           switch_button('friends_auto_remove','Удалять друзей','friends'))
-    kb.row(panel_button('👥 Лимит друзей','input:global_friend_limit'), panel_button('💬 Тексты ответов','templates'))
-    kb.row(panel_button('◀️ Главное меню','main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def reviews_menu(bot, chat_id, message_id):
-    db = database()
-    enabled = 'включён' if db.setting('review_bonus_active') == '1' else 'выключен'
-    text = ('⭐ <b>Бонус за отзыв</b>\n\n'
-            f'Статус: <b>{enabled}</b>\nЗа отзыв 5★: <b>+{esc(db.setting("review_bonus_hours"))} ч.</b>\n\n'
-            'Бонус начисляется один раз на оплаченный заказ.\n'
-            'Проверка — автоматически или по команде:\n<code>!отзыв #ЗАКАЗ</code>')
-    kb = Keyboard(row_width=2)
-    kb.row(switch_button('review_bonus_active','Бонус за отзыв','reviews'), panel_button('⏱ Размер бонуса','input:review_bonus'))
-    kb.row(panel_button('💬 Сообщение за отзыв','input:template:msg_review_bonus'))
-    kb.row(panel_button('◀️ Главное меню','main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def templates_menu(bot, chat_id, message_id):
-    text = ('💬 <b>Сообщения покупателю</b>\n\n'
-            'Выберите текст, который хотите изменить.\n'
-            'Подстановки сохраняют ссылку, время и данные заказа.\n\n'
-            '<i>Сброс восстановит стандартные тексты всех сообщений.</i>')
-    kb = Keyboard(row_width=2)
-    for left, right in (
-        (('🎮 Выдача сервера','msg_post_payment'), ('⌛ Конец аренды','msg_post_expire')),
-        (('🤝 Друг добавлен','msg_friend_added'), ('🔎 Нет заявки','msg_friend_not_found')),
-        (('👥 Лимит друзей','msg_friend_limit'), ('⭐ Отзыв','msg_review_bonus')),
-    ):
-        kb.row(panel_button(left[0], 'input:template:' + left[1]), panel_button(right[0], 'input:template:' + right[1]))
-    kb.row(panel_button('🔄 Сбросить шаблоны','reset_templates'))
-    kb.row(panel_button('◀️ Главное меню','main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def command_diagnostics_menu(bot, chat_id, message_id):
-    with GUARD:
-        snapshot, pending = dict(COMMAND_TRACE), len(RUNNING)
-    mode = getattr(CARDINAL, 'old_mode_enabled', None)
-    mode_text = 'старый' if mode is True else ('обычный' if mode is False else 'не определён этой версией Cardinal')
-    alive = bool(WORKER and WORKER.is_alive())
-    text = ('🔎 <b>Диагностика команд FunPay</b>\n\n'
-            f'Версия: <b>{esc(VERSION)}</b>\nФайл: <code>{esc(os.path.basename(__file__))}</code>\n'
-            f'Режим чтения: {mode_text}\nФоновый обработчик: {"работает" if alive else "не запущен"}\n'
-            f'Операций в очереди и работе: {pending}\n\n')
-    for key, label in (('receive', 'Получение'), ('process', 'Обработка'), ('send', 'Последняя отправка в FunPay')):
-        item = snapshot.get(key)
-        text += f'<b>{label}</b>\n'
-        text += (f'{esc(time.strftime("%H:%M:%S", time.localtime(item[0])))} · {esc(item[1])}\n\n'
-                 if item else 'После запуска данных нет.\n\n')
-    text += ('Из аккаунта покупателя отправьте <code>/com</code> в чат FunPay и нажмите «Обновить».\n'
-             'Если получение не появилось — команда не дошла до обработчиков этой версии. '
-             'Проверьте включение плагина и перезапуск Cardinal.\n\n'
-             '<i>Показаны последние этапы по всем чатам; отправка может относиться к другому уведомлению. '
-             'Тексты сообщений, ники и cookie не сохраняются. Диагностика сбрасывается при перезапуске.</i>')
-    kb = Keyboard().row(panel_button('🔄 Обновить','command_diagnostics'), panel_button('◀️ Настройки','settings'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def guide_menu(bot, chat_id, message_id, section=None):
-    kb = Keyboard(row_width=2)
-    if section is None:
-        text = ('📖 <b>Инструкция Auto VIP Roblox</b>\n\n'
-                'Пошаговая настройка, примеры ввода и помощь при ошибках.\n'
-                'Начните с установки и пройдите разделы по порядку.\n\n'
-                '<b>Порядок:</b> аккаунт → сервер → категория → лот → проверочная аренда.\n\n'
-                'Все ID в примерах условные. После кнопки действия отправляйте полный формат с вашими данными.\n'
-                '<code>/cancel</code> отменяет ожидание ввода.\n\n'
-                'Выберите раздел:')
-        buttons = [panel_button(title, 'guidepage:' + key) for key, title, _, _ in GUIDE_SECTIONS]
-        for index in range(0, len(buttons), 2):
-            kb.row(*buttons[index:index+2])
-    else:
-        index = next((i for i, item in enumerate(GUIDE_SECTIONS) if item[0] == section), None)
-        if index is None:
-            raise ValueError('Раздел инструкции не найден. Откройте оглавление заново.')
-        key, title, body, destination = GUIDE_SECTIONS[index]
-        text = f'📖 <b>{esc(title)}</b>\n<i>Раздел {index+1} из {len(GUIDE_SECTIONS)}</i>\n\n{body}'
-        nav = []
-        if index:
-            nav.append(panel_button('⬅️ Назад', 'guidepage:' + GUIDE_SECTIONS[index-1][0]))
-        if index+1 < len(GUIDE_SECTIONS):
-            nav.append(panel_button('Далее ➡️', 'guidepage:' + GUIDE_SECTIONS[index+1][0]))
-        if nav:
-            kb.row(*nav)
-        if destination != 'main':
-            kb.row(panel_button('⚙️ Открыть настройки раздела', destination))
-        kb.row(panel_button('📚 Оглавление', 'guide'))
-    kb.row(panel_button('◀️ Главное меню', 'main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def lot_details(bot, chat_id, message_id, lot_id):
-    lot = database().row('SELECT * FROM lots WHERE lot_id=?', (lot_id,))
-    if not lot:
-        raise ValueError('Лот не найден')
-    source = '⚠️ Выберите источник выдачи'
-    if source_key(lot):
-        if lot['bind_type'] == 'category':
-            cat = database().row('SELECT name FROM categories WHERE id=?', (lot['category_id'],))
-            source = '📁 ' + str(cat['name']) if cat else '⚠️ Категория не найдена'
-        elif lot['bind_type'] == 'server':
-            source = '🖥 Сервер ' + str(lot['server_id'])
-        else:
-            source = '🎲 Общий пул'
-    limit = 'по умолчанию' if lot['friend_limit'] < 0 else ('без лимита плагина' if not lot['friend_limit'] else str(lot['friend_limit']))
-    text = (f'✏️ <b>Редактирование лота</b>\n\n📦 <b>{esc(lot["name"])}</b>\n'
-            f'🆔 ID: <code>{lot_id}</code>\n⏰ За 1 шт.: {lot["hours"]:g} ч.\n'
-            f'📥 Выдача: {esc(source)}\n👥 Лимит друзей: {esc(limit)}\n\n'
-            f'💰 Обычная цена: {lot["price_normal"]:g}\n🎉 Евент-цена: {lot["price_event"]:g}\n'
-            f'Продажи: {"⏸ на паузе" if lot["paused"] else "включены"}\n'
-            f'Синхронизация: {esc(lot["last_error"] or "без ошибок")}\n\n'
-            '<i>Нажмите нужную настройку. Бот попросит только новое значение.</i>')
-    kb = Keyboard(row_width=2)
-    kb.row(panel_button('⏰ Изменить время', f'c_wizard:lot_hours:{lot_id}'))
-    kb.row(panel_button('📁 Привязать категорию', f'c_pick:{lot_id}:category:0'))
-    kb.row(panel_button('🖥 Привязать один сервер', f'c_pick:{lot_id}:server:0'))
-    kb.row(panel_button('🎲 Общий пул', f'c_bind:{lot_id}:random:0'))
-    kb.row(panel_button('💰 Обычная цена', f'c_wizard:price_normal:{lot_id}'), panel_button('🎉 Евент-цена', f'c_wizard:price_event:{lot_id}'))
-    kb.row(panel_button('👥 Лимит друзей', f'c_wizard:friend_limit:{lot_id}'))
-    kb.row(panel_button('▶️ Включить' if lot['paused'] else '⏸ Приостановить', f'pause:{lot_id}'), panel_button('🗑 Удалить лот', f'c_confirm:lot:{lot_id}'))
-    kb.row(panel_button('🔄 Обновить', f'lot:{lot_id}'), panel_button('⬅️ Лоты', 'lots'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def orders_menu(bot, chat_id, message_id, page=0):
-    total = database().row("SELECT COUNT(*) n FROM incoming_orders WHERE state IN ('attention','pending')")['n']
-    pages = max(1, (total+7)//8)
-    page = min(max(0, page), pages-1)
-    rows = database().rows("SELECT * FROM incoming_orders WHERE state IN ('attention','pending') ORDER BY created_at DESC LIMIT 8 OFFSET ?", (page*8,))
-    text = f'📥 <b>Заказы на разбор · {page+1}/{pages}</b>\n\n'
-    for r in rows:
-        text += f'#{esc(r["order_id"])} · {esc(r["state"])}\n{esc(r["error"] or "Ожидает обработки")}\n\n'
-    kb = Keyboard(row_width=1)
-    for title, action in (('🔗 Привязать заказ и выдать','bind_order'), ('🔁 Повторить чтение заказа','retry_order'), ('Убрать чужой заказ','ignore_order')):
-        route = 'c_wizard' if action == 'bind_order' else 'input'
-        kb.add(Button(title, callback_data=f'{PREFIX}:{route}:{action}'))
-    if page:
-        kb.add(Button('⬅️', callback_data=f'{PREFIX}:orderpage:{page-1}'))
-    if page+1 < pages:
-        kb.add(Button('➡️', callback_data=f'{PREFIX}:orderpage:{page+1}'))
-    kb.add(Button('🔄 Обновить', callback_data=f'{PREFIX}:orders'), Button('◀️ В меню', callback_data=f'{PREFIX}:main'))
-    edit_or_send(bot, chat_id, text, kb, message_id)
-
-
-def verify_server_config(server_id, account_id=None, place_id=None):
-    db = database()
-    accounts = db.rows('SELECT * FROM accounts WHERE enabled=1 AND id>0' + (' AND id=?' if account_id else ''), (account_id,) if account_id else ())
-    found = []
-    for account in accounts:
-        try:
-            api = RobloxAPI(RobloxAccount(account['id'], account['cookie'], account['proxy'], str(account['roblox_id'])))
-            details = api.details(server_id)
-            actual_place = ((details.get('game') or {}).get('rootPlace') or {}).get('id')
-            if place_id and str(actual_place) != str(place_id):
-                continue
-            if not as_int(actual_place):
-                continue
-            api.verify_owner(server_id, str(actual_place))
-            found.append((account['id'], str(actual_place)))
         except Exception:
+            LOG.debug("AutoVIP: delete_lot не сработал, удаляю через форму", exc_info=True)
+    lot_fields = account.get_lot_fields(int(offer_id))
+    fields = dict(getattr(lot_fields, "fields", None) or {})
+    fields.update({"deleted": "1", "offer_id": str(offer_id)})
+    fp_post_offer(fields)
+
+
+# ---------------------------------------------------------------------------
+# Серверы, лоты, бонусы
+# ---------------------------------------------------------------------------
+FREE_SQL = f"server_id NOT IN (SELECT server_id FROM rentals WHERE status IN {LIVE})"
+GENERAL_SQL = "category_id IS NULL AND server_id NOT IN (SELECT server_id FROM lots WHERE server_id IS NOT NULL)"
+
+
+def lot_mode(lot: sqlite3.Row) -> str:
+    if lot["category_id"] and S.q1("SELECT 1 FROM categories WHERE id=?", (lot["category_id"],)):
+        return "category"
+    if lot["server_id"]:
+        return "server"
+    return "random"
+
+
+def free_server_for(lot: sqlite3.Row) -> Tuple[Optional[str], str]:
+    mode = lot_mode(lot)
+    if mode == "category":
+        row = S.q1(f"SELECT server_id FROM servers WHERE category_id=? AND {FREE_SQL} ORDER BY added_at, server_id",
+                   (lot["category_id"],))
+    elif mode == "server":
+        row = S.q1(f"SELECT server_id FROM servers WHERE server_id=? AND {FREE_SQL}", (str(lot["server_id"]),))
+    else:
+        row = S.q1(f"SELECT server_id FROM servers WHERE {GENERAL_SQL} AND {FREE_SQL} ORDER BY added_at, server_id")
+    return (row["server_id"] if row else None), mode
+
+
+def free_general_count() -> int:
+    return int(S.val(f"SELECT COUNT(*) FROM servers WHERE {GENERAL_SQL} AND {FREE_SQL}"))
+
+
+def duplicate_lots() -> Dict[str, List[sqlite3.Row]]:
+    groups: Dict[str, List[sqlite3.Row]] = {}
+    for lot in S.q("SELECT * FROM lots ORDER BY lot_id"):
+        groups.setdefault(norm_name(lot["name"]), []).append(lot)
+    return {k: v for k, v in groups.items() if k and len(v) > 1}
+
+
+def name_taken(name: str, except_lot: Optional[int] = None) -> Optional[sqlite3.Row]:
+    key = norm_name(name)
+    for lot in S.q("SELECT * FROM lots"):
+        if norm_name(lot["name"]) == key and lot["lot_id"] != except_lot:
+            return lot
+    return None
+
+
+def match_lot(description: str) -> Tuple[Optional[sqlite3.Row], bool]:
+    """Ищет лот, название которого входит в описание заказа: сначала полное совпадение, затем самое длинное."""
+    desc = norm_name(description)
+    base = re.sub(r",?\s*\d+\s*шт\.?$", "", desc).strip()
+    candidates = [lot for lot in S.q("SELECT * FROM lots") if norm_name(lot["name"]) and norm_name(lot["name"]) in desc]
+    if not candidates:
+        return None, False
+    exact = [lot for lot in candidates if norm_name(lot["name"]) in (desc, base)]
+    chosen = (exact or sorted(candidates, key=lambda l: len(norm_name(l["name"])), reverse=True))[0]
+    twins = [lot for lot in S.q("SELECT * FROM lots")
+             if lot["lot_id"] != chosen["lot_id"] and norm_name(lot["name"]) == norm_name(chosen["name"])]
+    return chosen, bool(twins)
+
+
+def volume_bonus(hours: float) -> float:
+    if not S.flag("bonus_active"):
+        return 0.0
+    for rule in S.q("SELECT * FROM bonus_rules ORDER BY id"):
+        if hours >= float(rule["buy_hours"]):
+            return float(rule["get_hours"])
+    return 0.0
+
+
+def friend_limit_for(rental: sqlite3.Row) -> int:
+    lot = S.q1("SELECT friend_limit FROM lots WHERE lot_id=?", (rental["lot_id"],)) if rental["lot_id"] else None
+    if lot is not None and lot["friend_limit"] is not None:
+        return max(0, int(lot["friend_limit"]))
+    try:
+        return max(0, int(S.get("friends_default_limit") or 0))
+    except ValueError:
+        return 0
+
+
+def friends_used(rental_id: str) -> int:
+    return int(S.val("SELECT COUNT(*) FROM rental_friends WHERE rental_id=? AND state='added'", (rental_id,)))
+
+
+def active_rentals(buyer_id: Any) -> List[sqlite3.Row]:
+    return S.q("SELECT * FROM rentals WHERE buyer_id=? AND status='active' AND end_time>? ORDER BY start_time, created_at, rowid",
+               (str(buyer_id), now()))
+
+
+def get_active(rental_id: str) -> Optional[sqlite3.Row]:
+    return S.q1("SELECT * FROM rentals WHERE rental_id=? AND status='active' AND end_time>?", (rental_id, now()))
+
+
+def rental_title(rental: sqlite3.Row) -> str:
+    if rental["lot_name"]:
+        return str(rental["lot_name"])
+    row = S.q1("""SELECT c.game_name,c.name FROM servers s JOIN categories c ON c.id=s.category_id
+                  WHERE s.server_id=?""", (rental["server_id"],))
+    if row:
+        return str(row["game_name"] or row["name"])
+    return "VIP-сервер " + str(rental["server_id"])
+
+
+def owner_profile(rental: sqlite3.Row) -> Tuple[str, str]:
+    account = S.q1("SELECT * FROM accounts WHERE id=?", (rental["account_id"],)) if rental["account_id"] else None
+    if not account:
+        return "https://www.roblox.com/", "владелец сервера"
+    return (f"https://www.roblox.com/users/{account['roblox_id']}/profile",
+            str(account["username"] or account["roblox_id"]))
+
+
+def earned_total() -> float:
+    return float(S.val("SELECT COALESCE(SUM(price),0) FROM rentals")) + \
+        float(S.val("SELECT COALESCE(SUM(price),0) FROM friend_payments WHERE state='applied'"))
+
+
+# ---------------------------------------------------------------------------
+# Заказы
+# ---------------------------------------------------------------------------
+def on_new_order(cardinal: Any, event: Any) -> None:
+    order = getattr(event, "order", None)
+    if order is not None:
+        ORDER_QUEUE.put(order)
+
+
+def order_loop() -> None:
+    while not STOP.is_set():
+        try:
+            order = ORDER_QUEUE.get(timeout=1)
+        except queue.Empty:
             continue
-    if len(found) != 1:
-        raise ValueError('Roblox не подтвердил единственного владельца и Place ID. Проверьте cookie, прокси, ID сервера и аккаунта.')
-    return found[0]
+        try:
+            process_order(order)
+        except Exception:
+            LOG.exception("AutoVIP: ошибка обработки заказа")
 
 
-def update_configuration(action, raw, extra):
-    db = database()
-    parts = [p.strip() for p in raw.split('|')]
-    if action in ('add_account', 'update_account'):
-        expected = None
-        cookie = raw
-        if action == 'update_account':
-            account_id, cookie = raw.split('|', 1)
-            expected = db.row('SELECT * FROM accounts WHERE id=? AND id>0', (int(account_id),))
-            if not expected:
-                raise ValueError('Аккаунт не найден')
-        proxy = expected['proxy'] if expected else db.setting('global_proxy')
-        cookie = cookie.strip()
-        if '_|WARNING:-DO-NOT-SHARE' not in cookie:
-            raise ValueError('Это не .ROBLOSECURITY cookie')
-        auth = RobloxAPI(RobloxAccount(0, cookie, proxy, '')).authenticated()
-        if not auth or (expected and str(expected['roblox_id']) != auth[0]):
-            raise ValueError('Cookie не подтверждён или принадлежит другому аккаунту')
-        uid, name = auth
-        with db.lock, db.conn() as con:
-            exists = con.execute('SELECT id FROM accounts WHERE roblox_id=?', (uid,)).fetchone()
-            if exists:
-                con.execute('UPDATE accounts SET cookie=?,username=?,enabled=1 WHERE roblox_id=?', (cookie, name, uid))
-            else:
-                con.execute('INSERT INTO accounts(cookie,proxy,username,roblox_id,created_at) VALUES(?,?,?,?,?)', (cookie, proxy, name, uid, time.time()))
-        return '✅ Cookie проверен и сохранён для ' + esc(name)
-    if action in ('add_server','add_server_cat','rebind_server'):
-        category = None
-        if action == 'add_server_cat':
-            category, parts = int(parts[0]), parts[1:]
-            if not db.row('SELECT 1 FROM categories WHERE id=?', (category,)):
-                raise ValueError('Категория не найдена')
-        if len(parts) == 3:
-            server_ids = [parts[0]]
-            account, place = int(parts[1]), parts[2]
-        elif len(parts) == 1:
-            server_ids, account, place = split_ids(parts[0]), None, None
+def process_order(order: Any) -> None:
+    order_id = str(getattr(order, "id", "") or "").lstrip("#")
+    if not order_id:
+        return
+    status = getattr(order, "status", None)
+    if OrderStatuses is not None and status is not None and status != getattr(OrderStatuses, "PAID", status):
+        return
+    with S.tx():
+        if S.q1("SELECT 1 FROM processed_orders WHERE order_id=?", (order_id,)):
+            return
+        S.ex("INSERT INTO processed_orders VALUES(?,?,?)", (order_id, "processing", now()))
+    try:
+        kind = handle_order(order, order_id)
+    except Exception as exc:
+        LOG.exception("AutoVIP: заказ %s", order_id)
+        notify_admins(f"⚠️ <b>Auto VIP: ошибка обработки заказа</b> #{esc(order_id)}\n{esc(exc)}")
+        kind = "error"
+    S.ex("UPDATE processed_orders SET kind=? WHERE order_id=?", (kind, order_id))
+
+
+def order_chat(order: Any, order_id: str) -> Tuple[str, str, str]:
+    chat_id = str(getattr(order, "chat_id", "") or "")
+    buyer_id = str(getattr(order, "buyer_id", "") or "")
+    buyer_name = str(getattr(order, "buyer_username", "") or "")
+    if not chat_id or not buyer_id:
+        try:
+            full = CARDINAL.account.get_order(order_id)
+            chat_id = chat_id or str(getattr(full, "chat_id", "") or "")
+            buyer_id = buyer_id or str(getattr(full, "buyer_id", "") or "")
+            buyer_name = buyer_name or str(getattr(full, "buyer_username", "") or "")
+        except Exception:
+            LOG.debug("AutoVIP: get_order", exc_info=True)
+    if not chat_id and buyer_name:
+        try:
+            chat = CARDINAL.account.get_chat_by_name(buyer_name, True)
+            chat_id = str(getattr(chat, "id", "") or "")
+        except Exception:
+            LOG.debug("AutoVIP: get_chat_by_name", exc_info=True)
+    return chat_id, buyer_id, buyer_name
+
+
+def refund(order_id: str) -> bool:
+    try:
+        CARDINAL.account.refund(order_id)
+        return True
+    except Exception:
+        LOG.warning("AutoVIP: возврат заказа %s не выполнен", order_id, exc_info=True)
+        return False
+
+
+def handle_order(order: Any, order_id: str) -> str:
+    description = str(getattr(order, "description", "") or "")
+    if blacklisted(getattr(order, "buyer_username", None)):
+        return "blacklist"
+    tag = TAG_RE.search(description)
+    if tag:
+        return handle_friend_payment(order, order_id, tag.group(0))
+    lot, has_twin = match_lot(description)
+    if lot is None:
+        return "ignored"
+    chat_id, buyer_id, buyer_name = order_chat(order, order_id)
+    if has_twin:
+        notify_admins(f"⚠️ <b>Одинаковые названия лотов</b>\nЗаказ #{esc(order_id)} выдан по лоту «{esc(lot['name'])}» "
+                      f"(ID {lot['lot_id']}), но в плагине есть лот с таким же названием. Проверьте заказ и "
+                      "переименуйте один из лотов на FunPay.")
+    try:
+        amount = max(1, int(getattr(order, "amount", 1) or 1))
+    except (TypeError, ValueError):
+        amount = 1
+    try:
+        price = float(getattr(order, "price", 0) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    hours = float(lot["hours"]) * amount
+    bonus = volume_bonus(hours)
+    total = hours + bonus
+    server_id, mode = free_server_for(lot)
+    if not server_id:
+        busy = {"category": "❌ Все серверы для этого лота сейчас заняты.",
+                "server": "❌ Сервер для этого лота сейчас занят.",
+                "random": "❌ Все серверы сейчас заняты."}[mode]
+        refunded = refund(order_id)
+        busy += "\n💸 Деньги возвращены автоматически." if refunded else "\nПродавец уведомлён и вернёт деньги."
+        send_fp(chat_id, busy, buyer_name)
+        notify_admins(f"⚠️ <b>Нет свободного сервера</b> для заказа #{esc(order_id)} (лот «{esc(lot['name'])}»). "
+                      + ("Сделан автовозврат." if refunded else "<b>Автовозврат не удался — верните деньги вручную.</b>"))
+        request_lot_sync()
+        return "no_server"
+    try:
+        account, link, place = issue_link(server_id)
+    except Exception as exc:
+        send_fp(chat_id, "❌ Ошибка генерации ссылки. Обратитесь к администратору.", buyer_name)
+        notify_admins(f"⚠️ <b>Ошибка генерации ссылки</b>\nЗаказ #{esc(order_id)}, сервер <code>{esc(server_id)}</code>\n"
+                      f"Причина: {esc(exc)}\nАренда не создана, автовозврата нет — обработайте заказ вручную.")
+        return "link_failed"
+    start = now()
+    rental_id = str(uuid.uuid4())
+    S.ex("""INSERT INTO rentals(rental_id,order_id,buyer_id,buyer_name,chat_id,lot_id,lot_name,server_id,account_id,place_id,
+            hours,price,start_time,end_time,status,link,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?)""",
+         (rental_id, order_id, buyer_id, buyer_name, chat_id, lot["lot_id"], lot["name"], server_id, account["id"], place,
+          total, price, start, start + total * 3600, link, start))
+    text = render("post_payment", link=link, hours=fmt_num(total), order_id=order_id, price=fmt_num(price),
+                  buyer_id=buyer_id, server_id=server_id, chat_id=chat_id)
+    if bonus:
+        text += f"\n🎁 Бонус: +{fmt_num(bonus)} {plural_hours(bonus)} в подарок!"
+    send_fp(chat_id, text, buyer_name)
+    if S.flag("friends_module_active"):
+        profile, owner_name = f"https://www.roblox.com/users/{account['roblox_id']}/profile", account["username"]
+        send_fp(chat_id, render("friend_invite", owner_profile_link=profile, owner_username=owner_name,
+                                order_id=order_id), buyer_name)
+    request_lot_sync()
+    return "rental"
+
+
+# ---------------------------------------------------------------------------
+# Завершение аренды
+# ---------------------------------------------------------------------------
+def end_rental(rental_id: str, reason: Optional[str] = None) -> Tuple[bool, str]:
+    """reason: expired | manual | quiet | cancelled. Возвращает (успех, ошибка)."""
+    with rental_lock(rental_id):
+        rental = S.q1("SELECT * FROM rentals WHERE rental_id=?", (rental_id,))
+        if not rental or rental["status"] not in ("active", "ending"):
+            return False, "not_active"
+        if rental["status"] == "active":
+            reason = reason or "expired"
+            S.ex("UPDATE rentals SET status='ending',end_reason=?,attempts=0 WHERE rental_id=?", (reason, rental_id))
         else:
-            raise ValueError('Неверный формат сервера')
-        if not server_ids or len(server_ids) > 20 or any(not re.fullmatch(r'[1-9][0-9]*', x) for x in server_ids):
-            raise ValueError('Нужно от 1 до 20 числовых ID серверов')
-        for sid in server_ids:
-            owner, root_place = verify_server_config(sid, account, place)
-            with operation_lock('server-config:' + sid), db.lock, db.conn() as con:
-                con.execute('BEGIN IMMEDIATE')
-                existing = con.execute('SELECT * FROM servers WHERE server_id=?', (sid,)).fetchone()
-                if existing and existing['enabled'] and action == 'add_server':
-                    raise ValueError('Сервер уже есть. Откройте его карточку → «Проверить владельца».')
-                busy = con.execute("SELECT * FROM rentals WHERE server_id=? AND status IN ('issuing','delivering','active','refunding','cleaning')", (sid,)).fetchone()
-                if busy:
-                    raise ValueError('У сервера выполняется аренда или операция')
-                old_owner = existing['owner_account_id'] if existing else None
-                failed = con.execute("SELECT * FROM rentals WHERE server_id=? AND status='cleanup_failed'", (sid,)).fetchall()
-                if failed and old_owner not in (None, 0, owner):
-                    raise ValueError('Нельзя менять Roblox-владельца незавершённой аренды')
-                cat_id = category if category is not None else (existing['category_id'] if existing else None)
-                if existing and cat_id != existing['category_id'] and con.execute('SELECT 1 FROM lots WHERE server_id=?', (sid,)).fetchone():
-                    raise ValueError('Сначала измените прямую привязку лота к этому серверу.')
-                if cat_id:
-                    cat = con.execute('SELECT * FROM categories WHERE id=?', (cat_id,)).fetchone()
-                    if not cat or (cat['game_id'] and str(cat['game_id']) != root_place):
-                        raise ValueError('Сервер принадлежит другой игре, чем категория')
-                    con.execute('UPDATE categories SET game_id=? WHERE id=? AND game_id IS NULL', (root_place, cat_id))
-                if existing:
-                    if existing['status'] == 'error' and not failed:
-                        recovery_id = 'recovery-' + uuid.uuid4().hex
-                        con.execute('''INSERT INTO rentals(rental_id,buyer_id,chat_id,lot_id,server_id,owner_account_id,hours,start_time,end_time,status,cleanup_reason)
-                            VALUES(?,'0','',0,?,?,0,0,0,'cleanup_failed','issue_failed')''', (recovery_id,sid,owner))
-                    con.execute('UPDATE servers SET owner_account_id=?,place_id=?,category_id=?,verified=1,enabled=1 WHERE server_id=?', (owner, root_place, cat_id, sid))
-                    con.execute("UPDATE rentals SET owner_account_id=?,next_cleanup_at=0 WHERE server_id=? AND status='cleanup_failed' AND owner_account_id IN (0,?)", (owner, sid, owner))
-                else:
-                    con.execute("INSERT INTO servers(server_id,owner_account_id,place_id,category_id,status,verified) VALUES(?,?,?,?,'free',1)", (sid, owner, root_place, cat_id))
-        return '✅ Проверены и сохранены серверы: ' + ', '.join(server_ids)
-    if action == 'extend':
-        extend_rental(extra[0], raw)
-        return '✅ Аренда продлена. Уведомление покупателю сохранено в очереди.'
-    if action in ('bind_order','retry_order','ignore_order'):
-        oid = parts[0].lstrip('#')
-        with ORDER_LOCK, db.lock, db.conn() as con:
-            if con.execute('SELECT 1 FROM payments WHERE order_id=?', (oid,)).fetchone():
-                raise ValueError('Этот заказ уже обработан; используйте карточку аренды')
-            if not con.execute('SELECT 1 FROM incoming_orders WHERE order_id=?', (oid,)).fetchone():
-                raise ValueError('Заказ не найден в очереди')
-            if action == 'bind_order':
-                lot_id = int(parts[1])
-                if not con.execute('SELECT 1 FROM lots WHERE lot_id=?', (lot_id,)).fetchone():
-                    raise ValueError('Лот не настроен')
-                quantity = int(parts[2]) if len(parts) == 3 else None
-                if quantity is not None and not 1 <= quantity <= 1_000_000:
-                    raise ValueError('Недопустимое количество')
-                con.execute('UPDATE incoming_orders SET lot_id=?,amount=COALESCE(?,amount) WHERE order_id=?', (lot_id, quantity, oid))
-            con.execute('UPDATE incoming_orders SET state=?,error=NULL,next_at=0 WHERE order_id=?', ('ignored' if action == 'ignore_order' else 'pending', oid))
-        return '✅ Заказ убран из очереди.' if action == 'ignore_order' else '✅ Заказ поставлен в очередь обработки.'
-    # Network changes are outside the DB transaction.
-    if action == 'delete_lot':
-        with ORDER_LOCK:
-            lot_id = int(raw)
-            if not db.row('SELECT 1 FROM lots WHERE lot_id=?', (lot_id,)):
-                raise ValueError('Лот не найден')
-            if db.row("SELECT 1 FROM rentals WHERE lot_id=? AND status IN ('issuing','delivering','active','refunding','cleaning','cleanup_failed')", (lot_id,)):
-                raise ValueError('У лота есть незавершённые аренды')
-            with FP_LOT_LOCK:
-                fields = CARDINAL.account.get_lot_fields(lot_id)
-                fields.active = False
-                CARDINAL.account.save_lot(fields.renew_fields())
-                with db.lock, db.conn() as con:
-                    con.execute('DELETE FROM lots WHERE lot_id=?', (lot_id,))
-        return '✅ Лот деактивирован на FunPay и удалён из настроек.'
-    if action == 'add_lot':
-        lot_id, hours = int(parts[0]), positive_float(parts[1], 'Часы')
-        if lot_id <= 0:
-            raise ValueError('Нужен положительный ID лота')
-        fields = CARDINAL.account.get_lot_fields(lot_id)
-        if str(getattr(fields, 'lot_id', '')) != str(lot_id):
-            raise ValueError('FunPay вернул другой лот')
-        name = parts[2] if len(parts) > 2 else (getattr(fields, 'title_ru', None) or getattr(fields, 'summary', None) or f'Лот {lot_id}')
-        with ORDER_LOCK, db.lock, db.conn() as con:
-            con.execute('INSERT INTO lots(lot_id,hours,name,paused,subcategory_id) VALUES(?,?,?,1,?) ON CONFLICT(lot_id) DO UPDATE SET hours=excluded.hours,name=excluded.name',
-                        (lot_id, hours, str(name)[:200], getattr(fields, 'subcategory_id', None)))
-        return '✅ Лот сохранён. Выберите источник выдачи в его карточке.'
-    with ORDER_LOCK, db.lock, db.conn() as con:
-        con.execute('BEGIN IMMEDIATE')
-        if action == 'delete_account':
-            aid = int(raw)
-            if con.execute('SELECT 1 FROM servers WHERE owner_account_id=? AND enabled=1', (aid,)).fetchone() or con.execute("SELECT 1 FROM rentals WHERE owner_account_id=? AND status IN ('issuing','delivering','active','refunding','cleaning','cleanup_failed')", (aid,)).fetchone():
-                raise ValueError('У аккаунта остались серверы или незавершённые аренды')
-            changed = con.execute('UPDATE accounts SET enabled=0 WHERE id=? AND id>0', (aid,))
-        elif action == 'delete_server':
-            if con.execute('SELECT 1 FROM lots WHERE server_id=?', (raw,)).fetchone():
-                raise ValueError('Сначала измените привязку лотов к этому серверу')
-            changed = con.execute("UPDATE servers SET enabled=0 WHERE server_id=? AND status='free'", (raw,))
-        elif action == 'add_category':
-            name = parts[0][:100]
-            place = str(int(parts[1])) if len(parts) > 1 else None
-            if not name or (place and int(place) <= 0):
-                raise ValueError('Нужны название и положительный Place ID')
-            changed = con.execute('INSERT INTO categories(name,game_id) VALUES(?,?)', (name, place))
-        elif action == 'edit_category':
-            cid, name, place = int(parts[0]), parts[1][:100], str(int(parts[2]))
-            if not name or int(place) <= 0 or con.execute('SELECT 1 FROM servers WHERE category_id=? AND place_id!=?', (cid, place)).fetchone():
-                raise ValueError('Название пустое или игра не совпадает с серверами категории')
-            changed = con.execute('UPDATE categories SET name=?,game_id=? WHERE id=?', (name, place, cid))
-        elif action == 'move_server':
-            sid, cid = parts[0], None if parts[1] == '-' else int(parts[1])
-            server = con.execute("SELECT * FROM servers WHERE server_id=? AND status='free' AND enabled=1", (sid,)).fetchone()
-            if not server:
-                raise ValueError('Сервер не найден или занят')
-            if con.execute('SELECT 1 FROM lots WHERE server_id=?', (sid,)).fetchone():
-                raise ValueError('Сначала отвяжите лот от конкретного сервера')
-            if cid:
-                cat = con.execute('SELECT * FROM categories WHERE id=?', (cid,)).fetchone()
-                if not cat or (cat['game_id'] and str(cat['game_id']) != str(server['place_id'])):
-                    raise ValueError('Категория не найдена или относится к другой игре')
-                con.execute('UPDATE categories SET game_id=? WHERE id=? AND game_id IS NULL', (server['place_id'], cid))
-            changed = con.execute('UPDATE servers SET category_id=? WHERE server_id=?', (cid, sid))
-        elif action == 'delete_category':
-            cid = int(raw)
-            if con.execute('SELECT 1 FROM servers WHERE category_id=? AND enabled=1', (cid,)).fetchone() or con.execute('SELECT 1 FROM lots WHERE category_id=?', (cid,)).fetchone():
-                raise ValueError('Сначала перенесите серверы и измените привязки лотов')
-            con.execute('UPDATE servers SET category_id=NULL WHERE category_id=? AND enabled=0', (cid,))
-            changed = con.execute('DELETE FROM categories WHERE id=?', (cid,))
-        elif action == 'bind_lot':
-            lid, kind = int(parts[0]), parts[1]
-            lot = con.execute('SELECT * FROM lots WHERE lot_id=?', (lid,)).fetchone()
-            if not lot:
-                raise ValueError('Лот не найден')
-            category, server = None, None
-            if kind == 'category' and len(parts) == 3:
-                category = int(parts[2])
-                if not con.execute('SELECT 1 FROM categories WHERE id=? AND game_id IS NOT NULL', (category,)).fetchone():
-                    raise ValueError('Категория не найдена или её игра ещё не указана')
-            elif kind == 'server' and len(parts) == 3:
-                server = parts[2]
-                if not con.execute('SELECT 1 FROM servers WHERE server_id=? AND enabled=1 AND verified=1', (server,)).fetchone():
-                    raise ValueError('Сервер не найден или его владелец ещё не проверен')
-            elif kind != 'random' or len(parts) != 2:
-                raise ValueError('Неверный источник')
-            changed = con.execute('UPDATE lots SET bind_type=?,category_id=?,server_id=?,paused=0 WHERE lot_id=?', (kind, category, server, lid))
-        elif action in ('price_normal','price_event','lot_hours','friend_limit'):
-            lid = int(parts[0])
-            column = 'hours' if action == 'lot_hours' else action
-            value = (-1 if parts[1] == '-' else int(parts[1])) if action == 'friend_limit' else positive_float(parts[1], 'Значение')
-            if action == 'friend_limit' and value < -1:
-                raise ValueError('Лимит должен быть -1, 0 или положительным целым')
-            changed = con.execute(f'UPDATE lots SET {column}=? WHERE lot_id=?', (value, lid))
-        elif action in ('bonus','edit_bonus'):
-            values = raw if action == 'bonus' else parts[1]
-            buy, get = [positive_float(x, 'Бонус') for x in values.split(':')]
-            if action == 'bonus':
-                changed = con.execute('INSERT INTO wholesale_bonuses(buy_hours,get_hours) VALUES(?,?)', (buy, get))
+            reason = rental["end_reason"] or reason or "expired"
+        server_id = rental["server_id"]
+        try:
+            account, api, data = owner_of(server_id, rental["account_id"])
+            place = RobloxAPI.place_of(data) or rental["place_id"] or server_place_fallback(server_id)
+            api.shutdown_instances(server_id, place)
+            if data.get("active") is not False and not api.set_active(server_id, False):
+                raise RobloxError("Roblox не подтвердил выключение сервера")
+        except Exception as exc:
+            attempts = int(rental["attempts"] or 0) + 1
+            delay = min(900, 30 * 2 ** min(attempts - 1, 5))
+            S.ex("UPDATE rentals SET attempts=?,next_attempt=?,last_error=? WHERE rental_id=?",
+                 (attempts, now() + delay, str(exc)[:500], rental_id))
+            if attempts == 1:
+                notify_admins(f"⚠️ <b>Не удалось выключить сервер</b> <code>{esc(server_id)}</code> "
+                              f"(заказ #{esc(rental['order_id'])}).\nПричина: {esc(exc)}\n"
+                              "Сервер не выдаётся, бот повторит попытку автоматически.")
+            return False, str(exc)
+        try:
+            api.new_link(server_id, place)  # старая ссылка перестаёт работать
+        except Exception:
+            LOG.debug("AutoVIP: сброс ссылки после аренды", exc_info=True)
+        remove_rental_friends(rental, api)
+        final = "cancelled" if reason == "cancelled" else "completed"
+        S.ex("""UPDATE rentals SET status=?,end_reason=?,finished_at=?,last_error=NULL,link=NULL,
+                end_time=MIN(end_time,?) WHERE rental_id=?""", (final, reason, now(), now(), rental_id))
+    values = dict(order_id=rental["order_id"], hours=fmt_num(rental["hours"]), buyer_id=rental["buyer_id"],
+                  server_id=server_id, chat_id=rental["chat_id"])
+    if reason == "expired":
+        send_fp(rental["chat_id"], render("post_expire", **values), rental["buyer_name"])
+        notify_admins(f"🏁 <b>Аренда завершена</b>\nЗаказ #{esc(rental['order_id'])}, сервер <code>{esc(server_id)}</code>.\n"
+                      "Сервер выключен, ссылка обновлена.")
+    elif reason in ("manual", "cancelled"):
+        send_fp(rental["chat_id"], f"⛔ Аренда по заказу #{rental['order_id']} досрочно завершена администратором. "
+                                   "Сервер отключён, ссылка больше не работает.", rental["buyer_name"])
+    for lot in S.q("SELECT * FROM friend_lots WHERE rental_id=? AND state='active'", (rental_id,)):
+        remove_friend_lot(lot)
+    request_lot_sync()
+    return True, ""
+
+
+def remove_rental_friends(rental: sqlite3.Row, api: RobloxAPI) -> None:
+    friends = S.q("SELECT * FROM rental_friends WHERE rental_id=? AND state='added'", (rental["rental_id"],))
+    if not friends:
+        return
+    if not S.flag("friends_auto_remove"):
+        S.ex("UPDATE rental_friends SET state='kept' WHERE rental_id=? AND state='added'", (rental["rental_id"],))
+        return
+    for friend in friends:
+        if friend["on_server"]:
+            try:
+                api.set_permission(rental["server_id"], friend["roblox_id"], False)
+            except Exception:
+                LOG.debug("AutoVIP: удаление доступа %s", friend["roblox_id"], exc_info=True)
+        S.ex("UPDATE rental_friends SET state='removed' WHERE rental_id=? AND roblox_id=?",
+             (rental["rental_id"], friend["roblox_id"]))
+    for friend in friends:
+        if not friend["unfriend"]:
+            continue
+        still_needed = S.q1(f"""SELECT 1 FROM rental_friends f JOIN rentals r ON r.rental_id=f.rental_id
+            WHERE f.roblox_id=? AND f.account_id IS ? AND f.state='added' AND r.status IN {LIVE} AND f.rental_id!=?""",
+                            (friend["roblox_id"], friend["account_id"], rental["rental_id"]))
+        if still_needed:
+            continue
+        try:
+            api.unfriend(friend["roblox_id"])
+        except Exception:
+            LOG.debug("AutoVIP: удаление из друзей %s", friend["roblox_id"], exc_info=True)
+
+
+def extend_rental(rental_id: str, hours: float) -> sqlite3.Row:
+    with rental_lock(rental_id):
+        rental = get_active(rental_id)
+        if not rental:
+            raise ValueError("Аренда уже не активна")
+        new_end = float(rental["end_time"]) + hours * 3600
+        S.ex("UPDATE rentals SET end_time=?,hours=hours+?,warned=CASE WHEN ?-?>? THEN 0 ELSE warned END WHERE rental_id=?",
+             (new_end, hours, new_end, now(), WARN_BEFORE, rental_id))
+    send_fp(rental["chat_id"], f"🔄 Аренда продлена! К заказу #{rental['order_id']} добавлено {fmt_num(hours)} ч.\n"
+                               f"⏰ Теперь осталось: {fmt_left(new_end - now())}.", rental["buyer_name"])
+    return rental
+
+
+# ---------------------------------------------------------------------------
+# Друзья
+# ---------------------------------------------------------------------------
+def rental_api(rental: sqlite3.Row) -> Tuple[sqlite3.Row, RobloxAPI]:
+    account = S.q1("SELECT * FROM accounts WHERE id=?", (rental["account_id"],)) if rental["account_id"] else None
+    if account:
+        return account, api_for(account)
+    account, api, _ = owner_of(rental["server_id"])
+    S.ex("UPDATE rentals SET account_id=? WHERE rental_id=?", (account["id"], rental["rental_id"]))
+    return account, api
+
+
+def cmd_friends(rental: sqlite3.Row, raw: str, paid_context: bool = False) -> str:
+    """Возвращает итог: added | exists | not_found | limit | paid | error."""
+    chat, name = rental["chat_id"], rental["buyer_name"]
+    with rental_lock(rental["rental_id"]):
+        rental = get_active(rental["rental_id"])
+        if not rental:
+            send_fp(chat, "❌ Эта аренда уже закончилась.", name)
+            return "error"
+        limit = friend_limit_for(rental)
+        used = friends_used(rental["rental_id"])
+        allowed = limit + int(rental["paid_slots"] or 0)
+        if limit and used >= allowed:
+            if S.flag("paid_active"):
+                return start_paid_flow(rental, raw)
+            send_fp(chat, render("friend_limit", limit=limit, order_id=rental["order_id"]), name)
+            return "limit"
+        profile, _ = owner_profile(rental)
+        try:
+            account, api = rental_api(rental)
+            profile = f"https://www.roblox.com/users/{account['roblox_id']}/profile"
+            target = api.resolve_user(raw)
+            if not target:
+                if not paid_context:
+                    send_fp(chat, render("friend_not_found", input=raw, owner_profile_link=profile), name)
+                return "not_found"
+            user_id, user_name = target
+            if user_id == str(account["roblox_id"]):
+                send_fp(chat, "ℹ️ Это аккаунт владельца сервера — укажите свой ник Roblox.", name)
+                return "error"
+            if S.q1("SELECT 1 FROM rental_friends WHERE rental_id=? AND roblox_id=? AND state='added'",
+                    (rental["rental_id"], user_id)):
+                send_fp(chat, f"ℹ️ {user_name} уже добавлен(а) в друзья и на сервер.", name)
+                return "exists"
+            status = api.friend_status(str(account["roblox_id"]), user_id)
+            if status == "RequestReceived":
+                api.accept_friend(user_id)
+                if api.friend_status(str(account["roblox_id"]), user_id) != "Friends":
+                    raise RobloxError("Roblox не подтвердил принятие заявки")
+                unfriend = 1
+            elif status == "Friends":
+                unfriend = 1 if S.q1(f"""SELECT 1 FROM rental_friends f JOIN rentals r ON r.rental_id=f.rental_id
+                    WHERE f.roblox_id=? AND f.account_id=? AND f.unfriend=1 AND f.state='added' AND r.status IN {LIVE}""",
+                                     (user_id, account["id"])) else 0
             else:
-                changed = con.execute('UPDATE wholesale_bonuses SET buy_hours=?,get_hours=? WHERE id=?', (buy, get, int(parts[0])))
-        elif action == 'delete_bonus':
-            changed = con.execute('DELETE FROM wholesale_bonuses WHERE id=?', (int(raw),))
+                if not paid_context:
+                    send_fp(chat, render("friend_not_found", input=raw, owner_profile_link=profile), name)
+                return "not_found"
+            on_server = 0
+            try:
+                on_server = int(api.set_permission(rental["server_id"], user_id, True))
+            except Exception:
+                LOG.info("AutoVIP: Roblox не добавил %s в доступ сервера (приватность?)", user_id, exc_info=True)
+            S.ex("""INSERT INTO rental_friends(rental_id,roblox_id,name,account_id,on_server,unfriend,state,added_at)
+                    VALUES(?,?,?,?,?,?,'added',?) ON CONFLICT(rental_id,roblox_id) DO UPDATE SET
+                    name=excluded.name,account_id=excluded.account_id,on_server=excluded.on_server,
+                    unfriend=MAX(rental_friends.unfriend,excluded.unfriend),state='added'""",
+                 (rental["rental_id"], user_id, user_name, account["id"], on_server, unfriend, now()))
+        except RobloxError as exc:
+            LOG.warning("AutoVIP: !друзья: %s", exc)
+            send_fp(chat, "❌ Roblox сейчас не отвечает. Повторите команду через пару минут.", name)
+            return "error"
+    send_fp(chat, render("friend_added", friend_name=user_name, order_id=rental["order_id"]), name)
+    if limit and S.flag("paid_active") and used + 1 == limit and not rental["paid_slots"]:
+        send_fp(chat, render("paid_limit_reached", limit=limit, price=fmt_num(S.get("paid_price")),
+                             order_id=rental["order_id"]), name)
+    return "added"
+
+
+def start_paid_flow(rental: sqlite3.Row, raw: str) -> str:
+    chat, name = rental["chat_id"], rental["buyer_name"]
+    price = parse_number(S.get("paid_price") or 50)
+    existing = S.q1("SELECT * FROM friend_lots WHERE buyer_id=? AND state='active' ORDER BY created_at DESC LIMIT 1",
+                    (rental["buyer_id"],))
+    if existing:
+        send_fp(chat, render("paid_lot_exists", link=f"https://funpay.com/lots/offer?id={existing['offer_id']}",
+                             minutes=max(1, math.ceil((existing["expires_at"] - now()) / 60)),
+                             price=fmt_num(existing["price"]), friend_name=existing["friend_name"] or ""), name)
+        return "paid"
+    if not account_ready():
+        send_fp(chat, "⏳ Бот ещё подключается к FunPay. Повторите команду через пару минут.", name)
+        return "error"
+    try:
+        account, api = rental_api(rental)
+        profile = f"https://www.roblox.com/users/{account['roblox_id']}/profile"
+        target = api.resolve_user(raw)
+    except RobloxError:
+        send_fp(chat, "❌ Roblox сейчас не отвечает. Повторите команду через пару минут.", name)
+        return "error"
+    if not target:
+        send_fp(chat, render("friend_not_found", input=raw, owner_profile_link=profile), name)
+        return "not_found"
+    user_id, user_name = target
+    if S.q1("SELECT 1 FROM rental_friends WHERE rental_id=? AND roblox_id=? AND state='added'",
+            (rental["rental_id"], user_id)):
+        send_fp(chat, f"ℹ️ {user_name} уже добавлен(а) в друзья и на сервер.", name)
+        return "exists"
+    tag = "#FR" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    while S.q1("SELECT 1 FROM friend_lots WHERE tag=?", (tag,)):
+        tag = "#FR" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+    minutes = max(1, min(1440, int(parse_number(S.get("paid_lifetime") or 10))))
+    try:
+        with FP_LOCK:
+            offer_id = create_friend_offer(tag, price)
+    except Exception as exc:
+        LOG.warning("AutoVIP: лот доплаты не создан: %s", exc)
+        send_fp(chat, "❌ Не удалось создать лот для доплаты. Попробуйте позже или напишите продавцу.", name)
+        notify_admins(f"⚠️ <b>Не удалось создать лот доплаты за друзей</b>\nАренда #{esc(rental['order_id'])}, "
+                      f"игрок {esc(user_name)}.\nПричина: {esc(exc)}")
+        return "error"
+    created = now()
+    S.ex("""INSERT INTO friend_lots(tag,offer_id,rental_id,buyer_id,chat_id,friend_input,friend_name,price,created_at,
+            expires_at,state) VALUES(?,?,?,?,?,?,?,?,?,?,'active')""",
+         (tag, offer_id, rental["rental_id"], rental["buyer_id"], chat, raw, user_name, price, created,
+          created + minutes * 60))
+    link = f"https://funpay.com/lots/offer?id={offer_id}"
+    send_fp(chat, render("paid_lot_created", link=link, price=fmt_num(price), minutes=minutes, friend_name=user_name,
+                         limit=friend_limit_for(rental), order_id=rental["order_id"]), name)
+    notify_admins(f"🧾 <b>Создан лот доплаты за друзей</b>\nАренда #{esc(rental['order_id'])}, друг {esc(user_name)}, "
+                  f"цена {fmt_num(price)} {currency_symbol()}\n{esc(link)}")
+    return "paid"
+
+
+def remove_friend_lot(lot: sqlite3.Row, final_state: str = "deleted") -> bool:
+    """Удаляет временный лот доплаты с FunPay. При ошибке повторяет попытку через минуту (до 5 раз)."""
+    try:
+        if lot["offer_id"]:
+            with FP_LOCK:
+                delete_offer(lot["offer_id"])
+        S.ex("UPDATE friend_lots SET state=? WHERE tag=?", (final_state, lot["tag"]))
+        return True
+    except Exception as exc:
+        attempts = int(lot["attempts"] or 0) + 1
+        if attempts >= 5:
+            S.ex("UPDATE friend_lots SET attempts=?,state=? WHERE tag=?", (attempts, final_state, lot["tag"]))
+            notify_admins(f"⚠️ Не удалось удалить лот доплаты {esc(lot['tag'])} (ID {esc(lot['offer_id'])}): {esc(exc)}. "
+                          "Удалите его на FunPay вручную.")
         else:
-            key, value = action, raw
-            if action == 'review_bonus':
-                key, value = 'review_bonus_hours', positive_float(raw, 'Бонус')
-            elif action == 'global_friend_limit':
-                key, value = 'friends_default_limit', 0 if raw == '-' else int(raw)
-                if value < 0:
-                    raise ValueError('Лимит не может быть отрицательным')
-            elif action == 'template':
-                key = extra[0]
-                if key not in DEFAULTS or not key.startswith('msg_') or len(raw) > 2500:
-                    raise ValueError('Шаблон не найден или длиннее 2500 символов')
-                if key == 'msg_post_payment' and '{link}' not in raw:
-                    raise ValueError('Шаблон выдачи должен содержать {link}')
-            elif action == 'proxy':
-                key, value = 'global_proxy', '' if raw == '-' else raw
-                normalize_proxy(value)
-                con.execute('UPDATE accounts SET proxy=? WHERE id>0', (value,))
+            S.ex("UPDATE friend_lots SET attempts=?,state=?,expires_at=? WHERE tag=?",
+                 (attempts, "deleting" if final_state == "paid" else "active", now() + 60, lot["tag"]))
+        return False
+
+
+def handle_friend_payment(order: Any, order_id: str, tag: str) -> str:
+    chat_id, buyer_id, buyer_name = order_chat(order, order_id)
+    lot = S.q1("SELECT * FROM friend_lots WHERE tag=?", (tag,))
+    try:
+        amount = max(1, int(getattr(order, "amount", 1) or 1))
+    except (TypeError, ValueError):
+        amount = 1
+    try:
+        price = float(getattr(order, "price", 0) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    if not lot:
+        notify_admins(f"⚠️ <b>Оплачен лот доплаты, но запись о нём не найдена</b>\nЗаказ #{esc(order_id)}, тег {esc(tag)}. "
+                      "Обработайте заказ вручную.")
+        return "friend_unknown"
+    if lot["state"] in ("active", "deleting"):
+        remove_friend_lot(lot, "paid")
+    else:
+        S.ex("UPDATE friend_lots SET state='paid' WHERE tag=?", (tag,))
+    rental = get_active(lot["rental_id"])
+    problem = None
+    if str(buyer_id) != str(lot["buyer_id"]):
+        problem = ("лот купил другой покупатель", "❌ Этот лот был создан для другого покупателя, поэтому добавление не начислено.")
+    elif not rental:
+        problem = ("аренда уже не активна", "❌ Аренда, для которой создан лот, уже закончилась, поэтому добавление не начислено.")
+    if problem:
+        refunded = refund(order_id)
+        send_fp(chat_id, problem[1] + ("\n💸 Деньги возвращены автоматически." if refunded else "\nПродавец уведомлён."),
+                buyer_name)
+        S.ex("INSERT OR REPLACE INTO friend_payments VALUES(?,?,?,?,?,?,?)",
+             (order_id, tag, lot["rental_id"], amount, price, "refunded" if refunded else "rejected", now()))
+        notify_admins(f"⚠️ <b>Оплата лота доплаты за друзей не применена</b>\nЗаказ #{esc(order_id)}: {problem[0]}. "
+                      + ("Автовозврат выполнен." if refunded else "<b>Автовозврат не удался — верните деньги вручную.</b>"))
+        return "friend_rejected"
+    with rental_lock(rental["rental_id"]):
+        S.ex("UPDATE rentals SET paid_slots=paid_slots+? WHERE rental_id=?", (amount, rental["rental_id"]))
+        S.ex("INSERT OR REPLACE INTO friend_payments VALUES(?,?,?,?,?,?,?)",
+             (order_id, tag, rental["rental_id"], amount, price, "applied", now()))
+    send_fp(rental["chat_id"], render("paid_received", amount=amount, order_id=rental["order_id"]), rental["buyer_name"])
+    notify_admins(f"💳 <b>Оплачено добавление в друзья</b>\nАренда #{esc(rental['order_id'])}, количество {amount}, "
+                  f"сумма {fmt_num(price)} {currency_symbol()}, заказ FunPay #{esc(order_id)}.")
+    result = cmd_friends(rental, lot["friend_input"] or "", paid_context=True)
+    if result == "not_found":
+        profile, _ = owner_profile(rental)
+        send_fp(rental["chat_id"], f"ℹ️ Оплаченное добавление сохранено. Заявка от {lot['friend_name'] or lot['friend_input']} "
+                                   f"пока не найдена: отправьте заявку в друзья владельцу ({profile}) и повторите "
+                                   f"!друзья {lot['friend_input']}", rental["buyer_name"])
+    fresh = S.q1("SELECT * FROM rentals WHERE rental_id=?", (rental["rental_id"],))
+    left = friend_limit_for(fresh) + int(fresh["paid_slots"] or 0) - friends_used(fresh["rental_id"])
+    send_fp(rental["chat_id"], f"ℹ️ Для этого сервера осталось добавлений: {max(0, left)}. "
+                               "Остальных друзей добавляйте командой !друзья ник.", rental["buyer_name"])
+    return "friend_payment"
+
+
+# ---------------------------------------------------------------------------
+# Отзывы, ссылка
+# ---------------------------------------------------------------------------
+def cmd_review(order_id: str, chat_id: str, chat_name: Optional[str]) -> None:
+    if S.q1("SELECT 1 FROM reviews WHERE order_id=?", (order_id,)):
+        send_fp(chat_id, f"ℹ️ Бонус за заказ #{order_id} уже получен.", chat_name)
+        return
+    try:
+        order = CARDINAL.account.get_order(order_id)
+    except Exception:
+        send_fp(chat_id, "❌ Ошибка проверки отзыва. Попробуйте позже.", chat_name)
+        return
+    review = getattr(order, "review", None)
+    has_review = review is not None and bool(getattr(review, "stars", None) or str(getattr(review, "text", "") or "").strip())
+    if not has_review:
+        send_fp(chat_id, "❌ Отзыв не найден. Оставьте отзыв и напишите !отзыв снова.", chat_name)
+        return
+    try:
+        bonus = parse_number(S.get("review_bonus_hours"))
+    except ValueError:
+        bonus = 1.0
+    new_time = ""
+    with S.tx():
+        if S.q1("SELECT 1 FROM reviews WHERE order_id=?", (order_id,)):
+            return
+        S.ex("INSERT INTO reviews VALUES(?,?)", (order_id, now()))
+    rental = S.q1("SELECT * FROM rentals WHERE order_id=? AND status='active' AND end_time>?", (order_id, now()))
+    if rental and bonus > 0:
+        with rental_lock(rental["rental_id"]):
+            new_end = float(rental["end_time"]) + bonus * 3600
+            S.ex("UPDATE rentals SET end_time=?,hours=hours+?,warned=CASE WHEN ?-?>? THEN 0 ELSE warned END WHERE rental_id=?",
+                 (new_end, bonus, new_end, now(), WARN_BEFORE, rental["rental_id"]))
+            new_time = fmt_dt(new_end)
+    send_fp(chat_id, render("review_bonus", bonus_hours=fmt_num(bonus), order_id=order_id, new_time=new_time), chat_name)
+
+
+def cmd_link(rental: sqlite3.Row) -> None:
+    with rental_lock(rental["rental_id"]):
+        rental = get_active(rental["rental_id"])
+        if not rental:
+            return
+        try:
+            _, api = rental_api(rental)
+            link = api.new_link(rental["server_id"], rental["place_id"] or server_place_fallback(rental["server_id"]))
+        except Exception as exc:
+            LOG.warning("AutoVIP: !ссылка: %s", exc)
+            send_fp(rental["chat_id"], "❌ Не удалось создать новую ссылку. Попробуйте позже или напишите продавцу.",
+                    rental["buyer_name"])
+            return
+        S.ex("UPDATE rentals SET link=? WHERE rental_id=?", (link, rental["rental_id"]))
+    send_fp(rental["chat_id"], f"🔗 Новая ссылка на сервер (заказ #{rental['order_id']}):\n{link}\n"
+                               "Старая ссылка больше не работает, время аренды не изменилось.", rental["buyer_name"])
+
+
+# ---------------------------------------------------------------------------
+# Команды покупателя в чате FunPay
+# ---------------------------------------------------------------------------
+COMMANDS = {"!команды": "help", "!help": "help", "!время": "time", "!ссылка": "link", "!друзья": "friends",
+            "!бронь": "stock", "!отзыв": "review"}
+HELP_TEXT = ("📋 Команды:\n"
+             "!время — сколько осталось до конца аренды\n"
+             "!ссылка — новая ссылка на сервер\n"
+             "!друзья ник — принять заявку в друзья и добавить на сервер\n"
+             "!бронь — сколько свободных серверов сейчас\n"
+             "!отзыв — бонусное время за отзыв\n"
+             "!команды — этот список")
+
+
+def parse_command(text: str) -> Optional[Tuple[str, str]]:
+    text = str(text or "").strip()
+    if not text.startswith("!"):
+        return None
+    parts = text.split(maxsplit=1)
+    action = COMMANDS.get(parts[0].lower())
+    return (action, parts[1].strip() if len(parts) > 1 else "") if action else None
+
+
+def selection_list(rentals: List[sqlite3.Row]) -> str:
+    lines = []
+    for index, rental in enumerate(rentals, 1):
+        lines.append(f"{index}) {rental_title(rental)} · заказ #{rental['order_id']} · ⏰ осталось "
+                     f"{fmt_left(rental['end_time'] - now())}")
+    return "\n".join(lines)
+
+
+def handle_chat_message(chat_id: Any, author_id: Any, author_name: Optional[str], text: str,
+                        message_id: Any = None) -> None:
+    chat_id, author_id = str(chat_id), str(author_id)
+    if message_id:
+        key = f"{chat_id}:{message_id}"
+        with GUARD:
+            for old in [k for k, at in HANDLED.items() if now() - at > 900]:
+                HANDLED.pop(old, None)
+            if key in HANDLED:
+                return
+            HANDLED[key] = now()
+    if blacklisted(author_name):
+        return
+    with named_lock("buyer:" + author_id):
+        _handle_chat(chat_id, author_id, author_name, str(text or ""))
+
+
+def _handle_chat(chat_id: str, buyer_id: str, buyer_name: Optional[str], text: str) -> None:
+    key = (chat_id, buyer_id)
+    command = parse_command(text)
+    selection = SELECTIONS.get(key)
+    if selection and selection["expires"] < now():
+        SELECTIONS.pop(key, None)
+        selection = None
+    if command is None:
+        if not selection:
+            return
+        answer = text.strip().lower()
+        if answer in CANCEL_WORDS:
+            SELECTIONS.pop(key, None)
+            send_fp(chat_id, "✅ Выбор отменён.", buyer_name)
+            return
+        if not re.fullmatch(r"\d{1,3}", answer):
+            return  # обычная переписка не перехватывается
+        number, rentals = int(answer), selection["rentals"]
+        if not 1 <= number <= len(rentals):
+            send_fp(chat_id, f"❌ Введите номер от 1 до {len(rentals)}.", buyer_name)
+            return
+        SELECTIONS.pop(key, None)
+        rental = get_active(rentals[number - 1])
+        if not rental:
+            send_fp(chat_id, "❌ Эта аренда уже закончилась. Повторите команду.", buyer_name)
+            return
+        run_rental_action(selection["action"], rental, selection["arg"])
+        return
+    SELECTIONS.pop(key, None)  # новая команда отменяет незавершённый выбор
+    action, arg = command
+    if action == "help":
+        send_fp(chat_id, HELP_TEXT, buyer_name)
+        return
+    if action == "stock":
+        send_fp(chat_id, f"🟢 Свободных общих серверов сейчас: {free_general_count()}.", buyer_name)
+        return
+    rentals = active_rentals(buyer_id)
+    if action == "time":
+        if not rentals:
+            send_fp(chat_id, "❌ Нет активной аренды.", buyer_name)
+        elif len(rentals) == 1:
+            send_fp(chat_id, f"⏰ До конца аренды осталось: {fmt_left(rentals[0]['end_time'] - now())}\n"
+                             f"📦 Заказ #{rentals[0]['order_id']}", buyer_name)
+        else:
+            send_fp(chat_id, "⏰ Ваши активные аренды:\n" + selection_list(rentals), buyer_name)
+        return
+    if action == "friends":
+        if not S.flag("friends_module_active"):
+            return
+        if not arg:
+            send_fp(chat_id, "ℹ️ Укажите ник Roblox: !друзья ВашНик\nВместо ника можно указать ID или ссылку на профиль. "
+                             "Сначала отправьте заявку в друзья владельцу сервера.", buyer_name)
+            return
+    if action == "review":
+        if not S.flag("review_bonus_active"):
+            send_fp(chat_id, "Бонусы отключены.", buyer_name)
+            return
+        if not rentals:
+            last = S.q1("SELECT order_id FROM rentals WHERE buyer_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1", (buyer_id,))
+            if not last:
+                send_fp(chat_id, "❌ Не найдено заказов для проверки отзыва.", buyer_name)
             else:
-                raise ValueError('Неизвестное действие')
-            changed = con.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
-        if changed.rowcount != 1:
-            raise ValueError('Объект не найден или его состояние не позволяет изменение')
-    return '✅ Изменения сохранены.'
+                cmd_review(last["order_id"], chat_id, buyer_name)
+            return
+    if not rentals:
+        send_fp(chat_id, "❌ Нет активной аренды.", buyer_name)
+        return
+    if len(rentals) == 1:
+        run_rental_action(action, rentals[0], arg)
+        return
+    SELECTIONS[key] = {"action": action, "arg": arg, "rentals": [r["rental_id"] for r in rentals],
+                       "expires": now() + SELECTION_TTL}
+    names = {"link": "!ссылка", "friends": "!друзья", "review": "!отзыв"}
+    send_fp(chat_id, f"🖥 У вас несколько активных серверов. К какому применить {names[action]}?\n"
+                     + selection_list(rentals) + f"\n\nОтветьте номером (1–{len(rentals)}) или напишите «отмена».",
+            buyer_name)
 
 
-"""v11-style cards and sequential setup over the validated v16 operations."""
+def run_rental_action(action: str, rental: sqlite3.Row, arg: str) -> None:
+    if action == "link":
+        cmd_link(rental)
+    elif action == "friends":
+        cmd_friends(rental, arg)
+    elif action == "review":
+        cmd_review(rental["order_id"], rental["chat_id"], rental["buyer_name"])
 
 
-CLASSIC_FIELDS = {
-    'add_account': [('cookie', 'Отправьте cookie .ROBLOSECURITY аккаунта Roblox.\nБот проверит его и покажет ник владельца.')],
-    'update_account': [('cookie', 'Отправьте новый cookie этого же аккаунта Roblox.')],
-    'add_server': [('ids', 'Отправьте ID VIP-сервера со страницы Configure.\nМожно несколько ID через пробел (до 20). Владельца и игру бот определит сам.')],
-    'add_server_cat': [('ids', 'Отправьте ID серверов для этой категории — через пробел или с новой строки (до 20).')],
-    'add_category': [('name', 'Как назвать категорию? Например: Steal a Brainrot.\nИгра определится по первому добавленному серверу.')],
-    'rename_category': [('name', 'Отправьте новое название категории.')],
-    'category_game': [('id', 'Отправьте Place ID игры: цифры после /games/ в адресе Roblox.')],
-    'add_lot': [('lot', 'Отправьте только ID вашего предложения FunPay.\nНазвание бот получит из предложения.'),
-                ('hours', 'Сколько часов выдавать за 1 штуку?\nНапример: 1, 24 или 1.5.')],
-    'lot_hours': [('hours', 'Сколько часов выдавать за 1 штуку? Новое время применяется к будущим покупкам.')],
-    'price_normal': [('hours', 'Отправьте обычную цену за 1 штуку в валюте предложения.')],
-    'price_event': [('hours', 'Отправьте евент-цену за 1 штуку в валюте предложения.')],
-    'friend_limit': [('limit', 'Сколько пользователей можно добавить за аренду?\n0 — без лимита плагина. Минус (-) — общий лимит.')],
-    'bonus': [('hours', 'Сколько оплаченных часов нужно для бонуса? Например: 5.'),
-              ('hours', 'Сколько часов подарить за каждый такой набор? Например: 1.')],
-    'edit_bonus': [('hours', 'Новый порог покупки в часах?'), ('hours', 'Сколько бонусных часов добавить?')],
-    'bind_order': [('order', 'Отправьте номер заказа FunPay. Сначала проверьте на FunPay, какое предложение куплено.'),
-                   ('configured_lot', 'Отправьте ID купленного предложения. Лот должен быть настроен в плагине.'),
-                   ('quantity', 'Сколько штук куплено в этом заказе? Укажите количество из заказа, а не число часов. После ответа заказ попадёт в очередь выдачи.')],
-}
+def chat_relevant(chat_id: Any, author_id: Any, text: str) -> bool:
+    if parse_command(text) is not None:
+        return True
+    return (str(chat_id), str(author_id)) in SELECTIONS
 
 
-def classic_nav(kb, page, pages, route):
-    buttons = []
-    if page:
-        buttons.append(panel_button('⬅️ Назад', f'{route}:{page-1}'))
-    if page+1 < pages:
-        buttons.append(panel_button('Вперёд ➡️', f'{route}:{page+1}'))
-    if buttons:
-        kb.row(*buttons)
+def own_id() -> str:
+    return str(getattr(getattr(CARDINAL, "account", None), "id", "") or "")
 
 
-def classic_page(total, page, size=8):
-    pages = max(1, (total+size-1)//size)
-    return min(max(0, int(page)), pages-1), pages
+def on_new_message(cardinal: Any, event: Any) -> None:
+    if getattr(cardinal, "old_mode_enabled", False):
+        return
+    message = getattr(event, "message", None)
+    if message is None or getattr(message, "by_bot", False):
+        return
+    author_id = getattr(message, "author_id", None)
+    text = getattr(message, "text", None) or ""
+    if not author_id or str(author_id) in ("0", own_id()):
+        return
+    if not chat_relevant(message.chat_id, author_id, text):
+        return
+    EXECUTOR.submit(_safe, handle_chat_message, message.chat_id, author_id,
+                    getattr(message, "author", None) or getattr(message, "chat_name", None), text,
+                    getattr(message, "id", None))
 
 
-def classic_button(text, action):
-    return panel_button(text[:48], action)
+def on_last_chat_message_changed(cardinal: Any, event: Any) -> None:
+    """Старый режим получения сообщений Cardinal: читаем историю, чтобы узнать автора."""
+    if not getattr(cardinal, "old_mode_enabled", False):
+        return
+    chat = getattr(event, "chat", None)
+    text = str(getattr(chat, "last_message_text", "") or "")
+    if chat is None or getattr(chat, "last_by_bot", False):
+        return
+    if parse_command(text) is None and not any(k[0] == str(chat.id) for k in SELECTIONS):
+        return
+    EXECUTOR.submit(_safe, _legacy_message, chat.id, getattr(chat, "name", None), text)
 
 
-def classic_account(bot, chat, mid, identity):
-    row = database().row('SELECT * FROM accounts WHERE id=? AND enabled=1', (identity,))
-    if not row:
-        raise ValueError('Аккаунт уже удалён. Обновите список.')
-    count = database().row('SELECT COUNT(*) n FROM servers WHERE owner_account_id=? AND enabled=1', (identity,))['n']
-    text = (f'👤 <b>{esc(row["username"])}</b>\n\nRoblox ID: <code>{esc(row["roblox_id"])}</code>\n'
-            f'Серверов: {count}\n\nCookie сохранён. Чтобы обновить сессию, нажмите кнопку ниже.')
-    kb = Keyboard().row(panel_button('🔄 Обновить cookie', f'c_wizard:update_account:{identity}'))
-    kb.row(panel_button('🗑 Удалить аккаунт', f'c_confirm:account:{identity}'))
-    kb.row(panel_button('⬅️ Аккаунты', 'accounts'))
-    edit_or_send(bot, chat, text, kb, mid)
+def _legacy_message(chat_id: Any, chat_name: Optional[str], text: str) -> None:
+    history = CARDINAL.account.get_chat_history(chat_id, interlocutor_username=chat_name)
+    me = own_id()
+    for message in reversed(list(history or [])):
+        author = getattr(message, "author_id", None)
+        if not author or str(author) in ("0", me) or getattr(message, "by_bot", False):
+            continue
+        if str(getattr(message, "text", "") or "").strip() == text.strip():
+            handle_chat_message(chat_id, author, getattr(message, "author", None) or chat_name,
+                                message.text, getattr(message, "id", None))
+        return
 
 
-def classic_server(bot, chat, mid, identity):
-    row = database().row('''SELECT s.*,a.username,c.name category_name FROM servers s
-        LEFT JOIN accounts a ON a.id=s.owner_account_id LEFT JOIN categories c ON c.id=s.category_id
-        WHERE s.server_id=? AND s.enabled=1''', (identity,))
-    if not row:
-        raise ValueError('Сервер не найден. Обновите список.')
-    state = {'free':'🟢 Свободен','occupied':'🔴 Занят','reserved':'⏳ Выдаётся','cleaning':'🧹 Очистка','error':'⚠️ Требует проверки'}.get(row['status'], row['status'])
-    text = (f'🖥 <b>VIP-сервер {esc(identity)}</b>\n\nВладелец: {esc(row["username"] or "не проверен")}\n'
-            f'Игра (Place ID): {esc(row["place_id"] or "не определена")}\n'
-            f'Категория: {esc(row["category_name"] or "Общий пул")}\nСтатус: {esc(state)}')
-    kb = Keyboard().row(panel_button('📁 Перенести в категорию', f'c_move_pick:{identity}:0'))
-    kb.row(panel_button('🔄 Проверить владельца', f'c_recheck:{identity}'))
-    if row['category_id']:
-        kb.row(panel_button('↩️ В общий пул', f'c_move:{identity}:0'))
-    kb.row(panel_button('🗑 Удалить сервер', f'c_confirm:server:{identity}'))
-    back = f'c_cat:{row["category_id"]}:0' if row['category_id'] else 'servers'
-    kb.row(panel_button('⬅️ Назад', back))
-    edit_or_send(bot, chat, text, kb, mid)
+def _safe(func, *args) -> None:
+    try:
+        func(*args)
+    except Exception:
+        LOG.exception("AutoVIP: ошибка обработки сообщения")
 
 
-def classic_category(bot, chat, mid, identity, page=0):
-    row = database().row('SELECT * FROM categories WHERE id=?', (identity,))
-    if not row:
-        raise ValueError('Категория удалена. Обновите список.')
-    total = database().row('SELECT COUNT(*) n FROM servers WHERE enabled=1 AND category_id=?', (identity,))['n']
-    page, pages = classic_page(total, page)
-    servers = database().rows('SELECT * FROM servers WHERE enabled=1 AND category_id=? ORDER BY server_id LIMIT 8 OFFSET ?', (identity,page*8))
-    text = (f'📁 <b>{esc(row["name"])}</b>\n\n🎮 Place ID: {esc(row["game_id"] or "Определится по первому серверу")}\n'
-            f'🖥 Серверов: {total} · Страница {page+1}/{pages}\n\nВыберите сервер для управления.')
-    kb = Keyboard(row_width=2)
-    buttons = [classic_button(('🟢 ' if s['status']=='free' else '🟠 ') + s['server_id'], 'c_server:' + s['server_id']) for s in servers]
-    for offset in range(0,len(buttons),2):
-        kb.row(*buttons[offset:offset+2])
-    classic_nav(kb, page, pages, f'c_cat:{identity}')
-    kb.row(panel_button('➕ Добавить серверы', f'c_wizard:add_server_cat:{identity}'))
-    kb.row(panel_button('🎮 Привязать игру', f'c_wizard:category_game:{identity}'), panel_button('✏️ Переименовать', f'c_wizard:rename_category:{identity}'))
-    kb.row(panel_button('🗑 Удалить категорию', f'c_confirm:category:{identity}'))
-    kb.row(panel_button('⬅️ Категории', 'cats'))
-    edit_or_send(bot, chat, text, kb, mid)
+# ---------------------------------------------------------------------------
+# Синхронизация лотов и цен
+# ---------------------------------------------------------------------------
+def sync_lots(full: bool = False) -> None:
+    if not S.flag("lot_management") or not account_ready():
+        return
+    with FP_LOCK:
+        for lot in S.q("SELECT * FROM lots ORDER BY lot_id"):
+            if STOP.is_set():
+                return
+            desired = free_server_for(lot)[0] is not None
+            if not full and lot["last_active"] is not None and bool(lot["last_active"]) == desired:
+                continue
+            try:
+                fields = CARDINAL.account.get_lot_fields(int(lot["lot_id"]))
+                if bool(getattr(fields, "active", False)) != desired:
+                    fields.active = desired
+                    renew_and_save(fields)
+                S.ex("UPDATE lots SET last_active=? WHERE lot_id=?", (int(desired), lot["lot_id"]))
+            except Exception:
+                LOG.warning("AutoVIP: не удалось обновить состояние лота %s на FunPay", lot["lot_id"], exc_info=True)
+            time.sleep(0.5)
 
 
-def classic_pick(bot, chat, mid, lot_id, kind, page=0, moving=None):
-    if kind not in ('category','server'):
-        raise ValueError('Неизвестный источник')
-    if moving is None and not database().row('SELECT 1 FROM lots WHERE lot_id=?', (lot_id,)):
-        raise ValueError('Лот уже удалён')
-    table, where, key = ('categories','1=1','id') if kind=='category' else ('servers','enabled=1 AND verified=1','server_id')
-    total = database().row(f'SELECT COUNT(*) n FROM {table} WHERE {where}')['n']
-    page, pages = classic_page(total, page)
-    rows = database().rows(f'SELECT * FROM {table} WHERE {where} ORDER BY {key} LIMIT 8 OFFSET ?', (page*8,))
-    text = ('📁 <b>Выберите категорию</b>' if kind=='category' else '🖥 <b>Выберите сервер</b>') + '\n\n'
-    text += 'Выбор сохраняется для этого лота.' if moving is None else 'Сервер будет перенесён в выбранную категорию.'
-    if not rows:
-        text += '\nПока ничего нет. Сначала добавьте источник через главное меню.'
+def apply_prices() -> None:
+    column = "price_event" if S.flag("event_mode") else "price_normal"
+    failed, done = [], 0
+    with FP_LOCK:
+        for lot in S.q(f"SELECT lot_id,{column} AS price FROM lots ORDER BY lot_id"):
+            if not lot["price"] or lot["price"] <= 0:
+                continue
+            try:
+                fields = CARDINAL.account.get_lot_fields(int(lot["lot_id"]))
+                fields.price = round(float(lot["price"]), 2)
+                renew_and_save(fields)
+                done += 1
+            except Exception:
+                LOG.warning("AutoVIP: цена лота %s не обновлена", lot["lot_id"], exc_info=True)
+                failed.append(str(lot["lot_id"]))
+            time.sleep(0.5)
+    mode = "🎉 Евент" if S.flag("event_mode") else "📋 Обычный"
+    text = f"💰 Режим цен: {mode}. Обновлено лотов: {done}."
+    if failed:
+        text += "\n⚠️ Не удалось обновить: " + ", ".join(failed)
+    notify_admins(text)
+
+
+# ---------------------------------------------------------------------------
+# Фоновый цикл: таймеры аренд, повторы, лоты доплаты, очередь сообщений
+# ---------------------------------------------------------------------------
+def worker_loop() -> None:
+    last_full_sync = 0.0
+    while not STOP.wait(5):
+        if not plugin_enabled() or S is None:
+            continue
+        try:
+            worker_tick()
+            if SYNC_REQUEST.is_set() or now() - last_full_sync >= LOT_SYNC_INTERVAL:
+                full = now() - last_full_sync >= LOT_SYNC_INTERVAL
+                SYNC_REQUEST.clear()
+                if full:
+                    last_full_sync = now()
+                run_once("lots", sync_lots, full)
+        except Exception:
+            LOG.exception("AutoVIP: ошибка фонового цикла")
+
+
+def worker_tick() -> None:
+    t = now()
+    for rental in S.q("SELECT * FROM rentals WHERE status='active' AND warned=0 AND end_time>? AND end_time-?<=?",
+                      (t, t, WARN_BEFORE)):
+        S.ex("UPDATE rentals SET warned=1 WHERE rental_id=?", (rental["rental_id"],))
+        if rental["hours"] * 3600 > WARN_BEFORE:
+            send_fp(rental["chat_id"], f"⏰ До окончания аренды по заказу #{rental['order_id']} осталось 15 минут.",
+                    rental["buyer_name"])
+    for rental in S.q("SELECT rental_id FROM rentals WHERE status='active' AND end_time<=?", (t,)):
+        run_once("rental:" + rental["rental_id"], end_rental, rental["rental_id"], "expired")
+    for rental in S.q("SELECT rental_id FROM rentals WHERE status='ending' AND next_attempt<=?", (t,)):
+        run_once("rental:" + rental["rental_id"], end_rental, rental["rental_id"], None)
+    for lot in S.q("SELECT * FROM friend_lots WHERE state IN ('active','deleting') AND expires_at<=?", (t,)):
+        run_once("flot:" + lot["tag"], remove_friend_lot, lot, "deleted" if lot["state"] == "active" else "paid")
+    for item in S.q("SELECT * FROM outbox WHERE state='pending' AND next_at<=? ORDER BY id LIMIT 10", (t,)):
+        if _send_now(item["chat_id"], item["text"], item["chat_name"]):
+            S.ex("UPDATE outbox SET state='sent' WHERE id=?", (item["id"],))
+        else:
+            attempts = item["attempts"] + 1
+            S.ex("UPDATE outbox SET attempts=?,next_at=?,state=? WHERE id=?",
+                 (attempts, t + min(600, 30 * attempts), "failed" if attempts >= 10 else "pending", item["id"]))
+            if attempts >= 10:
+                notify_admins(f"⚠️ Не удалось доставить сообщение покупателю в чат {esc(item['chat_id'])}:\n"
+                              f"{esc(short(item['text'], 300))}")
+
+
+# ---------------------------------------------------------------------------
+# Telegram: общие помощники
+# ---------------------------------------------------------------------------
+P = "avr17"
+STATE = "avr17_input"
+DUP_HELP = ("❌ Лот с таким названием уже добавлен!\n"
+            "Бот узнаёт купленный лот по названию, поэтому названия лотов должны различаться. "
+            "Измените название на FunPay, например:\n"
+            "• добавьте эмодзи: 🔥 Название\n"
+            "• слово или срок: Название | 3 часа\n"
+            "• название игры: Название | Steal a Brainrot\n"
+            "и добавьте лот снова.")
+
+
+def cbd(*parts: Any) -> str:
+    data = ":".join([P] + [str(p) for p in parts])
+    if len(data.encode()) > 64:
+        raise ValueError("callback_data слишком длинный")
+    return data
+
+
+def B(text: str, *parts: Any) -> Any:
+    return Button(text, callback_data=cbd(*parts))
+
+
+def kb_rows(*rows: Any) -> Any:
     kb = Keyboard()
     for row in rows:
-        label = str(row['name']) if kind=='category' else str(row['server_id'])
-        route = f'c_bind:{lot_id}:{kind}:{row[key]}' if moving is None else f'c_move:{moving}:{row[key]}'
-        kb.row(classic_button(label, route))
-    classic_nav(kb, page, pages, f'c_pick:{lot_id}:{kind}' if moving is None else f'c_move_pick:{moving}')
-    kb.row(panel_button('⬅️ Назад', f'lot:{lot_id}' if moving is None else f'c_server:{moving}'))
-    edit_or_send(bot, chat, text, kb, mid)
+        if row:
+            kb.row(*row)
+    return kb
 
 
-def classic_return(bot, chat, mid, action, target):
-    if action == 'bind_order':
-        orders_menu(bot, chat, mid)
-    elif action in ('add_account','update_account'):
-        simple_list_menu(bot, chat, mid, 'accounts')
-    elif action in ('add_category','rename_category','category_game','add_server_cat'):
-        if target:
-            classic_category(bot, chat, mid, target)
-        else:
-            simple_list_menu(bot, chat, mid, 'cats')
-    elif action in ('add_lot','lot_hours','price_normal','price_event','friend_limit'):
-        if target:
-            lot_details(bot, chat, mid, int(target))
-        else:
-            simple_list_menu(bot, chat, mid, 'lots')
-    elif action in ('bonus','edit_bonus'):
-        bonuses_menu(bot, chat, mid)
-    else:
-        simple_list_menu(bot, chat, mid, 'servers')
+def chunks(items: List[Any], size: int) -> List[List[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-def classic_start(tg, bot, call, action, target=''):
-    if action not in CLASSIC_FIELDS:
-        raise ValueError('Неизвестное действие')
-    data = {'action':action, 'target':str(target), 'values':[], 'at':time.time()}
-    classic_prompt(tg, bot, call.message.chat.id, call.from_user.id, data)
+def bot():
+    return CARDINAL.telegram.bot
 
 
-def classic_prompt(tg, bot, chat, user, data):
-    data = dict(data, token=uuid.uuid4().hex[:12])
-    fields = CLASSIC_FIELDS[data['action']]
-    step = len(data['values'])
-    title = '✏️ Настройка · шаг ' + str(step+1) + ' из ' + str(len(fields))
-    text = f'<b>{title}</b>\n\n'
-    if data.get('lot_name'):
-        text += '📦 ' + esc(data['lot_name']) + '\n\n'
-    text += esc(fields[step][1])
-    kb = Keyboard()
-    if step:
-        kb.row(panel_button('⬅️ Предыдущий шаг', 'c_back:' + data['token']))
-    kb.row(panel_button('❌ Отмена', 'c_abort:' + data['token']))
-    msg = bot.send_message(chat, text, parse_mode='HTML', reply_markup=kb)
-    tg.set_state(chat, msg.message_id, user, STATE_PREFIX+'classic', data)
-
-
-def classic_input(tg, bot, message, unused):
-    with operation_lock(f'admin-input:{message.chat.id}:{message.from_user.id}'):
-        state = tg.get_state(message.chat.id, message.from_user.id) or {}
-        if state.get('state') != STATE_PREFIX+'classic':
-            return
-        data = dict(state.get('data') or {})
-        data['values'] = list(data.get('values') or [])
-        if data.get('at', 0)+1800 < time.time():
-            tg.clear_state(message.chat.id, message.from_user.id, True)
-            bot.reply_to(message, 'Время ожидания истекло. Откройте действие снова.')
-            return
-        raw = message.text.strip()
-        if raw.startswith('/'):
-            tg.clear_state(message.chat.id, message.from_user.id, True)
-            return
-        action, target = data['action'], data['target']
-        fields = CLASSIC_FIELDS[action]
+def show(chat_id: Any, text: str, kb: Any = None, mid: Any = None) -> None:
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    options = {"parse_mode": "HTML", "disable_web_page_preview": True, "reply_markup": kb}
+    if mid:
         try:
-            kind = fields[len(data['values'])][0]
-            if kind in ('id','lot'):
-                if not re.fullmatch(r'[1-9][0-9]*', raw):
-                    raise ValueError('Отправьте только числовой ID.')
-                if kind=='lot':
-                    offer = CARDINAL.account.get_lot_fields(int(raw))
-                    if str(getattr(offer,'lot_id','')) != raw:
-                        raise ValueError('FunPay не подтвердил это предложение.')
-                    if database().row('SELECT 1 FROM lots WHERE lot_id=?', (int(raw),)):
-                        raise ValueError('Этот лот уже добавлен. Откройте его карточку в списке.')
-                    data['lot_name'] = str(getattr(offer,'title_ru',None) or getattr(offer,'summary',None) or 'Лот '+raw)[:200]
-            elif kind=='hours':
-                raw = str(positive_float(raw, 'Значение'))
-            elif kind=='name':
-                if not raw or len(raw)>100 or '|' in raw:
-                    raise ValueError('Название: от 1 до 100 символов, без |.')
-            elif kind=='limit':
-                limit = -1 if raw=='-' else int(raw)
-                if limit < -1:
-                    raise ValueError('Лимит: 0, положительное целое или минус (-).')
-            elif kind=='ids':
-                ids = split_ids(raw)
-                if not ids or len(ids)>20 or any(not re.fullmatch(r'[1-9][0-9]*', sid) for sid in ids):
-                    raise ValueError('Отправьте от 1 до 20 числовых ID серверов.')
-            elif kind=='order':
-                raw = raw.lstrip('#').upper()
-                if not re.fullmatch(r'[A-Z0-9]+', raw) or not database().row('SELECT 1 FROM incoming_orders WHERE order_id=?', (raw,)):
-                    raise ValueError('Заказ не найден в очереди разбора.')
-            elif kind=='configured_lot':
-                if not re.fullmatch(r'[1-9][0-9]*', raw) or not database().row('SELECT 1 FROM lots WHERE lot_id=?', (raw,)):
-                    raise ValueError('Такой лот ещё не настроен в плагине.')
-            elif kind=='quantity':
-                if not re.fullmatch(r'[1-9][0-9]*', raw) or not 1 <= int(raw) <= 1_000_000:
-                    raise ValueError('Количество должно быть целым числом от 1 до 1000000.')
-            data['values'].append(raw)
-            if len(data['values']) < len(fields):
-                classic_prompt(tg, bot, message.chat.id, message.from_user.id, data)
-                return
-            values = data['values']
-            if action=='add_lot':
-                target = values[0]
-                name = data['lot_name'].replace('|',' ')
-                with ORDER_LOCK:
-                    if database().row('SELECT 1 FROM lots WHERE lot_id=?', (target,)):
-                        raise ValueError('Лот уже добавлен. Откройте его карточку.')
-                    reply = update_configuration(action, f'{target} | {values[1]} | {name}', [])
-            elif action=='bind_order':
-                reply = update_configuration(action, ' | '.join(values), [])
-            elif action=='add_category':
-                # Create and capture the new ID in one transaction for correct navigation.
-                with database().lock, database().conn() as con:
-                    target = str(con.execute('INSERT INTO categories(name) VALUES(?)', (values[0],)).lastrowid)
-                reply = '✅ Категория создана. Теперь добавьте в неё серверы.'
-            elif action in ('rename_category','category_game'):
-                with ORDER_LOCK, database().lock, database().conn() as con:
-                    row = con.execute('SELECT * FROM categories WHERE id=?', (target,)).fetchone()
-                    if not row:
-                        raise ValueError('Категория уже удалена.')
-                    if action=='category_game':
-                        if con.execute('SELECT 1 FROM servers WHERE category_id=? AND place_id!=?', (target, values[0])).fetchone():
-                            raise ValueError('Игра не совпадает с серверами этой категории.')
-                        con.execute('UPDATE categories SET game_id=? WHERE id=?', (values[0],target))
-                    else:
-                        con.execute('UPDATE categories SET name=? WHERE id=?', (values[0],target))
-                reply = '✅ Категория обновлена.'
-            elif action in ('bonus','edit_bonus'):
-                raw_value = ':'.join(values)
-                reply = update_configuration(action, f'{target} | {raw_value}' if target else raw_value, [])
-            else:
-                raw_value = f'{target} | {values[0]}' if target else values[0]
-                reply = update_configuration(action, raw_value, [])
-            tg.clear_state(message.chat.id, message.from_user.id, True)
-            bot.reply_to(message, reply, parse_mode='HTML')
-            if action in ('add_account','update_account'):
-                try:
-                    bot.delete_message(message.chat.id, message.message_id)
-                except Exception:
-                    pass
-            classic_return(bot, message.chat.id, None, action, target)
+            bot().edit_message_text(text, chat_id, mid, **options)
+            return
         except Exception as exc:
-            detail = str(exc) if isinstance(exc, ValueError) and action not in ('add_account','update_account') else 'Проверьте данные и подключение. Результат можно проверить в списке.'
-            bot.reply_to(message, '❌ ' + esc(detail) + '\nИсправьте значение и отправьте снова либо нажмите «Отмена».', parse_mode='HTML')
+            if "not modified" in str(exc).lower():
+                return
+    try:
+        bot().send_message(chat_id, text, **options)
+    except Exception:
+        LOG.warning("AutoVIP: меню не отправилось с кнопками", exc_info=True)
+        bot().send_message(chat_id, text + "\n\n⚠️ Меню слишком большое для Telegram, поэтому кнопки не показаны. "
+                           "Пользуйтесь постраничной навигацией или уменьшите количество элементов.",
+                           parse_mode="HTML", disable_web_page_preview=True)
 
 
-def classic_callback(tg, bot, call, parts):
-    chat, mid, user = call.message.chat.id, call.message.message_id, call.from_user.id
-    action = parts[0]
-    state = tg.get_state(chat, user) or {}
-    data = state.get('data') or {}
-    if action in ('c_back','c_abort'):
-        if state.get('state') != STATE_PREFIX+'classic' or len(parts)<2 or parts[1] != data.get('token'):
-            raise ValueError('Ввод уже завершён. Откройте действие заново.')
-        if action=='c_back' and data.get('values'):
-            data = dict(data, values=list(data['values'])[:-1])
-            classic_prompt(tg, bot, chat, user, data)
-        else:
-            tg.clear_state(chat, user, True)
-            classic_return(bot, chat, mid, data['action'], data['target'])
-        return
-    if str(state.get('state','')).startswith(STATE_PREFIX):
-        tg.clear_state(chat, user, True)
-    if action=='c_wizard':
-        classic_start(tg, bot, call, parts[1], parts[2] if len(parts)>2 else '')
-    elif action=='c_account':
-        classic_account(bot, chat, mid, parts[1])
-    elif action=='c_server':
-        classic_server(bot, chat, mid, parts[1])
-    elif action=='c_cat':
-        classic_category(bot, chat, mid, parts[1], int(parts[2]) if len(parts)>2 else 0)
-    elif action=='c_pick':
-        classic_pick(bot, chat, mid, int(parts[1]), parts[2], int(parts[3]))
-    elif action=='c_bind':
-        lid, kind = int(parts[1]), parts[2]
-        value = f'{lid} | {kind}' + ('' if kind=='random' else ' | '+parts[3])
-        update_configuration('bind_lot', value, [])
-        lot_details(bot, chat, mid, lid)
-    elif action=='c_move_pick':
-        classic_pick(bot, chat, mid, 0, 'category', int(parts[2]), moving=parts[1])
-    elif action=='c_move':
-        update_configuration('move_server', parts[1]+' | '+('-' if parts[2]=='0' else parts[2]), [])
-        classic_server(bot, chat, mid, parts[1])
-    elif action=='c_recheck':
-        owner, place = verify_server_config(parts[1])
-        update_configuration('rebind_server', f'{parts[1]} | {owner} | {place}', [])
-        classic_server(bot, chat, mid, parts[1])
-    elif action=='c_history':
-        rentals_menu(bot, chat, mid, int(parts[1]), history=True)
-    elif action=='c_bonuses':
-        bonuses_menu(bot, chat, mid, int(parts[1]))
-    elif action in ('c_confirm','c_delete'):
-        options = {'account':('delete_account','accounts'), 'server':('delete_server','servers'),
-                   'category':('delete_category','cats'), 'lot':('delete_lot','lots'), 'bonus':('delete_bonus','bonuses')}
-        operation, destination = options[parts[1]]
-        identity = parts[2]
-        if action=='c_confirm':
-            kb = Keyboard().row(panel_button('🗑 Да, удалить', f'c_delete:{parts[1]}:{identity}'), panel_button('Отмена', destination))
-            edit_or_send(bot, chat, f'Удалить выбранный объект <code>{esc(identity)}</code>?\nСвязанные аренды и привязки будут проверены перед удалением.', kb, mid)
-        else:
-            update_configuration(operation, identity, [])
-            if destination=='bonuses':
-                bonuses_menu(bot, chat, mid)
-            else:
-                simple_list_menu(bot, chat, mid, destination)
+def say(chat_id: Any, text: str) -> None:
+    try:
+        bot().send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        LOG.debug("AutoVIP: say", exc_info=True)
+
+
+def ask(chat_id: Any, user_id: Any, prompt: str, action: str, args: Tuple = (), back: str = "main",
+        extra: Optional[Dict[str, Any]] = None) -> None:
+    message = bot().send_message(chat_id, prompt, parse_mode="HTML", disable_web_page_preview=True,
+                                 reply_markup=kb_rows([B("❌ Отмена ввода", "x", back)]))
+    CARDINAL.telegram.set_state(chat_id, message.message_id, user_id, STATE,
+                                {"action": action, "args": [str(a) for a in args], "back": back, "extra": extra or {}})
+
+
+def input_state(message: Any) -> Optional[Dict[str, Any]]:
+    try:
+        state = CARDINAL.telegram.get_state(message.chat.id, message.from_user.id)
+    except Exception:
+        return None
+    return state if state and state.get("state") == STATE else None
+
+
+def clear_input(chat_id: Any, user_id: Any, delete_prompt: bool = False) -> None:
+    try:
+        state = CARDINAL.telegram.get_state(chat_id, user_id)
+        if state and state.get("state") == STATE:
+            CARDINAL.telegram.clear_state(chat_id, user_id, delete_prompt)
+    except Exception:
+        LOG.debug("AutoVIP: clear_state", exc_info=True)
+
+
+def open_route(chat_id: Any, mid: Any, user_id: Any, route: str) -> None:
+    parts = route.split(":")
+    ROUTES[parts[0]](chat_id, mid, user_id, *parts[1:])
+
+
+def finish(message: Any, reply: str, route: str) -> None:
+    clear_input(message.chat.id, message.from_user.id, True)
+    bot().reply_to(message, reply, parse_mode="HTML", disable_web_page_preview=True)
+    open_route(message.chat.id, None, message.from_user.id, route)
+
+
+def page_nav(route: str, page: int, pages: int) -> List[Any]:
+    row = []
+    if page > 0:
+        row.append(B("⬅️", route, page - 1))
+    if page + 1 < pages:
+        row.append(B("➡️", route, page + 1))
+    return row
+
+
+def toggle(key: str) -> bool:
+    value = not S.flag(key)
+    S.set(key, "1" if value else "0")
+    return value
+
+
+def on_off(key: str) -> str:
+    return "🟢 Включено" if S.flag(key) else "🔴 Выключено"
+
+
+# ---------------------------------------------------------------------------
+# Главная панель
+# ---------------------------------------------------------------------------
+def menu_main(chat: Any, mid: Any, user: Any) -> None:
+    accounts = S.val("SELECT COUNT(*) FROM accounts")
+    servers = S.val("SELECT COUNT(*) FROM servers")
+    categories = S.val("SELECT COUNT(*) FROM categories")
+    free = S.val(f"SELECT COUNT(*) FROM servers WHERE {FREE_SQL}")
+    busy = S.val(f"SELECT COUNT(DISTINCT server_id) FROM rentals WHERE status IN {LIVE}")
+    ending = S.val("SELECT COUNT(*) FROM rentals WHERE status='ending'")
+    text = ("🎮 <b>Auto VIP Roblox</b>\n\n"
+            f"👥 Аккаунтов: <b>{accounts}</b>\n"
+            f"🖥️ Серверов: <b>{servers}</b>\n"
+            f"🗂 Категорий: <b>{categories}</b>\n"
+            f"🌐 Глобальный прокси: {'✅ Подключен' if S.get('global_proxy') else '❌ Не задан'}\n\n"
+            f"🟢 Свободно: <b>{free}</b> (из них общих: {free_general_count()})\n"
+            f"🔴 Занято: <b>{busy}</b>\n"
+            f"💰 Заработано (всего): <b>{fmt_money(earned_total())} {currency_symbol()}</b>\n\n"
+            f"⚙️ Режим: <b>{'🎉 Евент' if S.flag('event_mode') else '📋 Обычный'}</b>")
+    if ending:
+        text += f"\n\n⚠️ Ожидают выключения сервера (повтор): <b>{ending}</b> — см. 🕹 Управление арендой."
+    management = "🟢 Деактивировать лоты" if S.flag("lot_management") else "🔴 Активировать лоты"
+    rows = [
+        [B("Переключить режим", "mode")],
+        [B("🌐 Настроить Прокси", "proxy")],
+        [B("🖥️ Сервера", "srv", 0), B("👤 Аккаунты", "acc")],
+        [B("🗂 Категории серверов", "cats")],
+        [B("⚙️ Лоты", "lots", 0), B("🕹 Управление арендой", "rents", 0)],
+        [B("🎁 Бонусы", "bon"), B("📊 Статистика", "stats")],
+        [B("📜 История заказов", "hist"), B("⭐ Отзывы", "rev")],
+        [B("🤝 Заявки в друзья", "fr")],
+        [B("📨 Шаблоны сообщений", "tpl")],
+        [B(management, "lotmgmt")],
+    ]
+    if CBT is not None and hasattr(CBT, "PLUGINS_LIST"):
+        rows.append([Button("◀️ В плагины", callback_data=f"{CBT.PLUGINS_LIST}:0")])
+    show(chat, text, kb_rows(*rows), mid)
+
+
+def act_mode(chat: Any, mid: Any, user: Any) -> None:
+    with GUARD:
+        if "prices" in RUNNING:
+            say(chat, "⏳ Цены ещё обновляются, подождите.")
+            return
+    toggle("event_mode")
+    run_once("prices", apply_prices)
+    say(chat, "⏳ Режим переключён, выставляю цены на FunPay. При большом количестве лотов это займёт время.")
+    menu_main(chat, mid, user)
+
+
+def act_lot_management(chat: Any, mid: Any, user: Any) -> None:
+    if toggle("lot_management"):
+        S.ex("UPDATE lots SET last_active=NULL")
+        request_lot_sync()
+    menu_main(chat, mid, user)
+
+
+# --- прокси ---------------------------------------------------------------
+def act_proxy(chat: Any, mid: Any, user: Any) -> None:
+    current = S.get("global_proxy")
+    ask(chat, user, "🌐 <b>Прокси</b>\n\n"
+        f"Текущий прокси: {('<code>' + esc(mask_proxy(current)) + '</code>') if current else 'не задан'}\n\n"
+        "Отправьте новый прокси в формате:\n<code>login:pass@ip:port</code> — с логином и паролем\n"
+        "<code>ip:port</code> — без авторизации\n\nИспользуйте HTTP/HTTPS-прокси. Чтобы удалить прокси, отправьте <code>-</code>.",
+        "proxy")
+
+
+def in_proxy(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if text == "-":
+        S.set("global_proxy", "")
+        reply = "✅ Прокси удалён."
     else:
-        raise ValueError('Неизвестное действие. Откройте меню заново.')
+        try:
+            S.set("global_proxy", normalize_proxy(text))
+        except ValueError:
+            raise ValueError("Неверный формат прокси. Попробуйте еще раз.") from None
+        reply = "✅ Прокси установлен"
+    with GUARD:
+        API_CACHE.clear()
+    try:
+        bot().delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    finish(message, reply, "main")
+
+
+# --- аккаунты -------------------------------------------------------------
+def _check_account(account: sqlite3.Row) -> Optional[str]:
+    try:
+        user_id, name = api_for(account).authenticated()
+    except Exception:
+        return None
+    S.ex("UPDATE accounts SET username=?,roblox_id=? WHERE id=?", (name, user_id, account["id"]))
+    return name
+
+
+def menu_accounts(chat: Any, mid: Any, user: Any) -> None:
+    accounts = S.q("SELECT * FROM accounts ORDER BY id")
+    futures = [EXECUTOR.submit(_check_account, account) for account in accounts]
+    lines = []
+    for index, (account, future) in enumerate(zip(accounts, futures), 1):
+        try:
+            name = future.result(timeout=40)
+        except Exception:
+            name = None
+        lines.append(f"{index}. {esc(name) if name else 'Error'}")
+    text = "👤 <b>Аккаунты Roblox</b>\n\n" + ("\n".join(lines) if lines else "Аккаунтов пока нет. Нажмите «➕ Добавить».")
+    if any(line.endswith("Error") for line in lines):
+        text += "\n\n<i>Error — куки устарели или не работает прокси.</i>"
+    delete = [B(f"🗑️ Удалить #{i}", "acc_del", a["id"]) for i, a in enumerate(accounts, 1)]
+    show(chat, text, kb_rows([B("➕ Добавить", "acc_add")], *chunks(delete, 3), [B("⬅️ Назад", "main")]), mid)
+
+
+def act_account_add(chat: Any, mid: Any, user: Any) -> None:
+    ask(chat, user, "🍪 Отправьте куки <code>.ROBLOSECURITY</code> аккаунта Roblox целиком одним сообщением.\n"
+        "Сообщение с куки бот удалит после проверки.", "acc_add", back="acc")
+
+
+def in_account_add(message: Any, text: str, data: Dict[str, Any]) -> None:
+    try:
+        bot().delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    try:
+        api = RobloxAPI(text, S.get("global_proxy"))
+        user_id, name = api.authenticated()
+    except Exception:
+        raise ValueError("Невалидный куки или ошибка прокси.") from None
+    cookie = api.cookie
+    existing = S.q1("SELECT id FROM accounts WHERE roblox_id=?", (user_id,))
+    if existing:
+        S.ex("UPDATE accounts SET cookie=?,username=? WHERE id=?", (cookie, name, existing["id"]))
+        with GUARD:
+            API_CACHE.pop(int(existing["id"]), None)
+    else:
+        S.ex("INSERT INTO accounts(cookie,username,roblox_id,created_at) VALUES(?,?,?,?)", (cookie, name, user_id, now()))
+    finish(message, f"✅ Аккаунт {esc(name)} добавлен.", "acc")
+
+
+def act_account_delete(chat: Any, mid: Any, user: Any, account_id: str) -> None:
+    if S.q1(f"SELECT 1 FROM rentals WHERE account_id=? AND status IN {LIVE}", (int(account_id),)):
+        say(chat, "❌ С этого аккаунта выданы активные аренды. Удалите его после их окончания.")
+    else:
+        S.ex("DELETE FROM accounts WHERE id=?", (int(account_id),))
+        S.ex("UPDATE servers SET owner_account_id=NULL WHERE owner_account_id=?", (int(account_id),))
+        with GUARD:
+            API_CACHE.pop(int(account_id), None)
+    menu_accounts(chat, mid, user)
+
+
+# --- серверы --------------------------------------------------------------
+def busy_servers() -> set:
+    return {r["server_id"] for r in S.q(f"SELECT server_id FROM rentals WHERE status IN {LIVE}")}
+
+
+def menu_servers(chat: Any, mid: Any, user: Any, page: Any = 0) -> None:
+    total = S.val("SELECT COUNT(*) FROM servers")
+    pages = max(1, math.ceil(total / 20))
+    page = min(max(0, int(page)), pages - 1)
+    rows = S.q("""SELECT s.*,c.name cat FROM servers s LEFT JOIN categories c ON c.id=s.category_id
+                  ORDER BY s.added_at, s.server_id LIMIT 20 OFFSET ?""", (page * 20,))
+    busy = busy_servers()
+    bound = {str(r["server_id"]) for r in S.q("SELECT server_id FROM lots WHERE server_id IS NOT NULL")}
+    lines = []
+    for row in rows:
+        where = f"🗂 {esc(row['cat'])}" if row["cat"] else ("📌 закреплён за лотом" if row["server_id"] in bound else "общий")
+        lines.append(f"{'🔴' if row['server_id'] in busy else '🟢'} <code>{esc(row['server_id'])}</code> · {where}")
+    text = (f"🖥️ <b>Сервера</b>\n\nВсего: {total}" + (f" · Страница {page + 1}/{pages}" if pages > 1 else "") + "\n\n"
+            + ("\n".join(lines) if lines else "Серверов пока нет. Нажмите «➕ Добавить».")
+            + "\n\n<i>Общие — без категории и без привязки к лоту; выдаются лотами в режиме «Рандом».</i>")
+    delete = [B(f"🗑️ Удалить {r['server_id']}", "srv_del", r["server_id"], page) for r in rows]
+    show(chat, text, kb_rows([B("➕ Добавить", "srv_add")], *chunks(delete, 2), page_nav("srv", page, pages),
+                             [B("⬅️ Назад", "main")]), mid)
+
+
+def act_server_add(chat: Any, mid: Any, user: Any) -> None:
+    ask(chat, user, "🖥️ Введите ID VIP-сервера (цифры после <code>id=</code> на странице Configure).", "srv_add",
+        back="srv:0")
+
+
+def in_server_add(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if not re.fullmatch(r"\d{1,20}", text):
+        raise ValueError("ID сервера должен состоять только из цифр.")
+    if S.q1("SELECT 1 FROM servers WHERE server_id=?", (text,)):
+        finish(message, "⚠️ Уже есть.", "srv:0")
+        return
+    S.ex("INSERT INTO servers(server_id,added_at) VALUES(?,?)", (text, now()))
+    request_lot_sync()
+    finish(message, f"✅ Сервер {esc(text)} добавлен.", "srv:0")
+
+
+def act_server_delete(chat: Any, mid: Any, user: Any, server_id: str, page: Any = 0) -> None:
+    if server_id in busy_servers():
+        say(chat, f"❌ На сервере {esc(server_id)} идёт аренда. Удалите его после её окончания.")
+    else:
+        S.ex("DELETE FROM servers WHERE server_id=?", (server_id,))
+        request_lot_sync()
+    menu_servers(chat, mid, user, page)
+
+
+# --- категории ------------------------------------------------------------
+def category_label(cat: sqlite3.Row) -> str:
+    return str(cat["name"]) + (f" • {cat['game_name'] or cat['game_id']}" if cat["game_id"] else "")
+
+
+def category_counts(cat_id: int) -> Tuple[int, int]:
+    total = S.val("SELECT COUNT(*) FROM servers WHERE category_id=?", (cat_id,))
+    free = S.val(f"SELECT COUNT(*) FROM servers WHERE category_id=? AND {FREE_SQL}", (cat_id,))
+    return int(total), int(free)
+
+
+def menu_categories(chat: Any, mid: Any, user: Any) -> None:
+    cats = S.q("SELECT * FROM categories ORDER BY id")
+    lines = []
+    for cat in cats:
+        total, free = category_counts(cat["id"])
+        lines.append(f"• {esc(category_label(cat))} — серверов: {total}, свободно: {free}")
+    text = ("🗂 <b>Категории серверов</b>\n\nКатегория — пул серверов (например, все серверы одной игры). "
+            "Привяжите категорию к лоту — бот выдаст любой свободный сервер из неё, а лот будет активен, "
+            "пока в категории есть свободный сервер.\n\n" + ("\n".join(lines) if lines else "Категорий пока нет."))
+    buttons = [[B("✏️ " + short(category_label(c), 40), "cat", c["id"])] for c in cats[:90]]
+    show(chat, text, kb_rows(*buttons, [B("➕ Добавить категорию", "cat_add")], [B("⬅️ Назад", "main")]), mid)
+
+
+def menu_category(chat: Any, mid: Any, user: Any, cat_id: Any) -> None:
+    cat = S.q1("SELECT * FROM categories WHERE id=?", (int(cat_id),))
+    if not cat:
+        say(chat, "❌ Категория не найдена.")
+        menu_categories(chat, mid, user)
+        return
+    servers = S.q("SELECT server_id FROM servers WHERE category_id=? ORDER BY added_at, server_id", (cat["id"],))
+    busy = busy_servers()
+    total, free = category_counts(cat["id"])
+    game = f"{esc(cat['game_name'] or cat['game_id'])} (<code>{esc(cat['game_id'])}</code>)" if cat["game_id"] else "не привязана"
+    lines = [f"{'🔴' if s['server_id'] in busy else '🟢'} <code>{esc(s['server_id'])}</code>" for s in servers[:40]]
+    if len(servers) > 40:
+        lines.append(f"…и ещё {len(servers) - 40}")
+    text = (f"🗂 <b>{esc(cat['name'])}</b>\n\n🎮 Игра: {game}\n🖥️ Серверов: {total}, свободно: {free}\n\n"
+            + ("\n".join(lines) if lines else "В категории пока нет серверов. Нажмите «➕ Добавить серверы»."))
+    delete = [B(f"🗑️ {s['server_id']}", "cs_del", cat["id"], s["server_id"]) for s in servers[:20]]
+    show(chat, text, kb_rows([B("➕ Добавить серверы", "cs_add", cat["id"])], *chunks(delete, 2),
+                             [B("🎮 Привязать игру", "cat_game", cat["id"]), B("✏️ Переименовать", "cat_ren", cat["id"])],
+                             [B("🗑️ Удалить категорию", "cat_del", cat["id"])], [B("⬅️ К категориям", "cats")]), mid)
+
+
+def act_category_add(chat: Any, mid: Any, user: Any) -> None:
+    ask(chat, user, "🗂 Введите название категории (например, <code>Steal a Brainrot</code>).", "cat_add", back="cats")
+
+
+def in_category_add(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if not text:
+        raise ValueError("Название не может быть пустым.")
+    cat_id = S.ex("INSERT INTO categories(name) VALUES(?)", (text[:100],)).lastrowid
+    finish(message, f"✅ Категория «{esc(text[:100])}» создана. Добавьте в неё серверы.", f"cat:{cat_id}")
+
+
+def act_category_servers_add(chat: Any, mid: Any, user: Any, cat_id: str) -> None:
+    ask(chat, user, "🖥️ Отправьте ID VIP-серверов — можно несколько через пробел, запятую или с новой строки.\n"
+        "Серверы автоматически попадут и в общий список «🖥️ Сервера».", "cs_add", (cat_id,), back=f"cat:{cat_id}")
+
+
+def in_category_servers_add(message: Any, text: str, data: Dict[str, Any]) -> None:
+    cat_id = int(data["args"][0])
+    if not S.q1("SELECT 1 FROM categories WHERE id=?", (cat_id,)):
+        raise ValueError("Категория уже удалена.")
+    ids = [x for x in re.split(r"[\s,;]+", text) if x]
+    bad = [x for x in ids if not re.fullmatch(r"\d{1,20}", x)]
+    added = already = 0
+    with S.tx():
+        for server_id in ids:
+            if server_id in bad:
+                continue
+            row = S.q1("SELECT category_id FROM servers WHERE server_id=?", (server_id,))
+            if row and row["category_id"] == cat_id:
+                already += 1
+            elif row:
+                S.ex("UPDATE servers SET category_id=? WHERE server_id=?", (cat_id, server_id))
+                added += 1
+            else:
+                S.ex("INSERT INTO servers(server_id,category_id,added_at) VALUES(?,?,?)", (server_id, cat_id, now()))
+                added += 1
+    if not added and not already:
+        raise ValueError("Не найдено ни одного числового ID сервера.")
+    reply = f"✅ Добавлено серверов: {added}. Уже были в категории: {already}."
+    if bad:
+        reply += "\n⚠️ Пропущены (не ID): " + esc(", ".join(bad[:10]))
+    request_lot_sync()
+    finish(message, reply, f"cat:{cat_id}")
+
+
+def act_category_server_delete(chat: Any, mid: Any, user: Any, cat_id: str, server_id: str) -> None:
+    S.ex("UPDATE servers SET category_id=NULL WHERE server_id=? AND category_id=?", (server_id, int(cat_id)))
+    request_lot_sync()
+    menu_category(chat, mid, user, cat_id)
+
+
+def act_category_game(chat: Any, mid: Any, user: Any, cat_id: str) -> None:
+    ask(chat, user, "🎮 Отправьте ID игры (число после <code>/games/</code> в ссылке) в формате <code>ID</code> или "
+        "<code>ID|Название</code>, например <code>109983668079237|Steal a Brainrot</code>.\n"
+        "Чтобы убрать привязку игры, отправьте <code>-</code>.", "cat_game", (cat_id,), back=f"cat:{cat_id}")
+
+
+def in_category_game(message: Any, text: str, data: Dict[str, Any]) -> None:
+    cat_id = int(data["args"][0])
+    if text == "-":
+        S.ex("UPDATE categories SET game_id=NULL,game_name=NULL WHERE id=?", (cat_id,))
+        finish(message, "✅ Привязка игры снята.", f"cat:{cat_id}")
+        return
+    game_id, _, name = text.partition("|")
+    game_id, name = game_id.strip(), name.strip()
+    if not re.fullmatch(r"\d{1,20}", game_id):
+        raise ValueError("ID игры должен состоять из цифр. Формат: ID или ID|Название.")
+    if not name:
+        name = DEFAULT_GAME_NAME if game_id == DEFAULT_PLACE_ID else game_id
+    S.ex("UPDATE categories SET game_id=?,game_name=? WHERE id=?", (game_id, name[:100], cat_id))
+    finish(message, f"✅ Игра «{esc(name)}» привязана к категории.", f"cat:{cat_id}")
+
+
+def act_category_rename(chat: Any, mid: Any, user: Any, cat_id: str) -> None:
+    ask(chat, user, "✏️ Введите новое название категории.", "cat_ren", (cat_id,), back=f"cat:{cat_id}")
+
+
+def in_category_rename(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if not text:
+        raise ValueError("Название не может быть пустым.")
+    S.ex("UPDATE categories SET name=? WHERE id=?", (text[:100], int(data["args"][0])))
+    finish(message, "✅ Категория переименована.", f"cat:{data['args'][0]}")
+
+
+def act_category_delete(chat: Any, mid: Any, user: Any, cat_id: str) -> None:
+    cat_id_int = int(cat_id)
+    lots = S.val("SELECT COUNT(*) FROM lots WHERE category_id=?", (cat_id_int,))
+    with S.tx():
+        S.ex("UPDATE lots SET category_id=NULL WHERE category_id=?", (cat_id_int,))
+        S.ex("UPDATE servers SET category_id=NULL WHERE category_id=?", (cat_id_int,))
+        S.ex("DELETE FROM categories WHERE id=?", (cat_id_int,))
+    request_lot_sync()
+    say(chat, "🗑️ Категория удалена. Серверы остались в общем списке."
+        + (f"\n⚠️ Лотов, потерявших привязку: {lots}. Они переведены в режим «Рандом» — перепривяжите их." if lots else ""))
+    menu_categories(chat, mid, user)
+
+
+# --- лоты -----------------------------------------------------------------
+def lot_bind_text(lot: sqlite3.Row) -> str:
+    mode = lot_mode(lot)
+    if mode == "category":
+        cat = S.q1("SELECT * FROM categories WHERE id=?", (lot["category_id"],))
+        total, free = category_counts(cat["id"])
+        return f"🗂 Категория «{esc(category_label(cat))}» (свободно {free}/{total})"
+    if mode == "server":
+        exists = S.q1("SELECT 1 FROM servers WHERE server_id=?", (str(lot["server_id"]),))
+        return f"🖥️ Один сервер <code>{esc(lot['server_id'])}</code>" + ("" if exists else " ⚠️ нет в списке серверов")
+    return "🎲 Рандом (общие серверы)"
+
+
+def lot_limit_text(lot: sqlite3.Row) -> str:
+    if lot["friend_limit"] is None:
+        return "по умолчанию"
+    return "без ограничений" if int(lot["friend_limit"]) == 0 else str(lot["friend_limit"])
+
+
+def menu_lots(chat: Any, mid: Any, user: Any, page: Any = 0) -> None:
+    total = S.val("SELECT COUNT(*) FROM lots")
+    pages = max(1, math.ceil(total / 20))
+    page = min(max(0, int(page)), pages - 1)
+    lots = S.q("SELECT * FROM lots ORDER BY added_at, lot_id LIMIT 20 OFFSET ?", (page * 20,))
+    dups = duplicate_lots()
+    dup_ids = {lot["lot_id"] for group in dups.values() for lot in group}
+    text = f"⚙️ <b>Лоты</b>\n\nВсего лотов: {total} · Страница {page + 1}/{pages}"
+    if dups:
+        text += "\n\n⚠️ <b>Одинаковые названия лотов!</b> Бот не сможет понять, какой из них купили:\n"
+        text += "\n".join("• " + ", ".join(f"{esc(l['name'])} (ID {l['lot_id']})" for l in group) for group in dups.values())
+        text += "\nПереименуйте лоты на FunPay и нажмите «🔄 Обновить название с FunPay» в карточке."
+    if not lots:
+        text += "\n\nЛотов пока нет. Нажмите «➕ Добавить лот»."
+    buttons = [[B(("⚠️ " if l["lot_id"] in dup_ids else "• ") + short(l["name"], 40) + f" ({fmt_num(l['hours'])}ч)",
+                  "lot", l["lot_id"])] for l in lots]
+    show(chat, text, kb_rows(*buttons, page_nav("lots", page, pages), [B("➕ Добавить лот", "lot_add")],
+                             [B("⬅️ Назад", "main")]), mid)
+
+
+def menu_lot(chat: Any, mid: Any, user: Any, lot_id: Any) -> None:
+    lot = S.q1("SELECT * FROM lots WHERE lot_id=?", (int(lot_id),))
+    if not lot:
+        say(chat, "❌ Лот не найден.")
+        menu_lots(chat, mid, user, 0)
+        return
+    text = (f"📦 <b>{esc(lot['name'])}</b>\n\n"
+            f"🆔 ID лота FunPay: <code>{lot['lot_id']}</code>\n"
+            f"⏰ Часов за 1 шт.: {fmt_num(lot['hours'])}\n"
+            f"🔗 Выдача: {lot_bind_text(lot)}\n"
+            f"👥 Лимит друзей: {lot_limit_text(lot)}\n"
+            f"💰 Обычная цена: {fmt_num(lot['price_normal'])}\n"
+            f"🎉 Евент цена: {fmt_num(lot['price_event'])}")
+    twin = name_taken(lot["name"], lot["lot_id"])
+    if twin:
+        text += (f"\n\n⚠️ У лота ID {twin['lot_id']} такое же название — бот может выдать не тот сервер или не то время. "
+                 "Переименуйте один из лотов на FunPay и нажмите «🔄 Обновить название с FunPay».")
+    lid = lot["lot_id"]
+    show(chat, text, kb_rows(
+        [B("⏰ Изменить время (часы)", "lh", lid)],
+        [B("🗂 Привязать категорию", "lc", lid)],
+        [B("🖥️ Привязать один сервер", "ls", lid)],
+        [B("💰 Обычная цена", "lpn", lid), B("🎉 Евент цена", "lpe", lid)],
+        [B(f"👥 Лимит друзей ({lot_limit_text(lot)})", "lf", lid)],
+        [B("🔄 Обновить название с FunPay", "lr", lid)],
+        [B("🗑️ Удалить лот", "ld", lid)],
+        [B("⬅️ Назад", "lots", 0)]), mid)
+
+
+def act_lot_add(chat: Any, mid: Any, user: Any) -> None:
+    ask(chat, user, "📦 Введите ID лота FunPay (цифры в конце ссылки на лот, например "
+        "<code>https://funpay.com/lots/offer?id=12345678</code> → <code>12345678</code>).", "lot_add", back="lots:0")
+
+
+def in_lot_add(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if not re.fullmatch(r"\d{1,12}", text):
+        raise ValueError("ID лота должен быть числом")
+    lot_id = int(text)
+    if S.q1("SELECT 1 FROM lots WHERE lot_id=?", (lot_id,)):
+        raise ValueError(f"⚠️ Лот {lot_id} уже добавлен в плагин")
+    if not account_ready():
+        raise ValueError("Бот ещё подключается к FunPay. Повторите через минуту.")
+    try:
+        name = lot_title_from_funpay(lot_id)
+    except Exception:
+        raise ValueError(f"Не удалось прочитать название лота {lot_id} с FunPay. Проверьте ID (лот должен быть вашим) "
+                         "и попробуйте ещё раз.") from None
+    if name_taken(name):
+        raise ValueError(DUP_HELP[2:] + f"\n\nНазвание: «{name}»")
+    clear_input(message.chat.id, message.from_user.id, True)
+    ask(message.chat.id, message.from_user.id,
+        f"📦 <b>{esc(name)}</b>\n🆔 {lot_id}\n\nВведите количество часов аренды за 1 шт. товара "
+        "(например, <code>24</code> или <code>1.5</code>).", "lot_add2", (lot_id,), back="lots:0", extra={"name": name})
+
+
+def in_lot_add2(message: Any, text: str, data: Dict[str, Any]) -> None:
+    try:
+        hours = parse_number(text)
+    except ValueError:
+        hours = 0
+    if hours <= 0:
+        raise ValueError("Введите число больше 0, например 24 или 1.5.")
+    lot_id, name = int(data["args"][0]), data["extra"]["name"]
+    if S.q1("SELECT 1 FROM lots WHERE lot_id=?", (lot_id,)):
+        raise ValueError(f"⚠️ Лот {lot_id} уже добавлен в плагин")
+    if name_taken(name):
+        raise ValueError(DUP_HELP[2:])
+    S.ex("INSERT INTO lots(lot_id,name,hours,added_at) VALUES(?,?,?,?)", (lot_id, name, hours, now()))
+    request_lot_sync()
+    finish(message, f"✅ Лот {esc(name)} ({fmt_num(hours)}ч) добавлен.", "lots:0")
+
+
+def _lot_input(action: str, prompt: str):
+    def opener(chat: Any, mid: Any, user: Any, lot_id: str) -> None:
+        ask(chat, user, prompt, action, (lot_id,), back=f"lot:{lot_id}")
+    return opener
+
+
+def in_lot_value(message: Any, text: str, data: Dict[str, Any]) -> None:
+    action, lot_id = data["action"], int(data["args"][0])
+    if not S.q1("SELECT 1 FROM lots WHERE lot_id=?", (lot_id,)):
+        raise ValueError("Лот уже удалён.")
+    if action == "lh":
+        try:
+            value = parse_number(text)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            raise ValueError("Введите положительное число часов (точка или запятая).")
+        S.ex("UPDATE lots SET hours=? WHERE lot_id=?", (value, lot_id))
+        reply = f"✅ Время: {fmt_num(value)} ч. за 1 шт."
+    elif action in ("lpn", "lpe"):
+        try:
+            value = parse_number(text)
+        except ValueError:
+            value = -1
+        if value <= 0:
+            raise ValueError("Введите цену числом больше 0.")
+        S.ex(f"UPDATE lots SET {'price_normal' if action == 'lpn' else 'price_event'}=? WHERE lot_id=?", (value, lot_id))
+        reply = "✅ Цена сохранена. На FunPay она применится при переключении режима."
+    elif action == "lf":
+        if text == "-":
+            S.ex("UPDATE lots SET friend_limit=NULL WHERE lot_id=?", (lot_id,))
+            reply = "✅ Используется лимит по умолчанию."
+        else:
+            if not re.fullmatch(r"\d{1,4}", text):
+                raise ValueError("Введите целое число от 1 до 9999, 0 — без ограничений, - — по умолчанию.")
+            S.ex("UPDATE lots SET friend_limit=? WHERE lot_id=?", (int(text), lot_id))
+            reply = "✅ Лимит друзей: " + ("без ограничений" if int(text) == 0 else text)
+    else:  # ls — один сервер
+        if text == "-":
+            S.ex("UPDATE lots SET server_id=NULL WHERE lot_id=?", (lot_id,))
+            reply = "✅ Привязка одного сервера снята."
+        else:
+            if not re.fullmatch(r"\d{1,20}", text):
+                raise ValueError("ID сервера должен состоять из цифр (или - чтобы снять привязку).")
+            S.ex("UPDATE lots SET server_id=?,category_id=NULL WHERE lot_id=?", (text, lot_id))
+            reply = f"✅ Лот выдаёт только сервер {esc(text)}."
+            if not S.q1("SELECT 1 FROM servers WHERE server_id=?", (text,)):
+                reply += "\n⚠️ Этого сервера нет в списке «🖥️ Сервера» — добавьте его, иначе выдача не сработает."
+        request_lot_sync()
+    finish(message, reply, f"lot:{lot_id}")
+
+
+def menu_lot_category(chat: Any, mid: Any, user: Any, lot_id: str) -> None:
+    lot = S.q1("SELECT * FROM lots WHERE lot_id=?", (int(lot_id),))
+    if not lot:
+        menu_lots(chat, mid, user, 0)
+        return
+    cats = S.q("SELECT * FROM categories ORDER BY id")
+    buttons = []
+    for cat in cats[:80]:
+        total, free = category_counts(cat["id"])
+        mark = "✅ " if lot["category_id"] == cat["id"] else ""
+        buttons.append([B(f"{mark}{short(category_label(cat), 36)} ({free}/{total})", "lcb", lot["lot_id"], cat["id"])])
+    rows = buttons
+    if lot["category_id"]:
+        rows.append([B("🎲 Снять привязку (рандом/сервер)", "lcu", lot["lot_id"])])
+    rows.append([B("⬅️ Назад к лоту", "lot", lot["lot_id"])])
+    text = (f"🗂 <b>Привязка категории</b> — {esc(lot['name'])}\n\nВыберите категорию: лот будет выдавать любой свободный "
+            "сервер из неё. Привязка категории отменяет привязку одного сервера.\nВ скобках — свободно/всего."
+            + ("" if cats else "\n\nКатегорий пока нет — создайте их в «🗂 Категории серверов»."))
+    show(chat, text, kb_rows(*rows), mid)
+
+
+def act_lot_bind_category(chat: Any, mid: Any, user: Any, lot_id: str, cat_id: str) -> None:
+    S.ex("UPDATE lots SET category_id=?,server_id=NULL WHERE lot_id=?", (int(cat_id), int(lot_id)))
+    request_lot_sync()
+    menu_lot(chat, mid, user, lot_id)
+
+
+def act_lot_unbind_category(chat: Any, mid: Any, user: Any, lot_id: str) -> None:
+    S.ex("UPDATE lots SET category_id=NULL WHERE lot_id=?", (int(lot_id),))
+    request_lot_sync()
+    menu_lot(chat, mid, user, lot_id)
+
+
+def act_lot_refresh(chat: Any, mid: Any, user: Any, lot_id: str) -> None:
+    lot = S.q1("SELECT * FROM lots WHERE lot_id=?", (int(lot_id),))
+    if not lot:
+        menu_lots(chat, mid, user, 0)
+        return
+    try:
+        name = lot_title_from_funpay(lot["lot_id"])
+    except Exception:
+        say(chat, f"❌ Не удалось прочитать название лота {lot['lot_id']} с FunPay. Попробуйте ещё раз.")
+        return
+    if name == lot["name"]:
+        say(chat, "ℹ️ Название не изменилось.")
+    elif name_taken(name, lot["lot_id"]):
+        say(chat, esc(DUP_HELP).replace("добавьте лот снова", "нажмите «🔄 Обновить название с FunPay» ещё раз")
+            + f"\n\nНовое название на FunPay: «{esc(name)}» — обновление не выполнено.")
+    else:
+        S.ex("UPDATE lots SET name=? WHERE lot_id=?", (name, lot["lot_id"]))
+        say(chat, f"✅ Название обновлено.\nБыло: {esc(lot['name'])}\nСтало: {esc(name)}")
+    menu_lot(chat, mid, user, lot_id)
+
+
+def act_lot_delete(chat: Any, mid: Any, user: Any, lot_id: str) -> None:
+    S.ex("DELETE FROM lots WHERE lot_id=?", (int(lot_id),))
+    say(chat, f"🗑️ Лот {esc(lot_id)} удалён из плагина. На FunPay он остался как был — не забудьте "
+        "деактивировать его вручную, иначе его будут покупать, а выдачи не будет.")
+    menu_lots(chat, mid, user, 0)
+
+
+# --- аренды ---------------------------------------------------------------
+def menu_rentals(chat: Any, mid: Any, user: Any, page: Any = 0) -> None:
+    rows_all = S.q(f"SELECT * FROM rentals WHERE status IN {LIVE} ORDER BY end_time, created_at, rowid")
+    pages = max(1, math.ceil(len(rows_all) / 10))
+    page = min(max(0, int(page)), pages - 1)
+    rows = rows_all[page * 10:(page + 1) * 10]
+    if not rows_all:
+        show(chat, "🕹 <b>Управление арендой</b>\n\n📭 Активных аренд нет.", kb_rows([B("⬅️ Назад в меню", "main")]), mid)
+        return
+    lines = []
+    for index, rental in enumerate(rows, page * 10 + 1):
+        left = "⏳ завершается…" if rental["status"] == "ending" else "⏰ " + fmt_left(rental["end_time"] - now())
+        lines.append(f"{index}. #{esc(rental['order_id'])} · 🖥️ <code>{esc(rental['server_id'])}</code> · {left}")
+    buttons = [B(str(i), "rent", r["rental_id"]) for i, r in enumerate(rows, page * 10 + 1)]
+    show(chat, f"🕹 <b>Управление арендой</b>\n\nАктивных аренд: {len(rows_all)}\n\n" + "\n".join(lines),
+         kb_rows(*chunks(buttons, 5), page_nav("rents", page, pages), [B("⬅️ Назад в меню", "main")]), mid)
+
+
+def menu_rental(chat: Any, mid: Any, user: Any, rental_id: str) -> None:
+    rental = S.q1("SELECT * FROM rentals WHERE rental_id=?", (rental_id,))
+    if not rental or rental["status"] not in ("active", "ending"):
+        say(chat, f"ℹ️ Аренда {('#' + esc(rental['order_id'])) if rental else ''} уже не активна.")
+        menu_rentals(chat, mid, user, 0)
+        return
+    limit = friend_limit_for(rental)
+    used = friends_used(rental_id)
+    paid = int(rental["paid_slots"] or 0)
+    friends = f"{used}/{'∞' if not limit else limit + paid}" + (f" (+{paid} оплачено)" if paid else "")
+    text = (f"🕹 <b>Аренда #{esc(rental['order_id'])}</b>\n\n"
+            f"📦 Лот: {esc(rental_title(rental))}\n"
+            f"🖥️ Сервер: <code>{esc(rental['server_id'])}</code>\n"
+            f"👤 Покупатель FunPay: {esc(rental['buyer_name'] or '—')} (ID {esc(rental['buyer_id'])})\n"
+            f"⏰ Осталось: {fmt_left(rental['end_time'] - now())} из {fmt_num(rental['hours'])} ч.\n"
+            f"👥 Друзья: {friends}\n"
+            f"🔗 Ссылка: {esc(rental['link'] or '—')}")
+    if rental["status"] == "ending":
+        text += ("\n\n⏳ <b>Завершается</b>: Roblox пока не подтвердил выключение сервера, бот повторяет попытки.\n"
+                 f"Ошибка: {esc(rental['last_error'] or '—')}")
+        kb = kb_rows([B("🔁 Повторить сейчас", "rr", rental_id)], [B("⬅️ Назад", "rents", 0)])
+    else:
+        kb = kb_rows([B("✅ Завершить", "re", rental_id), B("🔄 Продлить", "rx", rental_id)],
+                     [B("🤫 Тихо завершить", "rq", rental_id), B("❌ Отменить", "rc", rental_id)],
+                     [B("⬅️ Назад", "rents", 0)])
+    show(chat, text, kb, mid)
+
+
+def _end_from_panel(chat: Any, mid: Any, user: Any, rental_id: str, reason: str) -> None:
+    rental = get_active(rental_id)
+    if not rental:
+        old = S.q1("SELECT order_id FROM rentals WHERE rental_id=?", (rental_id,))
+        say(chat, f"ℹ️ Аренда #{esc(old['order_id'] if old else '?')} уже не активна.")
+        menu_rentals(chat, mid, user, 0)
+        return
+    order = rental["order_id"]
+
+    def job() -> None:
+        ok, error = end_rental(rental_id, reason)
+        if ok:
+            message = {"manual": f"✅ Аренда #{esc(order)} завершена.",
+                       "quiet": f"✅ Аренда #{esc(order)} завершена 🤫 (тихо, покупатель не уведомлён).",
+                       "cancelled": f"❌ Аренда #{esc(order)} отменена."}[reason]
+        elif error == "not_active":
+            message = f"ℹ️ Аренда #{esc(order)} уже не активна."
+        else:
+            message = (f"⚠️ Аренда #{esc(order)}: Roblox не подтвердил выключение сервера ({esc(error)}). "
+                       "Бот повторит попытку автоматически.")
+        say(chat, message)
+    if not run_once("rental:" + rental_id, job):
+        say(chat, "⏳ С этой арендой уже выполняется операция — подождите.")
+        return
+    say(chat, f"⏳ Завершаю аренду #{esc(order)} — это займёт около 10 секунд, не нажимайте повторно.")
+
+
+def act_rent_end(chat, mid, user, rid):
+    _end_from_panel(chat, mid, user, rid, "manual")
+
+
+def act_rent_quiet(chat, mid, user, rid):
+    _end_from_panel(chat, mid, user, rid, "quiet")
+
+
+def act_rent_cancel(chat, mid, user, rid):
+    _end_from_panel(chat, mid, user, rid, "cancelled")
+
+
+def act_rent_retry(chat: Any, mid: Any, user: Any, rental_id: str) -> None:
+    S.ex("UPDATE rentals SET next_attempt=0 WHERE rental_id=? AND status='ending'", (rental_id,))
+    say(chat, "🔁 Повторная попытка поставлена в очередь.")
+    menu_rental(chat, mid, user, rental_id)
+
+
+def act_rent_extend(chat: Any, mid: Any, user: Any, rental_id: str) -> None:
+    if not get_active(rental_id):
+        menu_rental(chat, mid, user, rental_id)
+        return
+    ask(chat, user, "🔄 На сколько часов продлить аренду? (положительное число, например <code>2</code> или <code>1.5</code>)",
+        "rx", (rental_id,), back=f"rent:{rental_id}")
+
+
+def in_rent_extend(message: Any, text: str, data: Dict[str, Any]) -> None:
+    try:
+        hours = parse_number(text)
+    except ValueError:
+        hours = 0
+    if hours <= 0:
+        raise ValueError("Введите положительное число часов.")
+    rental = extend_rental(data["args"][0], hours)
+    finish(message, f"✅ Аренда #{esc(rental['order_id'])} продлена на {fmt_num(hours)} ч. Покупатель уведомлён.",
+           f"rent:{data['args'][0]}")
+
+
+# --- бонусы ---------------------------------------------------------------
+def menu_bonuses(chat: Any, mid: Any, user: Any) -> None:
+    rules = S.q("SELECT * FROM bonus_rules ORDER BY id")
+    text = (f"🎁 <b>Бонусы за объём: {'ВКЛ' if S.flag('bonus_active') else 'ВЫКЛ'}</b>\n\n"
+            + ("\n".join(f"{r['buy_hours']:.1f}ч -> +{r['get_hours']:.1f}ч" for r in rules) if rules else "Правил пока нет.")
+            + "\n\n<i>Применяется первое подходящее правило по порядку списка; бонус не умножается. "
+              "Добавляйте правила от большего порога к меньшему.</i>")
+    show(chat, text, kb_rows([B("🔄 Вкл/Выкл", "bon_t"), B("➕ Правило", "bon_a")],
+                             [B("✏️ Ред. правила", "bon_el"), B("🗑️ Уд. правило", "bon_dl")], [B("⬅️ Назад", "main")]), mid)
+
+
+def act_bonus_toggle(chat, mid, user):
+    toggle("bonus_active")
+    menu_bonuses(chat, mid, user)
+
+
+def act_bonus_add(chat, mid, user):
+    ask(chat, user, "➕ Отправьте правило в формате <code>купить:получить</code>, например <code>5:1</code> "
+        "(купи 5 часов — получи 1 в подарок). Дробные числа — через точку.", "bon_a", back="bon")
+
+
+def menu_bonus_pick(chat: Any, mid: Any, user: Any, mode: str) -> None:
+    rules = S.q("SELECT * FROM bonus_rules ORDER BY id")
+    action = "bon_e" if mode == "edit" else "bon_d"
+    buttons = [[B(f"{'✏️' if mode == 'edit' else '🗑️'} {r['buy_hours']:.1f}ч -> +{r['get_hours']:.1f}ч", action, r["id"])]
+               for r in rules[:90]]
+    text = "✏️ Выберите правило для изменения:" if mode == "edit" else "🗑️ Нажмите на правило, чтобы удалить его:"
+    show(chat, text if rules else "Правил пока нет.", kb_rows(*buttons, [B("⬅️ Назад", "bon")]), mid)
+
+
+def act_bonus_edit(chat, mid, user, rule_id):
+    ask(chat, user, "✏️ Отправьте новое значение в формате <code>купить:получить</code>.", "bon_e", (rule_id,), back="bon")
+
+
+def act_bonus_delete(chat, mid, user, rule_id):
+    S.ex("DELETE FROM bonus_rules WHERE id=?", (int(rule_id),))
+    menu_bonus_pick(chat, mid, user, "delete")
+
+
+def in_bonus(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if ":" not in text:
+        raise ValueError("Неверный формат.")
+    try:
+        buy, get = (parse_number(x) for x in text.split(":", 1))
+    except ValueError:
+        raise ValueError("Ошибка. Используйте числа.") from None
+    if buy <= 0 or get <= 0:
+        raise ValueError("Ошибка. Используйте числа больше 0.")
+    if data["action"] == "bon_a":
+        S.ex("INSERT INTO bonus_rules(buy_hours,get_hours) VALUES(?,?)", (buy, get))
+    else:
+        S.ex("UPDATE bonus_rules SET buy_hours=?,get_hours=? WHERE id=?", (buy, get, int(data["args"][0])))
+    finish(message, f"✅ Правило: {buy:.1f}ч -> +{get:.1f}ч", "bon")
+
+
+# --- статистика и история -------------------------------------------------
+def menu_stats(chat: Any, mid: Any, user: Any) -> None:
+    rentals = S.val("SELECT COUNT(*) FROM rentals")
+    active = S.val("SELECT COUNT(*) FROM rentals WHERE status='active'")
+    paid = S.val("SELECT COUNT(*) FROM friend_payments WHERE state='applied'")
+    text = (f"📊 <b>Статистика</b>\n\n💰 Total Earned: <b>{fmt_money(earned_total())} {currency_symbol()}</b>\n\n"
+            f"Аренд всего: {rentals} (активных: {active})\nОплат доплаты за друзей: {paid}")
+    show(chat, text, kb_rows([B("⬅️ Назад", "main")]), mid)
+
+
+def menu_history(chat: Any, mid: Any, user: Any) -> None:
+    rows = S.q("SELECT * FROM rentals ORDER BY created_at DESC, rowid DESC LIMIT 5")
+    lines = [f"• #{esc(r['order_id'])} · {fmt_num(r['hours'])} ч · {fmt_money(r['price'])} {currency_symbol()} · "
+             f"{fmt_dt(r['created_at'], True)}" for r in rows]
+    show(chat, "📜 <b>История заказов</b> (5 последних)\n\n" + ("\n".join(lines) if lines else "Заказов пока нет."),
+         kb_rows([B("⬅️ Назад", "main")]), mid)
+
+
+# --- отзывы ---------------------------------------------------------------
+def menu_reviews(chat: Any, mid: Any, user: Any) -> None:
+    text = (f"⭐ <b>Бонус за отзыв</b>\n\nСтатус: {on_off('review_bonus_active')}\n"
+            f"Бонус: {esc(S.get('review_bonus_hours'))} ч.\n"
+            f"Сообщение: «{esc(short(get_template('review_bonus'), 80))}»\n\n"
+            "<i>Покупатель оставляет отзыв и пишет !отзыв — бот добавит часы к активной аренде этого заказа. "
+            "Бонус по заказу выдаётся один раз.</i>")
+    show(chat, text, kb_rows([B(f"🔄 Переключить ({'Включено' if S.flag('review_bonus_active') else 'Выключено'})", "rev_t")],
+                             [B("⏰ Изменить время бонуса", "rev_h")],
+                             [B("📝 Изменить сообщение", "te", "review_bonus", "rev")], [B("⬅️ Назад", "main")]), mid)
+
+
+def act_review_toggle(chat, mid, user):
+    toggle("review_bonus_active")
+    menu_reviews(chat, mid, user)
+
+
+def act_review_hours(chat, mid, user):
+    ask(chat, user, "⏰ Введите количество бонусных часов за отзыв (например, <code>1</code> или <code>0.5</code>).",
+        "rev_h", back="rev")
+
+
+def in_review_hours(message: Any, text: str, data: Dict[str, Any]) -> None:
+    try:
+        hours = parse_number(text)
+    except ValueError:
+        hours = 0
+    if hours <= 0:
+        raise ValueError("Введите положительное число.")
+    S.set("review_bonus_hours", fmt_num(hours))
+    finish(message, f"✅ Бонус за отзыв: {fmt_num(hours)} ч.", "rev")
+
+
+# --- шаблоны --------------------------------------------------------------
+def act_template_edit(chat: Any, mid: Any, user: Any, key: str, back: str = "tpl") -> None:
+    info = TEMPLATES[key]
+    current = get_template(key)
+    shown = current if len(current) <= 3000 else current[:3000] + "…"
+    variables = "\n".join(f"<code>{{{name}}}</code> — {esc(desc)}" for name, desc in info["vars"].items())
+    ask(chat, user, f"📝 <b>{esc(info['title'])}</b>\n\nТекущий текст:\n<code>{esc(shown)}</code>\n\n"
+        f"Доступные переменные:\n{variables}\n\nОтправьте новый текст одним сообщением. HTML не поддерживается, "
+        "фигурные скобки используйте только для переменных.", "tpl", (key, back), back=back)
+
+
+def in_template(message: Any, text: str, data: Dict[str, Any]) -> None:
+    key, back = data["args"][0], data["args"][1]
+    raw = (message.text or "").strip()
+    if not raw:
+        raise ValueError("Текст не может быть пустым.")
+    S.set("tpl_" + key, raw)
+    reply = "✅ Сообщение сохранено."
+    problems = template_problems(key, raw)
+    if problems:
+        reply += ("\n⚠️ В тексте есть неизвестные переменные или лишние скобки: " + esc(", ".join(problems))
+                  + ". Пока это не исправлено, покупатель будет получать упрощённое стандартное сообщение.")
+    finish(message, reply, back)
+
+
+def reset_templates(keys: Tuple[str, ...]) -> None:
+    for key in keys:
+        S.ex("DELETE FROM settings WHERE key=?", ("tpl_" + key,))
+
+
+def menu_templates(chat: Any, mid: Any, user: Any) -> None:
+    text = ("📨 <b>Шаблоны сообщений</b>\n\nСообщения, которые бот автоматически отправляет покупателю.\n\n"
+            f"📝 После выдачи сервера: «{esc(short(get_template('post_payment'), 70))}»\n"
+            f"📝 Об истечении аренды: «{esc(short(get_template('post_expire'), 70))}»")
+    show(chat, text, kb_rows([B("📝 Сообщение после выдачи сервера", "te", "post_payment", "tpl")],
+                             [B("📝 Сообщение об истечении аренды", "te", "post_expire", "tpl")],
+                             [B("🔄 Сбросить шаблоны к стандартным", "tpl_reset")], [B("⬅️ Назад", "main")]), mid)
+
+
+def act_templates_reset(chat, mid, user):
+    reset_templates(MAIN_TEMPLATES)
+    say(chat, "✅ Шаблоны сброшены к стандартным.")
+    menu_templates(chat, mid, user)
+
+
+# --- друзья ---------------------------------------------------------------
+def default_limit_text() -> str:
+    value = S.get("friends_default_limit") or "0"
+    return "без ограничений" if value in ("0", "") else value
+
+
+def menu_friends(chat: Any, mid: Any, user: Any) -> None:
+    outdated = "!друзья" not in get_template("friend_invite")
+    paid_label = f"🟢 {fmt_num(S.get('paid_price'))} {currency_symbol()}" if S.flag("paid_active") else "🔴 выкл"
+    text = ("🤝 <b>Заявки в друзья</b>\n\n"
+            "Пользователи Roblox младше 13 лет не могут зайти на VIP-сервер по ссылке. После выдачи сервера бот присылает "
+            "покупателю приглашение со ссылкой на профиль владельца. Покупатель отправляет заявку в друзья и пишет "
+            "!друзья ник — бот принимает заявку и добавляет игрока на VIP-сервер. По окончании аренды добавленные "
+            "игроки удаляются.\n\n"
+            f"Статус: {on_off('friends_module_active')}\n"
+            f"Удаление по окончании: {'Вкл' if S.flag('friends_auto_remove') else 'Выкл'}\n"
+            f"Лимит по умолчанию: {default_limit_text()}\n\n"
+            f"📝 Приглашение: «{esc(short(get_template('friend_invite'), 60))}»\n"
+            f"📝 После добавления: «{esc(short(get_template('friend_added'), 60))}»\n"
+            f"📝 Не найдено: «{esc(short(get_template('friend_not_found'), 60))}»\n"
+            f"📝 Лимит: «{esc(short(get_template('friend_limit'), 60))}»")
+    rows = []
+    if outdated:
+        text = ("⚠️ <b>В приглашении нет команды !друзья</b> — похоже, остались старые тексты. Нажмите «Сбросить шаблоны».\n\n"
+                + text)
+        rows.append([B("🆕 Сбросить шаблоны (применить обновление)", "fr_reset")])
+    rows += [
+        [B(f"🔄 Переключить ({'Включено' if S.flag('friends_module_active') else 'Выключено'})", "fr_t")],
+        [B(f"🔄 Удаление по окончании ({'Вкл' if S.flag('friends_auto_remove') else 'Выкл'})", "fr_r")],
+        [B(f"🔢 Лимит по умолчанию ({default_limit_text()})", "fr_l")],
+        [B(f"💳 Платное добавление ({paid_label})", "pd")],
+        [B("📝 Сообщение-приглашение", "te", "friend_invite", "fr")],
+        [B("📝 Сообщение о добавлении", "te", "friend_added", "fr")],
+        [B("📝 Сообщение 'не найдено'", "te", "friend_not_found", "fr")],
+        [B("📝 Сообщение о лимите", "te", "friend_limit", "fr")],
+    ]
+    if not outdated:
+        rows.append([B("🔄 Сбросить шаблоны к стандартным", "fr_reset")])
+    rows.append([B("⬅️ Назад", "main")])
+    show(chat, text, kb_rows(*rows), mid)
+
+
+def act_friends_toggle(chat, mid, user):
+    toggle("friends_module_active")
+    menu_friends(chat, mid, user)
+
+
+def act_friends_autoremove(chat, mid, user):
+    toggle("friends_auto_remove")
+    menu_friends(chat, mid, user)
+
+
+def act_friends_reset(chat, mid, user):
+    reset_templates(FRIEND_TEMPLATES)
+    say(chat, "✅ Шаблоны заявок в друзья сброшены к стандартным.")
+    menu_friends(chat, mid, user)
+
+
+def act_friends_limit(chat, mid, user):
+    ask(chat, user, "🔢 Сколько игроков можно бесплатно добавить командой !друзья за одну аренду? "
+        "Введите целое число от 1 до 9999. <code>0</code> или <code>-</code> — без ограничений.", "fr_l", back="fr")
+
+
+def in_friends_limit(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if text in ("-", "0"):
+        S.set("friends_default_limit", "0")
+        finish(message, "✅ Лимит по умолчанию снят (без ограничений).", "fr")
+        return
+    if not re.fullmatch(r"\d{1,4}", text) or int(text) < 1:
+        raise ValueError("Введите целое число от 1 до 9999, 0 или - — без ограничений.")
+    S.set("friends_default_limit", str(int(text)))
+    finish(message, f"✅ Лимит по умолчанию: {int(text)}.", "fr")
+
+
+# --- платное добавление ---------------------------------------------------
+PAID_SETTINGS = [
+    ("paid_price", "💰 Цена за 1 добавление", "price"),
+    ("paid_lifetime", "⏳ Время жизни лота (мин)", "minutes"),
+    ("paid_node", "🗂 ID раздела FunPay (node)", "node"),
+    ("paid_game", "🎮 Поле «Игра»", "text"),
+    ("paid_game_name_ru", "🏷 Название игры (RU)", "text"),
+    ("paid_game_name_en", "🏷 Название игры (EN)", "text"),
+    ("paid_type", "📂 Поле «Тип»", "text"),
+    ("paid_title_ru", "📝 Название лота (RU)", "title"),
+    ("paid_title_en", "📝 Название лота (EN)", "title"),
+    ("paid_desc_ru", "📄 Описание лота (RU)", "text"),
+    ("paid_desc_en", "📄 Описание лота (EN)", "text"),
+    ("paid_pay_msg_ru", "✉️ Сообщение после оплаты (RU)", "text"),
+    ("paid_pay_msg_en", "✉️ Сообщение после оплаты (EN)", "text"),
+]
+PAID_KEYS = {key: (label, kind) for key, label, kind in PAID_SETTINGS}
+
+
+def menu_paid(chat: Any, mid: Any, user: Any) -> None:
+    active = S.val("SELECT COUNT(*) FROM friend_lots WHERE state='active'")
+    text = ("💳 <b>Платное добавление в друзья</b>\n\n"
+            "Когда бесплатный лимит друзей для аренды исчерпан, бот по команде !друзья ник создаёт на FunPay временный "
+            "лот для доплаты, а после оплаты начисляет добавления и сразу добавляет друга. К названию и описанию лота "
+            "добавляется тег #FRXXXXX — по нему бот узнаёт оплату.\n\n"
+            f"Статус: {on_off('paid_active')}\n"
+            f"Цена за 1 добавление: {fmt_num(S.get('paid_price'))} {currency_symbol()}\n"
+            f"Время жизни лота: {esc(S.get('paid_lifetime'))} мин\n"
+            f"Раздел FunPay: {esc(S.get('paid_node'))}\n"
+            f"Поле «Игра»: {esc(S.get('paid_game'))} · «Тип»: {esc(S.get('paid_type'))}\n"
+            f"Название RU: {esc(short(S.get('paid_title_ru'), 60))}\n"
+            f"Название EN: {esc(short(S.get('paid_title_en'), 60))}\n"
+            f"Активных лотов доплаты сейчас: {active}")
+    if S.get("friends_default_limit") in ("0", ""):
+        text += ("\n\n⚠️ Лимит друзей по умолчанию не задан (без ограничений) — платное добавление сработает только для "
+                 "лотов, у которых в карточке указан свой лимит. Задайте его в 🤝 Заявки в друзья → 🔢 Лимит по умолчанию.")
+    rows = [[B("🔄 Выключить" if S.flag("paid_active") else "🔄 Включить", "pd_t")]]
+    settings = [B(label, "pd_s", key) for key, label, _ in PAID_SETTINGS]
+    rows += [settings[0:1], settings[1:2], settings[2:3], settings[3:4], settings[4:6], settings[6:7], settings[7:9],
+             settings[9:11], settings[11:13]]
+    rows += [[B("💬 Лимит исчерпан (после добавления)", "te", "paid_limit_reached", "pd")],
+             [B("💬 Лот создан", "te", "paid_lot_created", "pd"), B("💬 Лот уже есть", "te", "paid_lot_exists", "pd")],
+             [B("💬 Оплата получена", "te", "paid_received", "pd")],
+             [B("♻️ Сбросить тексты к стандартным", "pd_reset")],
+             [B("🗑 Удалить все активные лоты доплаты", "pd_del")],
+             [B("⬅️ Назад", "fr")]]
+    show(chat, text, kb_rows(*rows), mid)
+
+
+def act_paid_toggle(chat, mid, user):
+    toggle("paid_active")
+    menu_paid(chat, mid, user)
+
+
+def act_paid_setting(chat: Any, mid: Any, user: Any, key: str) -> None:
+    label, kind = PAID_KEYS[key]
+    hints = {"price": "Введите цену числом больше 0 (в валюте аккаунта FunPay).",
+             "minutes": "Введите число минут от 1 до 1440.",
+             "node": "Введите ID раздела FunPay (число из ссылки вида https://funpay.com/lots/402/).",
+             "title": "Введите название. Тег #FRXXXXX добавится автоматически; длиннее ~58 символов будет обрезано.",
+             "text": "Введите текст."}
+    current = S.get(key)
+    ask(chat, user, f"{esc(label)}\n\nСейчас: <code>{esc(current[:1500])}</code>\n\n{hints[kind]}", "pd_s", (key,), back="pd")
+
+
+def in_paid_setting(message: Any, text: str, data: Dict[str, Any]) -> None:
+    key = data["args"][0]
+    label, kind = PAID_KEYS[key]
+    raw = (message.text or "").strip()
+    reply = "✅ Сохранено."
+    if kind == "price":
+        try:
+            value = parse_number(raw)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            raise ValueError("Цена должна быть больше 0.")
+        raw = fmt_num(value)
+    elif kind == "minutes":
+        if not re.fullmatch(r"\d{1,4}", raw) or not 1 <= int(raw) <= 1440:
+            raise ValueError("Введите целое число от 1 до 1440.")
+    elif kind == "node":
+        if not re.fullmatch(r"\d{1,8}", raw):
+            raise ValueError("ID раздела должен быть числом.")
+    else:
+        if not raw:
+            raise ValueError("Текст не может быть пустым.")
+        if kind == "title" and len(raw) > 58:
+            reply += "\n⚠️ Название длиннее 58 символов — вместе с тегом оно будет обрезано до ~70 символов."
+    S.set(key, raw)
+    finish(message, reply, "pd")
+
+
+def act_paid_reset(chat, mid, user):
+    for key, value in PAID_TEXT_DEFAULTS.items():
+        S.set(key, value)
+    reset_templates(PAID_TEMPLATES)
+    say(chat, "✅ Тексты платного добавления сброшены к стандартным.")
+    menu_paid(chat, mid, user)
+
+
+def act_paid_delete_all(chat: Any, mid: Any, user: Any) -> None:
+    lots = S.q("SELECT * FROM friend_lots WHERE state='active'")
+
+    def job() -> None:
+        deleted = sum(1 for lot in lots if remove_friend_lot(lot))
+        say(chat, f"🗑 Удалено лотов доплаты: {deleted} из {len(lots)}.")
+    if not lots:
+        say(chat, "ℹ️ Активных лотов доплаты нет.")
+    elif not run_once("paid_delete_all", job):
+        say(chat, "⏳ Удаление уже выполняется.")
+    else:
+        say(chat, f"⏳ Удаляю лоты доплаты: {len(lots)}…")
+
+
+# ---------------------------------------------------------------------------
+# Маршруты и обработчики Telegram
+# ---------------------------------------------------------------------------
+ROUTES = {
+    "main": menu_main, "mode": act_mode, "lotmgmt": act_lot_management, "proxy": act_proxy,
+    "acc": menu_accounts, "acc_add": act_account_add, "acc_del": act_account_delete,
+    "srv": menu_servers, "srv_add": act_server_add, "srv_del": act_server_delete,
+    "cats": menu_categories, "cat": menu_category, "cat_add": act_category_add, "cs_add": act_category_servers_add,
+    "cs_del": act_category_server_delete, "cat_game": act_category_game, "cat_ren": act_category_rename,
+    "cat_del": act_category_delete,
+    "lots": menu_lots, "lot": menu_lot, "lot_add": act_lot_add,
+    "lh": _lot_input("lh", "⏰ Введите количество часов аренды за 1 шт. (целое или дробное, точка или запятая)."),
+    "ls": _lot_input("ls", "🖥️ Введите ID сервера, который нужно выдавать при покупке этого лота. "
+                           "Отправьте <code>-</code>, чтобы снять привязку одного сервера."),
+    "lpn": _lot_input("lpn", "💰 Введите обычную цену лота (число)."),
+    "lpe": _lot_input("lpe", "🎉 Введите евент цену лота (число)."),
+    "lf": _lot_input("lf", "👥 Сколько игроков покупатель может бесплатно добавить за одну аренду по этому лоту? "
+                           "Число от 1 до 9999, <code>0</code> — без ограничений, <code>-</code> — по умолчанию."),
+    "lc": menu_lot_category, "lcb": act_lot_bind_category, "lcu": act_lot_unbind_category,
+    "lr": act_lot_refresh, "ld": act_lot_delete,
+    "rents": menu_rentals, "rent": menu_rental, "re": act_rent_end, "rq": act_rent_quiet, "rc": act_rent_cancel,
+    "rx": act_rent_extend, "rr": act_rent_retry,
+    "bon": menu_bonuses, "bon_t": act_bonus_toggle, "bon_a": act_bonus_add,
+    "bon_el": lambda c, m, u: menu_bonus_pick(c, m, u, "edit"), "bon_dl": lambda c, m, u: menu_bonus_pick(c, m, u, "delete"),
+    "bon_e": act_bonus_edit, "bon_d": act_bonus_delete,
+    "stats": menu_stats, "hist": menu_history,
+    "rev": menu_reviews, "rev_t": act_review_toggle, "rev_h": act_review_hours,
+    "tpl": menu_templates, "tpl_reset": act_templates_reset, "te": act_template_edit,
+    "fr": menu_friends, "fr_t": act_friends_toggle, "fr_r": act_friends_autoremove, "fr_l": act_friends_limit,
+    "fr_reset": act_friends_reset,
+    "pd": menu_paid, "pd_t": act_paid_toggle, "pd_s": act_paid_setting, "pd_reset": act_paid_reset,
+    "pd_del": act_paid_delete_all,
+}
+
+INPUTS = {
+    "proxy": in_proxy, "acc_add": in_account_add, "srv_add": in_server_add, "cat_add": in_category_add,
+    "cs_add": in_category_servers_add, "cat_game": in_category_game, "cat_ren": in_category_rename,
+    "lot_add": in_lot_add, "lot_add2": in_lot_add2, "lh": in_lot_value, "ls": in_lot_value, "lpn": in_lot_value,
+    "lpe": in_lot_value, "lf": in_lot_value, "rx": in_rent_extend, "bon_a": in_bonus, "bon_e": in_bonus,
+    "rev_h": in_review_hours, "tpl": in_template, "fr_l": in_friends_limit, "pd_s": in_paid_setting,
+}
+
+
+def on_callback(call: Any) -> None:
+    chat, mid, user = call.message.chat.id, call.message.message_id, call.from_user.id
+    if not is_admin(user):
+        bot().answer_callback_query(call.id, "Нет доступа", show_alert=True)
+        return
+    try:
+        bot().answer_callback_query(call.id)
+    except Exception:
+        pass
+    parts = call.data.split(":")[1:]
+    try:
+        if parts[0] == "x":  # отмена ввода → возврат в меню
+            clear_input(chat, user, False)
+            parts = parts[1:]
+        else:
+            clear_input(chat, user, False)
+        handler = ROUTES.get(parts[0])
+        if handler is None:
+            raise ValueError("Неизвестное действие. Откройте /vip_config заново.")
+        handler(chat, mid, user, *parts[1:])
+    except ValueError as exc:
+        say(chat, "❌ " + esc(exc))
+    except Exception:
+        LOG.exception("AutoVIP: ошибка действия в Telegram")
+        say(chat, "❌ Не удалось выполнить действие. Подробности — в логе Cardinal.")
+
+
+def on_input(message: Any) -> None:
+    state = input_state(message)
+    if not state or not is_admin(message.from_user.id):
+        return
+    data = state.get("data") or {}
+    handler = INPUTS.get(data.get("action"))
+    if handler is None:
+        clear_input(message.chat.id, message.from_user.id, False)
+        return
+    try:
+        handler(message, (message.text or "").strip(), data)
+    except ValueError as exc:
+        text = str(exc)
+        bot().reply_to(message, esc(text) if text.startswith(("⚠️", "❌")) else "❌ " + esc(text), parse_mode="HTML")
+    except Exception:
+        LOG.exception("AutoVIP: ошибка обработки ввода")
+        bot().reply_to(message, "❌ Не удалось выполнить действие. Подробности — в логе Cardinal.")
+
+
+def on_panel_command(message: Any) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    clear_input(message.chat.id, message.from_user.id, False)
+    menu_main(message.chat.id, None, message.from_user.id)
+
+
+def on_plugin_settings(call: Any) -> None:
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        bot().answer_callback_query(call.id)
+    except Exception:
+        pass
+    menu_main(call.message.chat.id, call.message.message_id, call.from_user.id)
+
+
+def init_telegram(cardinal: Any) -> None:
+    tg = getattr(cardinal, "telegram", None)
+    if not tg:
+        return
+    tg.msg_handler(on_panel_command, commands=["vip_config"])
+    tg.cbq_handler(on_callback, lambda c: bool(c.data) and c.data.startswith(P + ":"))
+    if CBT is not None and hasattr(CBT, "PLUGIN_SETTINGS"):
+        tg.cbq_handler(on_plugin_settings,
+                       lambda c: bool(c.data) and c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
+    tg.msg_handler(on_input, func=lambda m: bool(getattr(m, "text", None)) and not m.text.startswith("/")
+                   and input_state(m) is not None)
+    try:
+        cardinal.add_telegram_commands(UUID, [("vip_config", "панель Auto VIP Roblox", True)])
+    except Exception:
+        LOG.debug("AutoVIP: add_telegram_commands", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Привязка к Cardinal
+# ---------------------------------------------------------------------------
+def init_plugin(cardinal: Any) -> None:
+    global S, CARDINAL
+    CARDINAL = cardinal
+    if S is None:
+        S = Store(DB_PATH)
+        report = migrate_old_database(S, OLD_DB_PATH)
+        if report:
+            LOG.info("AutoVIP: %s", report)
+            S.set("migration_report", report)
+    init_telegram(cardinal)
+    LOG.info("Auto VIP Roblox v%s инициализирован", VERSION)
+
+
+def start_plugin(cardinal: Any) -> None:
+    if S is None:
+        init_plugin(cardinal)
+    STOP.clear()
+    with GUARD:
+        if any(t.is_alive() for t in THREADS):
+            return
+        THREADS[:] = [threading.Thread(target=worker_loop, name="AutoVIP-worker", daemon=True),
+                      threading.Thread(target=order_loop, name="AutoVIP-orders", daemon=True)]
+        for thread in THREADS:
+            thread.start()
+    interrupted = S.q("SELECT order_id FROM processed_orders WHERE kind='processing'")
+    for row in interrupted:
+        S.ex("UPDATE processed_orders SET kind='interrupted' WHERE order_id=?", (row["order_id"],))
+        if not S.q1("SELECT 1 FROM rentals WHERE order_id=?", (row["order_id"],)):
+            notify_admins(f"⚠️ Обработка заказа #{esc(row['order_id'])} была прервана перезапуском. "
+                          "Проверьте заказ и при необходимости выдайте сервер вручную.")
+    report = S.get("migration_report", "")
+    if report:
+        notify_admins("🎮 Auto VIP Roblox v" + VERSION + "\n" + esc(report)
+                      + "\nОткройте /vip_config и проверьте аккаунты, серверы и лоты.")
+        S.set("migration_report", "")
+    request_lot_sync()
+
+
+def delete_plugin(cardinal: Any, *args: Any) -> None:
+    STOP.set()
+
+
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_POST_START = [start_plugin]
+BIND_TO_NEW_ORDER = [on_new_order]
+BIND_TO_NEW_MESSAGE = [on_new_message]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [on_last_chat_message_changed]
+BIND_TO_DELETE = delete_plugin
