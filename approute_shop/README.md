@@ -1,4 +1,4 @@
-# AppRoute Shop (Auto) 1.0.0 — плагин для FunPay Cardinal
+# AppRoute Shop (Auto) 1.0.1 — плагин для FunPay Cardinal
 
 Автопродажа готовых цифровых товаров магазина AppRoute (approute.ru / approute.io): подарочные карты и ваучеры,
 коды пополнения, ключи активации и туристические eSIM. После оплаты на FunPay бот покупает номинал у поставщика
@@ -8,6 +8,14 @@
 Автор: [@LuckyFunPay_Support](https://t.me/LuckyFunPay_Support) · канал [@LuckyFunPay](https://t.me/LuckyFunPay)
 
 Файл для установки: `AppRoute_LuckyFunpay.py`. Вся инструкция есть и в самом плагине: кнопка «📖 Инструкция» в панели.
+
+## 1.0.1
+
+- Исправлено: на части сборок Cardinal команда `/approute_shop` не отвечала, а кнопка «⚙️ Настройки» показывала
+  `47:…:0`. Теперь панель регистрируется, как только у Cardinal готов Telegram-бот: при PRE_INIT, POST_INIT или запуске.
+- Если плагин не смог открыть базу, `/approute_shop` и «Настройки» сообщают причину. Ошибка с подробностями пишется
+  в консоль и в `logs/log.log`.
+- После успешного запуска в консоли появляется строка «AppRoute Shop (Auto): панель зарегистрирована, команда /approute_shop».
 
 ## Установка
 
@@ -95,7 +103,7 @@ pip install pytest beautifulsoup4
 python -m pytest approute_shop/tests
 ```
 
-65 сценариев с поддельными FunPay, AppRoute и Telegram:
+67 сценариев с поддельными FunPay, AppRoute и Telegram:
 
 - выдача кодов и eSIM;
 - скрытые коды;

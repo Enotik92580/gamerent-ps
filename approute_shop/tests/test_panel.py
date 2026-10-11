@@ -228,3 +228,43 @@ def test_region_change_blocked_during_purchase(ui):
 def test_delete_lot_is_immediate(ui):
     ui.panel.dispatch(10, 10, ("delete_lot", "100"))
     assert ui.env.store.get("lot", "100") is None and "Привязанные лоты" in ui.bot.messages[-1]
+
+
+class FakeTG:
+    def __init__(self, bot):
+        self.bot, self.authorized_users, self.msg, self.cbq = bot, [10], [], []
+
+    def msg_handler(self, handler, **kwargs):
+        self.msg.append((handler, kwargs))
+
+    def cbq_handler(self, handler, func, **kwargs):
+        self.cbq.append((handler, func))
+
+
+def test_panel_registers_when_telegram_appears_after_pre_init(env, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for name, value in (("SHOP", None), ("STARTUP_ERROR", ""), ("UI_REGISTERED", False)):
+        monkeypatch.setattr(P, name, value)
+    cardinal = SimpleNamespace(account=env.account, plugins={}, telegram=None, add_telegram_commands=lambda *a: None)
+    P.init(cardinal)
+    assert P.SHOP is not None and not P.UI_REGISTERED
+    cardinal.telegram = FakeTG(Bot())
+    P.init(cardinal)  # POST_INIT
+    assert P.UI_REGISTERED and any(k.get("commands") == ["approute_shop"] for _, k in cardinal.telegram.msg)
+    settings = [f for _, f in cardinal.telegram.cbq if f(SimpleNamespace(data=f"plugin_settings:{P.UUID}:0"))]
+    assert settings
+
+
+def test_storage_error_still_answers_command(env, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "storage").mkdir()
+    (tmp_path / "storage" / "plugins").write_text("")
+    for name, value in (("SHOP", None), ("STARTUP_ERROR", ""), ("UI_REGISTERED", False)):
+        monkeypatch.setattr(P, name, value)
+    bot = Bot()
+    cardinal = SimpleNamespace(account=env.account, plugins={}, telegram=FakeTG(bot), add_telegram_commands=lambda *a: None)
+    P.init(cardinal)
+    assert P.SHOP is None and P.STARTUP_ERROR
+    handler = next(h for h, k in cardinal.telegram.msg if k.get("commands") == ["approute_shop"])
+    handler(SimpleNamespace(chat=SimpleNamespace(id=10)))
+    assert "не запустился" in bot.messages[-1]

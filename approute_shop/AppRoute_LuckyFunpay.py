@@ -49,7 +49,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 NAME = "AppRoute Shop (Auto)"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Автопродажа кодов, гифт-карт и eSIM из магазина AppRoute • /approute_shop"
 CREDITS = "@LuckyFunPay_Support"
 UUID = "d1eb44d6-c72b-48ed-8ee3-c5ca58ea9413"
@@ -1055,6 +1055,8 @@ class Shop:
             return
         # Prevent two processes from using one purchase journal.
         STORAGE.mkdir(parents=True, exist_ok=True)
+        if self.instance_lock is not None:
+            self.instance_lock.close()
         self.instance_lock = (STORAGE / "worker.lock").open("a+b")
         try:
             if os.name == "nt":
@@ -1920,7 +1922,8 @@ class TelegramUI:
 
     def allowed(self, user):
         users = getattr(self.tg, "authorized_users", {}) or {}
-        return (int(user.id) in users or str(user.id) in users) and self.shop.active()
+        plugin = getattr(self.shop.cardinal, "plugins", {}).get(UUID)
+        return (int(user.id) in users or str(user.id) in users) and getattr(plugin, "enabled", True)
 
     def markup(self, rows):
         kb = self.Markup()
@@ -1960,6 +1963,11 @@ class TelegramUI:
             return CBT
         except Exception:
             return None
+
+    @classmethod
+    def settings_prefix(cls):
+        """Callback of Cardinal's «⚙️ Настройки» button on the plugin card: 47:UUID:offset."""
+        return f"{getattr(cls.cbt(), 'PLUGIN_SETTINGS', None) or '47'}:{UUID}"
 
     def plugins_button(self):
         cbt = self.cbt()
@@ -2628,16 +2636,16 @@ class TelegramUI:
         self.tg.msg_handler(self.command, commands=[COMMAND])
         self.tg.msg_handler(self.message, func=self.has_input, content_types=["text"])
         self.tg.cbq_handler(self.callback, lambda c: bool(c.data) and c.data.startswith(PREFIX))
-        cbt = self.cbt()
-        if cbt is not None and getattr(cbt, "PLUGIN_SETTINGS", None):
-            def settings_callback(call):
-                if call.message and self.allowed(call.from_user):
-                    try:
-                        self.bot.answer_callback_query(call.id)
-                    except Exception:
-                        pass
-                    self.plugin_card(call.message.chat.id, call.message.message_id)
-            self.tg.cbq_handler(settings_callback, lambda c: bool(c.data) and c.data.startswith(f"{cbt.PLUGIN_SETTINGS}:{UUID}"))
+        prefix = self.settings_prefix()
+
+        def settings_callback(call):
+            if call.message and self.allowed(call.from_user):
+                try:
+                    self.bot.answer_callback_query(call.id)
+                except Exception:
+                    pass
+                self.plugin_card(call.message.chat.id, call.message.message_id)
+        self.tg.cbq_handler(settings_callback, lambda c: bool(c.data) and c.data.startswith(prefix))
         try:
             self.shop.cardinal.add_telegram_commands(UUID, [(COMMAND, "🛒 AppRoute Shop — панель", True)])
         except Exception:
@@ -2645,26 +2653,71 @@ class TelegramUI:
 
 
 SHOP = None
+STARTUP_ERROR = ""
+UI_REGISTERED = False
+
+
+def register_fallback(cardinal):
+    """The storage did not open: the command and the plugin card still explain why."""
+    tg = cardinal.telegram
+
+    def reply(chat):
+        text = (f"⛔ <b>{NAME}</b> не запустился.\n\n{esc(STARTUP_ERROR)}\n\n"
+                f"Исправьте причину и перезапустите бота: /restart. Подробности — в консоли и logs/log.log.")
+        tg.bot.send_message(chat, text, parse_mode="HTML")
+
+    tg.msg_handler(lambda m: reply(m.chat.id), commands=[COMMAND])
+    prefix = TelegramUI.settings_prefix()
+
+    def settings(call):
+        try:
+            tg.bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        reply(call.message.chat.id)
+    tg.cbq_handler(settings, lambda c: bool(c.data) and c.data.startswith(prefix))
+
+
+def register_ui(cardinal):
+    """Idempotent: tried at PRE_INIT, POST_INIT and POST_START, whichever first has Telegram."""
+    global UI_REGISTERED
+    if UI_REGISTERED or not getattr(cardinal, "telegram", None):
+        return
+    UI_REGISTERED = True
+    try:
+        if SHOP is None:
+            register_fallback(cardinal)
+            return
+        SHOP.ui = TelegramUI(SHOP)
+        SHOP.ui.register()
+        LOG.info("%s: панель зарегистрирована, команда /%s", NAME, COMMAND)
+    except Exception:
+        LOG.error("%s: не удалось зарегистрировать панель Telegram", NAME, exc_info=True)
 
 
 def init(cardinal, *args):
-    global SHOP
-    if SHOP is not None:
-        return
-    SHOP = Shop(cardinal)
-    if getattr(cardinal, "telegram", None):
-        SHOP.ui = TelegramUI(SHOP)
-        SHOP.ui.register()
-    LOG.info("%s v%s initialized. Author: %s", NAME, VERSION, CREDITS)
+    global SHOP, STARTUP_ERROR
+    if SHOP is None and not STARTUP_ERROR:
+        try:
+            SHOP = Shop(cardinal)
+            LOG.info("%s v%s initialized. Author: %s", NAME, VERSION, CREDITS)
+        except Exception as exc:
+            STARTUP_ERROR = (str(exc) or exc.__class__.__name__)[:500]
+            LOG.error("%s: ошибка запуска: %s", NAME, STARTUP_ERROR, exc_info=True)
+    register_ui(cardinal)
 
 
 def start(cardinal, *args):
+    init(cardinal)
     if SHOP is None:
-        init(cardinal)
+        return
+    SHOP.stop_event.clear()
     try:
         SHOP.start()
-    except ShopError as exc:
-        LOG.error("AppRoute Shop: %s", exc)
+    except Exception as exc:
+        LOG.error("%s: фоновая обработка не запущена: %s", NAME, exc, exc_info=not isinstance(exc, ShopError))
+        if SHOP.ui is not None:
+            SHOP.notify(f"⛔ <b>{NAME}</b>: фоновая обработка заказов не запущена.\n{esc(exc)}", force=True)
 
 
 def stop(cardinal, *args):
@@ -2706,6 +2759,7 @@ def delete(cardinal, *args):
 
 
 BIND_TO_PRE_INIT = [init]
+BIND_TO_POST_INIT = [init]
 BIND_TO_POST_START = [start]
 BIND_TO_PRE_STOP = [stop]
 BIND_TO_NEW_ORDER = [new_order]
