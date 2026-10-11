@@ -28,7 +28,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 NAME = "AppRoute Top-Up"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Прямые пополнения AppRoute • /approute_topup"
 CREDITS = "@LuckyFunPay_Support"
 UUID = "24c22120-5c0d-4e3f-994c-1b758263a3b7"
@@ -78,11 +78,33 @@ class RateLimitError(APIError):
                      f"Пауза ещё {seconds} сек. Плагин продолжит автоматически; повторно нажимать обновление не нужно.",)
 
 
+class PacerBlocked(RateLimitError):
+    """A saved provider cooldown stopped the call before any HTTP request was sent."""
+
+
 class RequestDeferred(ShopError):
     """Local scheduling, before any HTTP request; keep the worker available."""
     def __init__(self, retry_at):
         self.retry_at = retry_at
         super().__init__("Ожидание интервала запросов AppRoute. Продолжение запланировано автоматически.")
+
+
+class TransientError(ShopError):
+    """Network/FunPay/5xx failure: retried with backoff instead of manual review."""
+
+
+class GuardError(ShopError):
+    """The amount or price guard stopped an order before any payment."""
+
+
+class FormError(ShopError):
+    """The provider form is unknown; payments are blocked until it is known."""
+
+
+def is_transient(exc):
+    if isinstance(exc, TransientError):
+        return True
+    return isinstance(exc, APIError) and not isinstance(exc, RateLimitError) and (not exc.status or exc.status >= 500)
 
 
 def retry_after_seconds(value, now, fallback=65):
@@ -168,7 +190,7 @@ class RequestPacer:
                     self.store.patch("rate", key, **changes)
                     state.update(changes)
                 if state.get("blocked_until", 0) > now:
-                    raise RateLimitError(state["blocked_until"], now=now)
+                    raise PacerBlocked(state["blocked_until"], now=now)
                 gap = state.get("limit_gaps", {}).get(bucket, self.GAPS[bucket])
                 deadline = max(state.get("next_any", 0), state.get("next_" + bucket, 0),
                                state.get("last_" + bucket, -gap) + gap)
@@ -257,6 +279,44 @@ def lot_id_from_text(value):
     raise ShopError("Отправьте ID лота или ссылку https://funpay.com/lots/offer?id=12345678.")
 
 
+def order_id_from_text(value):
+    value = str(value or "").strip().lstrip("#")
+    p = urlparse(value)
+    if p.hostname == "funpay.com":
+        parts = [x for x in p.path.split("/") if x]
+        value = parts[1] if len(parts) >= 2 and parts[0] == "orders" else ""
+    if not re.fullmatch(r"[A-Za-z0-9]{4,40}", value):
+        raise ShopError("Отправьте номер заказа FunPay (например, ABCD1234) или ссылку на заказ.")
+    return value.upper()
+
+
+def chat_for(seller_id, buyer_id):
+    """FunPay private chat name; numeric node ids are mapped to this form."""
+    try:
+        pair = sorted((int(seller_id), int(buyer_id)))
+    except (TypeError, ValueError):
+        return ""
+    return f"users-{pair[0]}-{pair[1]}"
+
+
+def order_attr_values(order):
+    """Order parameters across FunPayAPI versions: fields, lot_params, buyer_params."""
+    result = []
+    for name in ("fields", "lot_params", "buyer_params"):
+        raw = getattr(order, name, None)
+        if not raw:
+            continue
+        pairs = raw.items() if isinstance(raw, dict) else raw
+        for entry in pairs:
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                key, value = entry
+            else:
+                continue
+            value = getattr(value, "value", value)
+            result.append((str(key), value))
+    return result
+
+
 def calculate_price(cost, settings):
     price = dec(cost) * dec(settings["rate"]) * (1 + dec(settings["markup"]) / 100)
     return money(max(dec(settings["min_price"]), min(dec(settings["max_price"]), price)))
@@ -272,10 +332,31 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS records (kind TEXT, id TEXT, data TEXT NOT NULL, PRIMARY KEY(kind,id))")
+        # 1.1: indexed copies of hot fields, so the worker does not parse the whole journal every second.
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(records)")}
+        for name, kind in (("state", "TEXT"), ("due", "REAL"), ("chat", "TEXT"), ("outbox", "INTEGER")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE records ADD COLUMN {name} {kind}")
+        self.db.execute("CREATE INDEX IF NOT EXISTS records_state ON records(kind, state)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS records_chat ON records(kind, chat)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS records_due ON records(kind, due)")
         self.db.commit()
+        if "state" not in columns:
+            with self.lock, self.db:
+                for kind, key, data in self.db.execute("SELECT kind, id, data FROM records WHERE kind IN ('order','seen')").fetchall():
+                    self.db.execute("UPDATE records SET state=?, due=?, chat=?, outbox=? WHERE kind=? AND id=?",
+                                    (*self.columns(kind, json.loads(data)), kind, key))
         if os.name != "nt":
             os.chmod(path.parent, 0o700)
             os.chmod(path, 0o600)
+
+    @staticmethod
+    def columns(kind, value):
+        if kind == "order":
+            return value.get("state"), value.get("next_at", 0), value.get("chat"), int(bool(value.get("outbox")))
+        if kind == "seen":
+            return None, value.get("at", 0), None, 0
+        return None, None, None, 0
 
     def get(self, kind, key, default=None):
         with self.lock:
@@ -284,7 +365,35 @@ class Store:
 
     def put(self, kind, key, value):
         with self.lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?)", (kind, str(key), json.dumps(value, ensure_ascii=False)))
+            self.db.execute("INSERT OR REPLACE INTO records (kind, id, data, state, due, chat, outbox) VALUES (?,?,?,?,?,?,?)",
+                            (kind, str(key), json.dumps(value, ensure_ascii=False), *self.columns(kind, value)))
+
+    def query(self, where, params=()):
+        with self.lock:
+            return [json.loads(r[0]) for r in self.db.execute("SELECT data FROM records WHERE kind='order' AND " + where, params).fetchall()]
+
+    def due_orders(self, now, states):
+        marks = ",".join("?" * len(states))
+        return sorted(self.query(f"(outbox=1 OR state IN ({marks})) AND COALESCE(due, 0) <= ?", (*states, now)),
+                      key=lambda r: r["created"])
+
+    def orders_in(self, states, chats=None):
+        marks = ",".join("?" * len(states))
+        if chats is None:
+            return self.query(f"state IN ({marks})", tuple(states))
+        chats = [c for c in chats if c]
+        if not chats:
+            return []
+        cmarks = ",".join("?" * len(chats))
+        return self.query(f"state IN ({marks}) AND chat IN ({cmarks})", (*states, *chats))
+
+    def count_states(self):
+        with self.lock:
+            return dict(self.db.execute("SELECT state, COUNT(*) FROM records WHERE kind='order' GROUP BY state").fetchall())
+
+    def prune(self, kind, before):
+        with self.lock, self.db:
+            return self.db.execute("DELETE FROM records WHERE kind=? AND COALESCE(due, 0) < ?", (kind, before)).rowcount
 
     def patch(self, kind, key, **changes):
         with self.lock:
@@ -307,26 +416,30 @@ class Store:
     def configure(self, **changes):
         return self.patch("settings", "main", **changes)
 
-    def enqueue(self, oid):
+    def enqueue(self, oid, chat="", buyer_id=""):
         if not re.fullmatch(r"[A-Za-z0-9-]{1,40}", str(oid)):
             raise ShopError("Некорректный номер заказа FunPay.")
         with self.lock, self.db:
             data = {"id": str(oid), "state": "queued", "created": time.time(), "next_at": 0, "attempts": 0}
-            return self.db.execute("INSERT OR IGNORE INTO records VALUES ('order',?,?)", (str(oid), json.dumps(data))).rowcount == 1
+            if chat:
+                # Known before the dialog starts, so early buyer messages are not lost.
+                data.update(chat=chat, buyer_id=str(buyer_id))
+            return self.db.execute("INSERT OR IGNORE INTO records (kind, id, data, state, due, chat, outbox) VALUES ('order',?,?,?,?,?,?)",
+                                   (str(oid), json.dumps(data), *self.columns("order", data))).rowcount == 1
 
 
 
 def match_lot(order, lots, diagnostics=None):
     """No fuzzy matching for spending. Every configured condition must match."""
     sub = getattr(getattr(order, "subcategory", None), "id", None)
-    text = [getattr(order, "short_description", "") or "", getattr(order, "description", "") or ""]
+    text = [getattr(order, "short_description", "") or "", getattr(order, "description", "") or "",
+            getattr(order, "full_description", "") or "", getattr(order, "title", "") or ""]
     fields = {}
-    for key, field in (getattr(order, "fields", {}) or {}).items():
-        value = getattr(field, "value", field)
+    for key, value in order_attr_values(order):
         values = list(value.values()) if isinstance(value, dict) else [value]
-        fields[str(key)] = [normalized(v) for v in values if v is not None]
+        fields.setdefault(str(key), []).extend(normalized(v) for v in values if v is not None)
         if str(key) not in {"desc", "payment_msg", "images"}:
-            text.extend(str(v) for v in values)
+            text.extend(str(v) for v in values if v is not None)
     for key in ("server", "side"):
         obj = getattr(order, key, None)
         if obj is not None:
@@ -338,7 +451,7 @@ def match_lot(order, lots, diagnostics=None):
     for lot in lots:
         if not lot.get("item_id") or not lot.get("enabled", True):
             continue
-        if lot.get("subcategory") and str(sub) != str(lot["subcategory"]):
+        if lot.get("subcategory") and sub is not None and str(sub) != str(lot["subcategory"]):
             continue
         if direct:
             if str(direct) == lot["id"]:
@@ -353,10 +466,17 @@ def match_lot(order, lots, diagnostics=None):
         for condition in conditions:
             if "=" in condition:
                 key, value = condition.split("=", 1)
-                if normalized(value) not in fields.get(key.strip(), []):
+                if key.strip() in fields:
+                    ok = normalized(value) in fields[key.strip()]
+                else:
+                    # Order pages without machine keys (lot_params) carry the same value as text.
+                    ok = has_phrase(haystack, value)
+                if not ok:
                     failed.append(f"поле {key.strip()[:40]}={value[:70]}")
             else:
-                if not has_phrase(haystack, condition):
+                # "a / b" alternatives only in conditions typed by the seller; FunPay titles often contain "/".
+                variants = [condition] + ([v for v in condition.split("/") if v.strip()] if lot.get("conditions_manual") else [])
+                if not any(has_phrase(haystack, variant) for variant in variants):
                     failed.append(f"фраза «{condition[:100]}»")
         if not failed:
             candidates.append(lot)
@@ -441,9 +561,11 @@ class AppRouteAPI:
             return data["data"]
         except ShopError:
             raise
-        except Exception:
+        except Exception as exc:
             # requests exceptions can contain proxy passwords or request URLs.
-            raise ShopError("Сетевая ошибка AppRoute. Проверьте ключ, IP и прокси. Статус закупки будет уточнён.") from None
+            if "socks" in str(self.proxies.get("https", "")).lower() and "Missing dependencies for SOCKS" in str(exc):
+                raise TransientError("Для socks-прокси установите пакет PySocks: pip install pysocks.") from None
+            raise TransientError("Сетевая ошибка AppRoute. Проверьте ключ, IP и прокси. Статус закупки будет уточнён.") from None
         finally:
             if session is not None:
                 session.close()
@@ -466,10 +588,13 @@ class AppRouteAPI:
 
     def balance(self):
         data = self.request("GET", "/accounts")
-        values = [i for i in data.get("items", []) if i.get("currency") == "USD"]
-        if len(values) != 1 or "available" not in values[0]:
-            raise ShopError("В ответе AppRoute отсутствует доступный баланс USD.")
-        return dec(values[0]["available"])
+        items = [i for i in data.get("items", []) if isinstance(i, dict)]
+        # The API labels the account USD; some cabinets report USDT. Never sum both.
+        for code in ("USD", "USDT"):
+            values = [i for i in items if str(i.get("currency", "")).upper() == code]
+            if len(values) == 1 and "available" in values[0]:
+                return dec(values[0]["available"])
+        raise ShopError("В ответе AppRoute отсутствует доступный баланс USD/USDT.")
 
     def catalog(self, checkpoint=None, on_page=None):
         progress = copy.deepcopy(checkpoint or {"products": [], "kind_index": 0, "offset": 0})
@@ -551,7 +676,7 @@ TEMPLATES = {
     "confirm": ("Подтверждение", "👤 Найден аккаунт: {nickname}\nЭто ваш аккаунт? Ответьте «да» для пополнения или «нет» для повторного ввода."),
     "confirm_hint": ("Ответ на подтверждение", "Ответьте «да» или «нет». Пополнение ещё не оплачено."),
     "confirmed": ("Аккаунт подтверждён", "✅ Аккаунт подтверждён. Начинаю пополнение."),
-    "retry": ("Повтор ввода", "Аккаунт не прошёл проверку. Введите данные заново. Осталось попыток: {attempts_left}."),
+    "retry": ("Повтор ввода", "Аккаунт не прошёл проверку: {reason}\nВведите данные заново. Осталось попыток: {attempts_left}."),
     "rejected_account": ("Другой аккаунт", "Хорошо, укажите данные нужного аккаунта заново."),
     "processing": ("Оплата", "⏳ Выполняю пополнение. Дождитесь результата."),
     "accepted": ("Ожидание поставщика", "⏳ Поставщик принял пополнение в обработку. Обычно это занимает несколько минут."),
@@ -571,15 +696,22 @@ TEMPLATES = {
     "limit": ("Лимит количества", "Заказ превышает лимит автоматической обработки. Продавец проверит его вручную."),
     "amount_range": ("Границы суммы", "Сумма этого заказа требует проверки продавцом. Деньги поставщику ещё не отправлены."),
     "missing_form": ("Неизвестная форма", "Уточняем данные, которые требуются для этого пополнения. Продавец уже уведомлён."),
-    "additional_field": ("Дополнительное поле", "Поставщик запросил ещё одно поле. Уточним его перед пополнением."),
+    "additional_field": ("Дополнительное поле", "Поставщик запросил дополнительные данные ({count}). Уточним их перед пополнением."),
     "optional": ("Необязательное поле", "Поле необязательное: отправьте «-», чтобы пропустить."),
-    "resumed": ("Диалог продолжен", "Продолжаем заказ #{order_id}."),
+    "resumed": ("Диалог продолжен", "Переходим к заказу #{order_id}: {lot_name}."),
     "cancel_hint": ("Слово отмена", "Для отмены свяжитесь с продавцом. Сейчас ожидаю данные для заказа #{order_id}."),
     "pre_filled": ("Данные из заказа", "Данные аккаунта уже указаны в заказе. Проверю их перед пополнением."),
 }
 TEMPLATE_FIELDS = {"order_id", "lot_name", "quantity", "timeout_min", "questions", "step", "field_label",
-                   "options", "reason", "nickname", "attempts_left", "extra", "completed", "operations", "refund_note"}
-REQUIRED_TEMPLATE_FIELDS = {"question": {"field_label"}, "confirm": {"nickname"}, "success": {"extra"}}
+                   "options", "reason", "nickname", "attempts_left", "extra", "completed", "operations", "refund_note",
+                   # Synonyms used in the seller guide.
+                   "label", "total", "error", "attempt", "max_attempts", "done", "count", "limits"}
+# Each group: at least one of the names must be present.
+REQUIRED_TEMPLATE_FIELDS = {"question": [{"field_label", "label"}], "confirm": [{"nickname"}], "success": [{"extra"}]}
+
+
+def required_hint(key):
+    return ", ".join(" или ".join("{" + x + "}" for x in sorted(group)) for group in REQUIRED_TEMPLATE_FIELDS.get(key, [])) or "нет"
 
 
 def validate_template(key, value):
@@ -592,10 +724,10 @@ def validate_template(key, value):
                 if field not in TEMPLATE_FIELDS or spec or conversion:
                     raise ValueError
                 fields.add(field)
-        if not REQUIRED_TEMPLATE_FIELDS.get(key, set()) <= fields:
+        if any(not group & fields for group in REQUIRED_TEMPLATE_FIELDS.get(key, [])):
             raise ValueError
     except ValueError:
-        raise ShopError("Проверьте скобки и подстановки. Обязательные: " + ", ".join(REQUIRED_TEMPLATE_FIELDS.get(key, set()))) from None
+        raise ShopError("Проверьте скобки и подстановки. Обязательные: " + required_hint(key)) from None
     return value
 
 
@@ -655,15 +787,16 @@ def validate_field(field, value, service_name="", settings=None):
         raise ShopError("Ответ должен содержать от 1 до 256 символов без переноса строки.")
     options = field.get("options") or []
     if options:
-        if value.isdigit() and 1 <= int(value) <= len(options):
-            value = str(options[int(value)-1]["value"])
-        else:
-            found = [o for o in options if value.casefold() in {str(o.get("value", "")).casefold(), str(o.get("label", "")).casefold()}]
-            if len(found) != 1:
-                raise ShopError("Выберите номер, значение или название из списка.")
-            value = str(found[0]["value"])
+        # An exact value/label wins over a list position: with values 0,1,2 the answer "1" means value 1.
+        found = [o for o in options if value.casefold() in {str(o.get("value", "")).casefold(), str(o.get("label", "")).casefold()}]
+        if not found and value.isdigit() and 1 <= int(value) <= len(options):
+            found = [options[int(value)-1]]
+        if len(found) != 1:
+            raise ShopError("Выберите номер, значение или название из списка.")
+        value = str(found[0]["value"])
     key, name = field_key(field).casefold(), service_name.casefold()
-    if "telegram" in name and key in {"account_reference", "username", "account", "login"}:
+    ton_address = re.fullmatch(r"(?:[EUk0]Q[A-Za-z0-9_-]{46}|-?\d:[0-9a-fA-F]{64})", value)
+    if "telegram" in name and key in {"account_reference", "username", "account", "login"} and not ton_address:
         if not settings["telegram_no_at"] and not value.startswith("@"):
             raise ShopError("Укажите username с @.")
         value = value.removeprefix("@")
@@ -689,14 +822,34 @@ def validate_field(field, value, service_name="", settings=None):
             raise ShopError("Длина ответа вне допустимого диапазона.")
     pattern = rules.get("pattern")
     if pattern:
-        try:
-            if len(pattern) > 256 or len(value) > 128 or re.search(r"\([^)]*[+*][^)]*\)[+*{]", pattern):
-                raise ShopError("Сложный шаблон проверки — требуется проверка продавцом.")
-            if re.fullmatch(pattern, value) is None:
-                raise ShopError("Ответ не соответствует формату поставщика.")
-        except re.error:
-            raise ShopError("Некорректный шаблон формы поставщика.") from None
+        if len(value) > 128:
+            raise ShopError("Ответ слишком длинный для формата поставщика.")
+        if not pattern_matches(pattern, value):
+            raise ShopError("Ответ не соответствует формату поставщика.")
     return value
+
+
+def pattern_matches(pattern, value):
+    """Provider regex with a time limit when the `regex` package exists; heuristic guard otherwise."""
+    try:
+        import regex as timed_re
+    except ImportError:
+        timed_re = None
+    if len(pattern) > 256:
+        raise ShopError("Сложный шаблон проверки — требуется проверка продавцом.")
+    if timed_re is not None:
+        try:
+            return timed_re.fullmatch(pattern, value, timeout=0.5) is not None
+        except TimeoutError:
+            raise ShopError("Сложный шаблон проверки — требуется проверка продавцом.") from None
+        except timed_re.error:
+            raise ShopError("Некорректный шаблон формы поставщика.") from None
+    if re.search(r"\([^)]*[+*][^)]*\)[+*{]", pattern):
+        raise ShopError("Сложный шаблон проверки — требуется проверка продавцом.")
+    try:
+        return re.fullmatch(pattern, value) is not None
+    except re.error:
+        raise ShopError("Некорректный шаблон формы поставщика.") from None
 
 
 def make_body(item_id, data, quantity=1, currency="", reference=None, check=False):
@@ -716,14 +869,16 @@ def discovered_fields(error):
     # Only machine-readable MISSING errors are used, never words in a provider message.
     result = []
     for entry in error.errors if isinstance(error.errors, list) else []:
-        key = entry.get("field", "")
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("field", ""))
         if entry.get("code") == "MISSING" and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", key):
             result.append({"key": key, "type": "amount_input" if key == "amount" else "text", "required": True, "label": key})
     return result
 
 
 def quote_cost(value):
-    if value.get("currency") != "USD" or value.get("price") is None or dec(value["price"]) <= 0:
+    if str(value.get("currency", "")).upper() not in {"USD", "USDT"} or value.get("price") is None or dec(value["price"]) <= 0:
         raise ShopError("Поставщик не вернул достоверную цену USD. Нужна ручная проверка.")
     return dec(value["price"])
 
@@ -743,6 +898,16 @@ def native_currency(service, field):
     return field.get("currencyCode") or service.get("amountCurrencyCode") or service.get("currencyCode") or ""
 
 
+def resolve_currency(lot, service, field, settings, service_name=""):
+    """One rule for the purchase body and the FunPay price: lot → provider → global (Steam only) → none."""
+    currency = lot.get("amount_currency")
+    if currency is None:
+        currency = native_currency(service or {}, field or {})
+        if "steam" in str(service_name or (service or {}).get("name", "")).casefold():
+            currency = currency or settings.get("amount_currency", "")
+    return (currency or "").upper()
+
+
 def check_amount_bounds(field, value, currency, native, rates=None, manual=None):
     number = dec(value)
     rules = manual or field.get("validation") or {}
@@ -756,16 +921,67 @@ def check_amount_bounds(field, value, currency, native, rates=None, manual=None)
         raise ShopError("Расчётная сумма вне границ пополнения.")
 
 
+# Order parameters that may already carry the buyer's account. Only login/ID-like names:
+# a nickname is never used as a login because it could belong to another account.
+COMMON_ALIASES = {
+    "account_reference": ("login", "username", "player", "account", "логин", "логин steam", "steam login",
+                          "юзернейм", "username telegram", "telegram username"),
+    "account_number": ("uid", "user_id", "player_id", "player", "id игрока", "игровой id", "user id", "player id"),
+    "user_id": ("uid", "player_id", "id игрока", "игровой id", "user id", "player id"),
+    "player_id": ("uid", "user_id", "id игрока", "игровой id", "user id", "player id"),
+    "zone_id": ("zone", "zone id", "server id", "id сервера"),
+}
+YES_WORDS = {"да", "yes", "д", "ага", "верно", "y", "ок", "ok", "конечно", "мой"}
+NO_WORDS = {"нет", "no", "н", "не", "неа", "n"}
+SECRET_HINTS = ("pass", "secret", "token", "пароль", "otp", "pin_code", "auth_code")
+MAX_RETRIES = 6
+
+
+def secret_field(key, form=None):
+    field = next((f for f in form or [] if field_key(f) == key), {})
+    return field.get("type") in {"password", "hidden", "secret"} or field.get("secret") is True or \
+        any(x in str(key).lower() for x in SECRET_HINTS)
+
+
+def masked_data(data, form=None):
+    result = {}
+    for key, value in (data or {}).items():
+        value = str(value)
+        result[key] = ("••••" + value[-2:] if len(value) > 6 else "••••") if secret_field(key, form) else value
+    return result
+
+
+def confirm_answer(text):
+    """True for yes, False for no, None when unclear. Punctuation and short phrases are accepted."""
+    raw = text.strip()
+    if raw in {"+", "👍", "✅"}:
+        return True
+    if raw in {"-", "👎", "❌"}:
+        return False
+    words = normalized(raw).split()
+    if not words:
+        return None
+    if words[0] in NO_WORDS or "не" in words and "мой" in words:
+        return False
+    if words[0] in YES_WORDS and not NO_WORDS & set(words):
+        return True
+    return None
+
+
 class TopUp:
     def __init__(self, cardinal, store=None, api_factory=None):
         self.cardinal = cardinal
         self.store = store or Store("storage/plugins/approute_topup/topup.sqlite3")
         self.api_factory = api_factory
-        self.stop_event, self.wakeup = threading.Event(), threading.Event()
+        self.stop_event, self.wakeup, self.service_wakeup = threading.Event(), threading.Event(), threading.Event()
         self.pacer = RequestPacer(self.store, self.stop_event)
+        # Order worker: purchases, dialogs and panel actions that change orders.
         self.jobs = queue.Queue(maxsize=200)
-        self.thread, self.ui, self.instance_lock = None, None, None
+        # Service worker: catalogue, prices, lots. Slow syncs no longer delay buyer replies.
+        self.service_jobs = queue.Queue(maxsize=200)
+        self.thread, self.service_thread, self.ui, self.instance_lock = None, None, None, None
         self.last_maintenance = 0
+        self.last_prune = 0
 
     def active(self):
         plugin = getattr(self.cardinal, "plugins", {}).get(UUID)
@@ -775,33 +991,58 @@ class TopUp:
         settings = settings or self.store.settings()
         return self.api_factory(settings) if self.api_factory else AppRouteAPI(settings, getattr(self.cardinal.account, "proxy", None), pacer=self.pacer)
 
-    def notify(self, text):
+    def notify(self, text, buttons=None):
         tg = getattr(self.cardinal, "telegram", None)
-        if not tg or not self.store.settings()["notifications"]:
+        s = self.store.settings()
+        if not tg or not s["notifications"]:
             return
-        for chat in self.store.settings()["notify_chats"]:
+        markup = None
+        if buttons:
             try:
-                tg.bot.send_message(chat, text, parse_mode="HTML", disable_web_page_preview=True)
+                from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+                markup = InlineKeyboardMarkup()
+                markup.row(*[InlineKeyboardButton(label, url=url) for label, url in buttons])
+            except Exception:
+                markup = None
+        for chat in s["notify_chats"]:
+            try:
+                tg.bot.send_message(chat, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=markup)
             except Exception:
                 LOG.warning("AppRoute Top-Up: Telegram notification not sent")
+
+    @staticmethod
+    def order_buttons(record):
+        buttons = [("💙 Заказ FunPay", f"https://funpay.com/orders/{quote(str(record['id']), safe='')}/")]
+        if str(record.get("buyer_id", "")).isdigit():
+            buttons.append(("👤 Покупатель", f"https://funpay.com/users/{record['buyer_id']}/"))
+        return buttons
 
     def save(self, record):
         record["updated"] = time.time()
         self.store.put("order", record["id"], record)
 
-    def tell(self, record, key, **values):
+    def render(self, record, key, **values):
         s = self.store.settings()
+        attempts = record.get("attempts", 0)
         context = {k: "" for k in TEMPLATE_FIELDS}
         context.update(order_id=record["id"], lot_name=record.get("lot", {}).get("name", ""),
                        quantity=record.get("quantity", 1), timeout_min=s["timeout_min"],
                        completed=record.get("completed", 0), operations=record.get("operations", 1),
-                       refund_note="Возврат будет проверен продавцом." if s["auto_refund"] else "Свяжитесь с продавцом.")
+                       attempt=attempts, max_attempts=s["input_attempts"],
+                       attempts_left=max(0, s["input_attempts"] - attempts),
+                       refund_note="Средства будут возвращены автоматически." if s["auto_refund"] else "Свяжитесь с продавцом.")
         context.update(values)
+        # Guide synonyms resolve to the same values.
+        context.update(label=context["field_label"], error=context["reason"], done=context["completed"],
+                       total=context["questions"] if "questions" in values else context["operations"])
         text = s["templates"].get(key, TEMPLATES[key][1])
         try:
-            text = validate_template(key, text).format(**context)
+            return validate_template(key, text).format(**context)
         except Exception:
-            text = TEMPLATES[key][1].format(**context)
+            return TEMPLATES[key][1].format(**context)
+
+    def tell(self, record, key, **values):
+        text = self.render(record, key, **values)
         if record.get("chat"):
             # Persist the message with the state transaction before sending. A retry never repeats a payment.
             record.setdefault("outbox", []).append({"id": uuid.uuid4().hex, "text": text})
@@ -810,10 +1051,26 @@ class TopUp:
     def flush(self, record):
         while record.get("outbox"):
             msg = record["outbox"][0]
-            result = self.cardinal.account.send_message(record["chat"], msg["text"], record.get("buyer"), int(record["buyer_id"]))
+            buyer_id = str(record.get("buyer_id", ""))
+            try:
+                result = self.cardinal.account.send_message(record["chat"], msg["text"], record.get("buyer") or None,
+                                                            int(buyer_id) if buyer_id.isdigit() else None)
+            except Exception:
+                result = None
             if not result:
-                raise ShopError("FunPay не подтвердил доставку сообщения.")
+                record["outbox_failures"] = record.get("outbox_failures", 0) + 1
+                if record["outbox_failures"] >= 10:
+                    # Do not block the order forever on a chat FunPay refuses; tell the seller instead.
+                    dropped = len(record["outbox"])
+                    record.update(outbox=[], outbox_failures=0)
+                    self.save(record)
+                    self.notify(f"✉️ <b>Заказ #{esc(record['id'])}</b>: FunPay не принял {dropped} сообщ. покупателю. "
+                                f"Напишите ему вручную.", self.order_buttons(record))
+                    return
+                self.save(record)
+                raise TransientError("FunPay не подтвердил доставку сообщения.")
             record["outbox"].pop(0)
+            record["outbox_failures"] = 0
             self.save(record)
 
     def review(self, record, reason, message="review"):
@@ -823,12 +1080,19 @@ class TopUp:
         else:
             record["state"] = "review"
         record["reason"] = reason
+        record["next_at"] = 0
         self.save(record)
         self.tell(record, message)
-        self.notify(f"🛠 <b>Заказ #{esc(record['id'])}</b> · {esc(record.get('buyer', ''))}\n{esc(reason)}")
+        self.notify(f"🛠 <b>Заказ #{esc(record['id'])}</b> · {esc(record.get('buyer', ''))}\n"
+                    f"{esc(record.get('lot', {}).get('name', ''))}\n{esc(reason)}", self.order_buttons(record))
 
     def get_order(self, oid):
-        order = self.cardinal.account.get_order(oid)
+        try:
+            order = self.cardinal.account.get_order(oid)
+        except ShopError:
+            raise
+        except Exception:
+            raise TransientError("FunPay временно не вернул данные заказа. Повтор запланирован.") from None
         if str(getattr(order, "seller_id", "")) != str(self.cardinal.account.id):
             raise ShopError("Этот аккаунт Cardinal не является продавцом заказа.")
         return order
@@ -839,7 +1103,9 @@ class TopUp:
             raise ShopError("Заказ FunPay больше не оплачен. Автоматическая закупка остановлена.")
         if str(getattr(order, "buyer_id", "")) == str(self.cardinal.account.id):
             raise ShopError("Заказ от собственного аккаунта не обслуживается.")
-        if enum_name(getattr(order, "currency", "")) != "RUB":
+        # Older FunPayAPI builds have no Order.currency; only a known non-RUB currency is refused.
+        currency = getattr(order, "currency", None)
+        if currency is not None and enum_name(currency) != "RUB":
             raise ShopError("Для автоматического расчёта требуется заказ в RUB.")
         if getattr(order, "order_secrets", None):
             raise ShopError("Заказ содержит встроенную автовыдачу FunPay. Проверьте выдачу вручную.")
@@ -849,16 +1115,32 @@ class TopUp:
             raise ShopError("Сумма заказа FunPay изменилась. Проверьте вручную.")
         return order
 
-    def enqueue(self, oid):
-        self.store.enqueue(oid)
+    def enqueue(self, oid, chat="", buyer_id=""):
+        self.store.enqueue(oid, chat, buyer_id)
         self.wakeup.set()
 
-    def submit(self, action):
+    def manual_enqueue(self, oid):
+        """Seller's «process order #ID»: orders paid while the bot was offline, or ignored before a lot was bound."""
+        record = self.store.get("order", oid)
+        if record:
+            reusable = record["state"] in {"ignored", "closed"} and not record.get("manual_resolved") and \
+                not record.get("transactions") and not record.get("completed")
+            if not reusable:
+                raise ShopError(f"Заказ #{oid} уже в журнале: {STATE_NAMES.get(record['state'], record['state'])}.")
+            for key in ("reason", "pause_alert", "queue_alert", "resumed", "lot", "fields", "data", "outbox"):
+                record.pop(key, None)
+            record.update(state="queued", next_at=0, attempts=0, retries=0)
+            self.save(record)
+        else:
+            self.store.enqueue(oid)
+        self.wakeup.set()
+
+    def submit(self, action, service=False):
         try:
-            self.jobs.put_nowait(action)
+            (self.service_jobs if service else self.jobs).put_nowait(action)
         except queue.Full:
             raise ShopError("Очередь панели заполнена. Повторите позже.") from None
-        self.wakeup.set()
+        (self.service_wakeup if service else self.wakeup).set()
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -883,31 +1165,49 @@ class TopUp:
             self.instance_lock = None
             raise ShopError("Другой экземпляр плагина уже использует эту базу заказов.") from None
         self.thread = threading.Thread(target=self.loop, name="AppRouteTopUp", daemon=True)
+        self.service_thread = threading.Thread(target=self.service_loop, name="AppRouteTopUpService", daemon=True)
         self.thread.start()
+        self.service_thread.start()
+
+    @staticmethod
+    def run_jobs(jobs, limit=20):
+        for _ in range(limit):
+            try:
+                action = jobs.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                action()
+            except Exception:
+                LOG.warning("AppRoute Top-Up: panel job failed")
 
     def loop(self):
         while not self.stop_event.is_set():
             if self.active():
-                try:
-                    action = self.jobs.get_nowait()
-                except queue.Empty:
-                    action = None
-                if action:
-                    try:
-                        action()
-                    except Exception:
-                        LOG.warning("AppRoute Top-Up: panel job failed")
-                for record in sorted(self.store.all("order"), key=lambda r: r["created"]):
+                self.run_jobs(self.jobs)
+                for record in self.store.due_orders(time.time(), ACTIVE_STATES):
                     if self.stop_event.is_set():
                         break
-                    if (record.get("outbox") or record["state"] in ACTIVE_STATES) and record.get("next_at", 0) <= time.time():
-                        self.process(record["id"])
-                for job in self.store.all("message"):
-                    try:
-                        self.handle_message(job)
-                        self.store.delete("message", job["id"])
-                    except Exception:
-                        LOG.warning("AppRoute Top-Up: buyer message deferred")
+                    self.process(record["id"])
+                for kind, handler in (("status", self.handle_status), ("message", self.handle_message)):
+                    for job in sorted(self.store.all(kind), key=lambda j: j.get("created", 0)):
+                        try:
+                            done = handler(job)
+                        except Exception:
+                            LOG.warning("AppRoute Top-Up: %s job deferred", kind)
+                            job["tries"] = job.get("tries", 0) + 1
+                            done = job["tries"] >= 20
+                            if not done:
+                                self.store.put(kind, job["id"], job)
+                        if done:
+                            self.store.delete(kind, job["id"])
+            self.wakeup.wait(1)
+            self.wakeup.clear()
+
+    def service_loop(self):
+        while not self.stop_event.is_set():
+            if self.active():
+                self.run_jobs(self.service_jobs)
                 if time.time() - self.last_maintenance >= 30:
                     self.last_maintenance = time.time()
                     try:
@@ -916,8 +1216,14 @@ class TopUp:
                         pass
                     except Exception:
                         LOG.warning("AppRoute Top-Up: maintenance failed")
-            self.wakeup.wait(1)
-            self.wakeup.clear()
+            self.service_wakeup.wait(1)
+            self.service_wakeup.clear()
+
+    def retry_later(self, record, exc):
+        record["retries"] = record.get("retries", 0) + 1
+        record["next_at"] = time.time() + min(600, 15 * 2 ** (record["retries"] - 1))
+        record["last_error"] = str(exc)[:300]
+        self.save(record)
 
     def process(self, oid):
         record = self.store.get("order", oid)
@@ -929,8 +1235,9 @@ class TopUp:
             flushing = False
             if record["state"] not in ACTIVE_STATES:
                 return
+            s = self.store.settings()
             if record["state"] in WAIT_STATES:
-                if time.time() - record.get("last_input", record["created"]) > self.store.settings()["timeout_min"] * 60:
+                if time.time() - record.get("last_input", record["created"]) > s["timeout_min"] * 60:
                     self.review(record, "Покупатель не ответил вовремя. Возврат автоматически не выполняется.", "timeout")
                 return
             if record["state"] in {"pending", "purchasing"}:
@@ -938,33 +1245,51 @@ class TopUp:
             elif record["state"] == "refund_pending":
                 self.refund(record)
             elif record["state"] == "queued":
-                self.prepare(record)
-            elif not self.store.settings()["enabled"]:
-                if not record.get("pause_alert"):
-                    record["pause_alert"] = True
+                if not s["enabled"] and record.get("pause_alert"):
+                    # Already matched and announced: do not ask FunPay for the order every second while paused.
+                    record["next_at"] = time.time() + 60
                     self.save(record)
-                    self.notify(f"⏸ Заказ #{esc(oid)} сохранён: пополнения на паузе.")
+                    return
+                self.prepare(record)
+            elif not s["enabled"]:
+                self.pause(record)
             elif record["state"] == "check":
                 self.check(record)
             elif record["state"] == "ready":
                 self.purchase(record)
             flushing = True
             self.flush(record)
+            if record.get("retries"):
+                record["retries"] = 0
+                self.save(record)
         except (RateLimitError, RequestDeferred) as exc:
             record["next_at"] = exc.retry_at
             self.save(record)
-        except APIError as exc:
-            if record["state"] in {"pending", "purchasing", "refund_pending"}:
-                record["next_at"] = time.time() + 30
-                self.save(record)
-            else:
-                self.review(record, str(exc))
+        except GuardError as exc:
+            self.review(record, str(exc), "amount_range")
+        except FormError as exc:
+            self.review(record, str(exc), "missing_form")
         except Exception as exc:
-            if record["state"] in {"pending", "purchasing", "refund_pending"} or flushing:
+            if record["state"] in {"pending", "purchasing", "refund_pending"}:
+                # Money may be in flight: keep reconciling, never escalate on a timer here.
                 record["next_at"] = time.time() + 30
                 self.save(record)
+            elif flushing or is_transient(exc):
+                if record.get("retries", 0) >= MAX_RETRIES and not flushing:
+                    self.review(record, f"{exc} Повторы исчерпаны, нужна проверка продавцом.")
+                else:
+                    self.retry_later(record, exc)
             else:
                 self.review(record, str(exc) if isinstance(exc, ShopError) else "Ошибка обработки; проверьте настройку заказа.")
+
+    def pause(self, record):
+        if not record.get("pause_alert"):
+            record["pause_alert"] = True
+            self.notify(f"⏸ Заказ #{esc(record['id'])} сохранён: пополнения на паузе.", self.order_buttons(record))
+            if record.get("lot"):
+                self.tell(record, "paused")
+        record["next_at"] = time.time() + 60
+        self.save(record)
 
     def product_form(self, lot):
         api = self.api()
@@ -983,15 +1308,34 @@ class TopUp:
                 result = api.check(make_body(lot["item_id"], {}))
                 fields = form_fields({"fields": result.get("fields")}, {})
             except APIError as exc:
+                if is_transient(exc):
+                    raise
                 fields = discovered_fields(exc) or None
         if not fields:
             if s["require_form"]:
-                raise ShopError("Поставщик не описал форму. Выполните диагностику; до определения полей оплат не будет.")
+                if not self.store.get("form_alert", lot["product_id"]):
+                    self.store.put("form_alert", lot["product_id"], {"at": time.time()})
+                    self.notify(f"⚠️ Форма товара «{esc(service.get('name', lot['product_id']))}» неизвестна. "
+                                f"Автопополнение по лоту {esc(lot['id'])} заблокировано до диагностики.")
+                raise FormError("Поставщик не описал форму. Выполните диагностику; до определения полей оплат не будет.")
             fields = [{"key": "account_reference", "type": "text", "label": "Данные аккаунта", "required": True}]
         self.store.patch("lot", lot["id"], form=fields, service_name=service.get("name", ""),
                          item_name=item.get("name", ""), last_cost=str(item.get("price", "")),
                          native_currency=native_currency(service, open_amount(fields) or {}) or lot.get("native_currency", ""))
         return service, item, fields
+
+    def amount_value(self, lot, quantity, s):
+        mode = lot.get("amount_mode") or s["amount_mode"]
+        if mode not in {"quantity", "fixed"}:
+            raise ShopError("Неподдерживаемый источник суммы. Выберите количество или фиксированную сумму.")
+        if mode == "fixed":
+            # «Сумма за 1 шт.»: the buyer pays per piece, so the top-up scales with the paid quantity.
+            value = dec(lot.get("fixed_amount", "0")) * quantity
+        else:
+            value = dec(quantity) * dec(lot.get("multiplier") or s["multiplier"])
+        if value <= 0:
+            raise ShopError("Сумма пополнения должна быть положительной. Проверьте множитель или фиксированную сумму лота.")
+        return value
 
     def prepare(self, record):
         order = self.get_order(record["id"])
@@ -1004,11 +1348,12 @@ class TopUp:
             self.save(record)
             return
         order = self.paid(record, order)
+        lots = self.store.all("lot")
         diagnostics = []
-        matches = match_lot(order, self.store.all("lot"), diagnostics)
+        matches = match_lot(order, lots, diagnostics)
         if not matches:
             sub = getattr(getattr(order, "subcategory", None), "id", None)
-            configured = any(l.get("item_id") and l.get("enabled", True) and l.get("subcategory") and str(l["subcategory"]) == str(sub) for l in self.store.all("lot"))
+            configured = any(l.get("item_id") and l.get("enabled", True) and l.get("subcategory") and str(l["subcategory"]) == str(sub) for l in lots)
             if diagnostics and configured and not (getattr(order, "lot_id", None) or getattr(order, "offer_id", None)):
                 record.update(chat=str(order.chat_id), buyer=getattr(order, "buyer_username", "") or "", buyer_id=str(order.buyer_id), revenue=str(order.sum))
                 self.review(record, "Заказ в настроенной категории, но условия лота не совпали. " + " ".join(diagnostics[:3]))
@@ -1031,23 +1376,26 @@ class TopUp:
         record.update(lot=lot, quantity=quantity, revenue=str(order.sum), buyer=getattr(order, "buyer_username", "") or "",
                       buyer_id=str(order.buyer_id), chat=str(chat), completed=0, cost="0", data={},
                       operations=quantity, last_input=time.time())
-        if not self.store.settings()["enabled"]:
-            if not record.get("pause_alert"):
-                record["pause_alert"] = True
-                self.notify(f"⏸ Заказ #{esc(record['id'])} сохранён: пополнения на паузе.")
-            self.save(record)
+        s = self.store.settings()
+        if not s["enabled"]:
+            self.pause(record)
             return
-        earlier = [r for r in self.store.all("order") if r["id"] != record["id"] and r.get("chat") == record["chat"] and
-                   r["state"] in ACTIVE_STATES and (r["created"], r["id"]) < (record["created"], record["id"])]
+        earlier = [r for r in self.store.orders_in(ACTIVE_STATES, [record["chat"]]) if r["id"] != record["id"] and
+                   (r["created"], r["id"]) < (record["created"], record["id"])]
         if earlier:
             if not record.get("queue_alert"):
                 record["queue_alert"] = True
                 self.tell(record, "queued")
+            # Re-check later, not every second: each attempt reads the order from FunPay.
+            record["next_at"] = time.time() + 20
+            self.save(record)
             return
+        if record.get("queue_alert") and not record.get("resumed"):
+            record["resumed"] = True
+            self.tell(record, "resumed")
         service, item, fields = self.product_form(lot)
         record.update(service_name=service.get("name", ""), fields=fields, item=item)
         amount = open_amount(fields)
-        s = self.store.settings()
         if not available(item):
             self.disable_lots("Товар недоступен", [lot])
             self.fail(record, "Товар недоступен", "unavailable")
@@ -1062,26 +1410,26 @@ class TopUp:
             record["provider_quantity"] = 1
         if amount:
             record["operations"] = 1
-            multiplier = dec(lot.get("multiplier") or s["multiplier"])
-            mode = lot.get("amount_mode") or s["amount_mode"]
-            if mode not in {"quantity", "fixed"}:
-                raise ShopError("Неподдерживаемый источник суммы. Выберите количество или фиксированную сумму.")
-            value = dec(lot.get("fixed_amount", "0")) * quantity if mode == "fixed" else dec(quantity) * multiplier
-            if value <= 0:
-                raise ShopError("Сумма пополнения должна быть положительной.")
+            value = self.amount_value(lot, quantity, s)
             record["data"][field_key(amount)] = str(value)
             # Global currency applies only to monetary amount forms, never implicitly to Stars/TON.
-            currency = lot.get("amount_currency")
-            if currency is None:
-                currency = native_currency(service, amount)
-                if "steam" in record["service_name"].casefold():
-                    currency = currency or s["amount_currency"]
-            record["amount_currency"] = currency or ""
-            native = lot.get("native_currency") or native_currency(service, amount)
+            currency = resolve_currency(lot, service, amount, s, record["service_name"])
+            record["amount_currency"] = currency
+            native = (lot.get("native_currency") or native_currency(service, amount)).upper()
             rates = rates_map(self.api().rates()) if currency and native and currency != native else None
-            check_amount_bounds(amount, value, currency, native, rates, lot.get("limits"))
+            try:
+                check_amount_bounds(amount, value, currency, native, rates, lot.get("limits"))
+            except ShopError as exc:
+                raise GuardError(str(exc)) from None
         else:
             record["amount_currency"] = ""
+            # Early guard on the catalogue price; the exact quote is checked again after precheck.
+            try:
+                unit = quote_cost(item)
+            except ShopError:
+                unit = None
+            if unit is not None:
+                self.guard(record, unit * record["operations"] * record["provider_quantity"])
         fixed = lot.get("fixed_fields") or {}
         for f in fields:
             key = field_key(f)
@@ -1091,23 +1439,22 @@ class TopUp:
                 record["data"][key] = validate_field(f, fixed[key], record["service_name"], s)
         # Use explicit field aliases only; never parse amounts or arbitrary description text.
         values = {}
-        for k, field in (getattr(order, "fields", {}) or {}).items():
-            value = getattr(field, "value", field)
+        for k, value in order_attr_values(order):
             if isinstance(value, dict):
                 value = value.get(getattr(order, "locale", "ru")) or value.get("ru") or value.get("en")
-            if value is not None:
-                values[str(k)] = str(value)
+            if value is not None and str(value).strip():
+                values.setdefault(normalized(k), set()).add(str(value).strip())
         if getattr(order, "player", None):
-            values.setdefault("player", str(order.player))
-        common_aliases = {"account_reference": ("login", "username", "player", "account"),
-                          "account_number": ("uid", "user_id", "player_id", "player")}
+            values.setdefault("player", set()).add(str(order.player))
+        aliases = lot.get("aliases") or {}
         for f in fields:
             key = field_key(f)
             if key in record["data"] or is_amount(f):
                 continue
-            aliases = lot.get("aliases") or {}
-            candidates = [aliases[key]] if key in aliases else [key, *common_aliases.get(key, ())]
-            answers = {values[k] for k in candidates if k in values and values[k]}
+            candidates = [aliases[key]] if key in aliases else [key, *COMMON_ALIASES.get(key, ())]
+            answers = set()
+            for name in candidates:
+                answers |= values.get(normalized(name), set())
             if len(answers) == 1:
                 try:
                     record["data"][key] = validate_field(f, answers.pop(), record["service_name"], s)
@@ -1115,8 +1462,9 @@ class TopUp:
                     pass
         record["state"] = "collect"
         record["attempts"] = 0
-        self.save(record)
         missing = self.missing(record)
+        record["total_questions"] = len(missing)
+        self.save(record)
         self.tell(record, "welcome" if missing else "pre_filled", questions=len(missing))
         self.ask_next(record)
 
@@ -1130,55 +1478,76 @@ class TopUp:
             self.save(record)
             return
         field = missing[0]
-        record.update(state="collect", asking=field_key(field), last_input=time.time())
+        total = max(record.get("total_questions") or 0, len(missing))
+        record.update(state="collect", asking=field_key(field), last_input=time.time(), total_questions=total)
         self.save(record)
         options = "\n".join(f"{i+1}. {o.get('label', o['value'])} ({o['value']})" for i, o in enumerate(field.get("options") or []))
         if not field.get("required", False):
-            options += "\nНеобязательно — можно отправить -."
-        questions = len([f for f in record["fields"] if not is_amount(f) and field_key(f) not in (record["lot"].get("fixed_fields") or {})])
-        self.tell(record, "question", step=max(1, questions-len(missing)+1), questions=questions,
+            options = (options + "\n" if options else "") + self.render(record, "optional")
+        self.tell(record, "question", step=total - len(missing) + 1, questions=total,
                   field_label=field.get("label") or field_key(field), options=options)
 
+    def handle_status(self, job):
+        """FunPay changed an order (refund, close) while the plugin was waiting for the buyer."""
+        record = self.store.get("order", job["id"])
+        if not record or record["state"] not in WAIT_STATES:
+            return True
+        status = enum_name(self.get_order(job["id"]).status)
+        if status != "PAID":
+            record.update(state="closed", finished=time.time(), next_at=0,
+                          reason=f"Заказ FunPay перешёл в статус {status} во время диалога. Пополнение не выполнялось.")
+            self.save(record)
+            self.notify(f"⏹ <b>Заказ #{esc(record['id'])}</b>: {esc(record['reason'])}", self.order_buttons(record))
+        return True
+
     def handle_message(self, job):
-        def same_chat(record):
-            if record.get("chat") == job["chat"]:
-                return True
+        """Returns True when the message is consumed, False to keep it for a dialog that has not started yet."""
+        chats = {job["chat"]}
+        if job["chat"].isdigit():
             # Older FunPayAPI runners emit numeric node ids; full orders use users-A-B.
-            pair = sorted((str(self.cardinal.account.id), job["buyer_id"]), key=int)
-            return job["chat"].isdigit() and record.get("chat") == "users-" + "-".join(pair)
-        candidates = sorted([r for r in self.store.all("order") if same_chat(r) and
-                             r.get("buyer_id") == job["buyer_id"] and r["state"] in WAIT_STATES], key=lambda r: r["created"])
-        if not candidates:
-            return
-        record = candidates[0]
+            chats.add(chat_for(self.cardinal.account.id, job["buyer_id"]))
+        active = sorted([r for r in self.store.orders_in(ACTIVE_STATES, chats) if r.get("buyer_id") == job["buyer_id"]],
+                        key=lambda r: (r["created"], r["id"]))
+        if not active:
+            return True
+        record = active[0]
+        if record["state"] not in WAIT_STATES:
+            # Data written right after payment waits for the first question; never for a running payment.
+            return not (record["state"] == "queued" and time.time() - job["created"] < 900)
         if job["id"] in record.get("seen_messages", []) or job["created"] < record["created"]:
-            return
-        record.setdefault("seen_messages", []).append(job["id"])
+            return True
+        record["seen_messages"] = (record.get("seen_messages", []) + [job["id"]])[-50:]
         record["last_input"] = time.time()
         text = job["text"].strip()
-        if text.casefold() in {"отмена", "стоп", "cancel", "/cancel"}:
+        if normalized(text) in {"отмена", "стоп", "cancel"} or text.casefold() == "/cancel":
             self.tell(record, "cancel_hint")
         elif record["state"] == "confirm":
-            if text.casefold() in {"да", "yes", "д", "+"}:
+            answer = confirm_answer(text)
+            if answer is True:
                 record.update(state="ready", next_at=0)
                 self.tell(record, "confirmed")
-            elif text.casefold() in {"нет", "no", "н"}:
+            elif answer is False:
                 self.reset_input(record, "rejected_account")
             else:
                 self.tell(record, "confirm_hint")
         else:
-            field = next(f for f in record["fields"] if field_key(f) == record["asking"])
-            try:
-                value = validate_field(field, text, record["service_name"], self.store.settings())
-            except ShopError as exc:
-                self.tell(record, "invalid", reason=str(exc), field_label=field.get("label") or field_key(field))
-            else:
-                record["data"][field_key(field)] = value
+            field = next((f for f in record["fields"] if field_key(f) == record.get("asking")), None)
+            if field is None:
+                # The form changed under the dialog: ask the field that is actually missing.
                 self.ask_next(record)
+            else:
+                try:
+                    value = validate_field(field, text, record["service_name"], self.store.settings())
+                except ShopError as exc:
+                    self.tell(record, "invalid", reason=str(exc), field_label=field.get("label") or field_key(field))
+                else:
+                    record["data"][field_key(field)] = value
+                    self.ask_next(record)
         self.save(record)
         self.flush(record)
+        return True
 
-    def reset_input(self, record, message="retry"):
+    def reset_input(self, record, message="retry", reason=""):
         record["attempts"] = record.get("attempts", 0) + 1
         if record["attempts"] >= self.store.settings()["input_attempts"]:
             self.fail(record, "Исчерпаны попытки подтверждения/ввода.")
@@ -1186,11 +1555,26 @@ class TopUp:
         fixed = record["lot"].get("fixed_fields") or {}
         record["data"] = {k: v for k, v in record["data"].items() if k in fixed or any(is_amount(f) and field_key(f) == k for f in record["fields"])}
         record.pop("quote", None)
-        self.tell(record, message, attempts_left=self.store.settings()["input_attempts"] - record["attempts"])
+        record.pop("telegram_variant", None)
+        record["total_questions"] = 0
+        self.tell(record, message, reason=reason or "данные не приняты поставщиком")
         self.ask_next(record)
 
     def body(self, record, reference=None):
         return make_body(record["lot"]["item_id"], record["data"], record["provider_quantity"], record.get("amount_currency", ""), reference)
+
+    def field_label(self, record, key):
+        field = next((f for f in record.get("fields", []) if field_key(f) == key), {})
+        return str(field.get("label") or key)
+
+    def rejected(self, record, exc):
+        """Precheck refusal of the buyer's data: the buyer may re-enter instead of a manual review."""
+        known = {field_key(f) for f in record["fields"]}
+        fields = [e.get("field") for e in (exc.errors if isinstance(exc.errors, list) else [])
+                  if isinstance(e, dict) and e.get("field") in known and e.get("code") != "MISSING"]
+        if exc.status == 422 and str(exc.code) == "3":
+            return fields or [""]
+        return fields if exc.status in {400, 422} else []
 
     def check(self, record):
         self.paid(record)
@@ -1208,20 +1592,24 @@ class TopUp:
         try:
             result = self.api().check(self.body(record))
         except APIError as exc:
+            if is_transient(exc):
+                raise
             extra = [f for f in discovered_fields(exc) if field_key(f) not in {field_key(x) for x in record["fields"]}]
             if extra and s["discover_fields"]:
                 if any(is_amount(f) for f in extra):
                     self.review(record, "Поставщик дополнительно запросил сумму. Перепривяжите лот с правильной формой.")
                 else:
                     record["fields"].extend(extra)
-                    self.tell(record, "additional_field")
+                    record["total_questions"] = (record.get("total_questions") or 0) + len(extra)
+                    self.tell(record, "additional_field", count=len(extra))
                     self.ask_next(record)
                 return
             if str(exc.code) in {"9", "10", "13"}:
                 self.disable_lots("Номинал недоступен" if str(exc.code) == "9" else "Баланс/лимит трат AppRoute", [record["lot"]] if str(exc.code) == "9" else None)
-                self.fail(record, str(exc))
+                self.fail(record, str(exc), "unavailable" if str(exc.code) == "9" else "balance")
                 return
-            if exc.status == 422 and str(exc.code) == "3":
+            rejected = self.rejected(record, exc)
+            if rejected:
                 # Alternative Telegram spelling is attempted only in a free check.
                 key = next((k for k, v in record["data"].items() if str(v).startswith("@")), None)
                 if "telegram" in record["service_name"].casefold() and key and not record.get("telegram_variant"):
@@ -1229,22 +1617,20 @@ class TopUp:
                     record["data"][key] = record["data"][key].removeprefix("@")
                     self.save(record)
                     return
-                self.reset_input(record)
+                labels = ", ".join(self.field_label(record, k) for k in rejected if k)
+                self.reset_input(record, reason=("поставщик не принял: " + labels) if labels else "аккаунт не найден")
                 return
             raise
         if result.get("canRecharge") is not True:
-            self.reset_input(record)
+            self.reset_input(record, reason="аккаунт не найден или не может быть пополнен")
             return
         cost = quote_cost(result)
-        record["quote"] = {"price": str(cost), "at": time.time(), "data": copy.deepcopy(record["data"])}
+        record["quote"] = {"price": str(cost), "at": time.time(), "data": copy.deepcopy(record["data"]), "completed": record["completed"]}
         self.guard(record, cost * (record["operations"] - record["completed"]))
         attrs = result.get("attributes") or {}
         nickname = next((str(attrs[k]) for k in ("nickname", "username", "name", "accountName", "account_name") if attrs.get(k)), "")
-        if s["confirm_account"]:
-            nickname = nickname or ", ".join(str(v) for k, v in record["data"].items() if not any(is_amount(f) and field_key(f) == k for f in record["fields"]))
-            if not nickname:
-                self.review(record, "Нет данных аккаунта для подтверждения.")
-                return
+        # Ask only about a nickname the provider found; echoing the buyer's own input proves nothing.
+        if s["confirm_account"] and nickname:
             record.update(state="confirm", last_input=time.time(), nickname=nickname[:256])
             self.tell(record, "confirm", nickname=nickname[:256])
         else:
@@ -1254,37 +1640,61 @@ class TopUp:
     def guard(self, record, cost):
         s = self.store.settings()
         if s["sanity_enabled"] and dec(cost) * dec(s["rate"]) > dec(record["revenue"]) * dec(s["sanity_ratio"]):
-            raise ShopError("Предохранитель остановил заказ: закупка существенно дороже оплаты покупателя.")
+            raise GuardError("Предохранитель остановил заказ: закупка существенно дороже оплаты покупателя.")
 
     def disable_lots(self, reason, lots=None):
         for lot in lots if lots is not None else self.store.all("lot"):
             try:
                 fields = self.cardinal.account.get_lot_fields(int(lot["id"]))
+                if not getattr(fields, "active", True):
+                    continue
                 fields.active = False
                 self.cardinal.account.save_lot(fields.renew_fields())
-                self.store.patch("lot", lot["id"], disabled_reason=reason)
+                self.store.patch("lot", lot["id"], disabled_reason=reason, disabled_by_plugin=True)
+                self.notify(f"⚠️ Лот {esc(lot['id'])} отключён: {esc(reason)}",
+                            [("🔗 Лот на FunPay", f"https://funpay.com/lots/offer?id={lot['id']}")])
             except Exception:
                 self.notify(f"⚠️ Не удалось отключить лот {esc(lot['id'])}. Отключите вручную: {esc(reason)}")
+
+    def enable_disabled_lots(self):
+        enabled, errors = 0, 0
+        for lot in self.store.all("lot"):
+            if not lot.get("disabled_by_plugin"):
+                continue
+            try:
+                fields = self.cardinal.account.get_lot_fields(int(lot["id"]))
+                fields.active = True
+                self.cardinal.account.save_lot(fields.renew_fields())
+                self.store.patch("lot", lot["id"], disabled_reason="", disabled_by_plugin=False)
+                enabled += 1
+            except Exception:
+                errors += 1
+        return enabled, errors
 
     def purchase(self, record):
         s = self.store.settings()
         self.paid(record)
         api = self.api()
-        # Check again at every split operation and after account confirmation.
-        if s["precheck"]:
+        quote_ = record.get("quote") or {}
+        fresh = (quote_ and time.time() - quote_.get("at", 0) < 60 and quote_.get("data") == record["data"]
+                 and quote_.get("completed") == record["completed"])
+        # Check again at every split operation and after a slow account confirmation.
+        if s["precheck"] and fresh:
+            cost = dec(quote_["price"])
+        elif s["precheck"]:
             try:
                 result = api.check(self.body(record))
             except APIError as exc:
                 if str(exc.code) in {"9", "10", "13"}:
                     self.disable_lots("Баланс/лимит/наличие AppRoute", [record["lot"]] if str(exc.code) == "9" else None)
-                    self.fail(record, str(exc))
+                    self.fail(record, str(exc), "unavailable" if str(exc.code) == "9" else "balance")
                     return
                 raise
             if result.get("canRecharge") is not True:
                 if record["completed"]:
                     self.review(record, "Оставшаяся часть не прошла предпроверку.")
                 else:
-                    self.reset_input(record)
+                    self.reset_input(record, reason="аккаунт не может быть пополнен")
                 return
             cost = quote_cost(result)
         else:
@@ -1314,14 +1724,20 @@ class TopUp:
         record.setdefault("transactions", []).append(operation)
         record.update(state="purchasing", next_at=time.time() + 10)
         self.save(record)
-        self.tell(record, "processing")
+        if record.get("processing_told") != record["completed"]:
+            record["processing_told"] = record["completed"]
+            self.tell(record, "processing")
+        self.send(record, api, operation)
+
+    def send(self, record, api, operation):
         try:
             result = api.purchase(operation["body"])
-        except RequestDeferred:
-            # No request was sent. Keep the same body/reference for the next safe send.
-            operation["state"] = "unsent"
+        except (PacerBlocked, RequestDeferred) as exc:
+            # Stopped locally before any HTTP request: drop the operation, re-check and pay later.
+            record["transactions"] = [t for t in record["transactions"] if t["reference"] != operation["reference"]]
+            record.update(state="ready", next_at=exc.retry_at)
             self.save(record)
-            raise
+            return
         except RateLimitError:
             # A 429 can originate upstream: reconcile first, do not assume no charge.
             self.save(record)
@@ -1372,7 +1788,13 @@ class TopUp:
                 # Allow only customer-facing result keys; never expose arbitrary response secrets.
                 extra = "\n".join(f"{k}: {v}" for k, v in attrs.items() if k in {"nickname", "account_reference", "amount", "currency", "message"})
                 self.tell(record, "success", extra=extra or record["lot"].get("item_name", record["lot"]["name"]))
-                self.notify(f"✅ <b>#{esc(record['id'])}</b> · {esc(record['buyer'])}\n{esc(record['lot']['name'])}\nВыручка: {esc(record['revenue'])} ₽ · закупка: {esc(record['cost'])} USD\nОпераций: {record['completed']} · ref: <code>{esc(op['reference'])}</code>")
+                data = ", ".join(f"{k}: {v}" for k, v in masked_data(record.get("data"), record.get("fields")).items())
+                balance = self.store.settings().get("balance")
+                self.notify(f"✅ <b>#{esc(record['id'])}</b> · {esc(record.get('buyer', ''))}\n{esc(record['lot']['name'])}\n"
+                            f"Количество: {record.get('quantity', 1)} · данные: {esc(data or '—')}\n"
+                            f"Выручка: {esc(record['revenue'])} ₽ · закупка: {esc(record['cost'])} USD\n"
+                            f"Операций: {record['completed']} · ref: <code>{esc(op['reference'])}</code>"
+                            + (f"\nБаланс AppRoute: {esc(balance)} USD" if balance else ""), self.order_buttons(record))
             else:
                 record.update(state="ready", next_at=0)
                 self.tell(record, "progress")
@@ -1382,12 +1804,10 @@ class TopUp:
             self.fail(record, "Поставщик отменил пополнение.")
         elif status == "PARTIALLY_COMPLETED":
             op["state"] = "partial"
-            record["state"] = "partial"
             try:
                 record["cost"] = str(dec(record["cost"]) + quote_cost(result))
             except ShopError:
                 record["accounting_unknown"] = True
-            self.save(record)
             self.review(record, "Поставщик сообщил о частичном выполнении. Возврат заблокирован.", "partial")
             record["state"] = "partial"
             self.save(record)
@@ -1414,11 +1834,11 @@ class TopUp:
                 return
             self.accept_result(record, result)
             return
-        if op["state"] == "unsent" and self.store.settings()["enabled"]:
-            self.paid(record)
-            op["state"] = "sent"
+        if op["state"] == "unsent":
+            # Journal from 1.0.x: the request never left. Start a fresh, re-checked attempt.
+            record["transactions"].pop()
+            record.update(state="ready", next_at=0)
             self.save(record)
-            self.accept_result(record, api.purchase(op["body"]))
             return
         if time.time() - op["created"] > self.store.settings()["poll_timeout"] * 60:
             self.review(record, "Результат операции неизвестен. Автоматический повтор и возврат остановлены.", "unknown")
@@ -1431,6 +1851,9 @@ class TopUp:
             self.review(record, reason)
             return
         if self.store.settings()["auto_refund"]:
+            if message != "failed":
+                # The buyer learns the reason now; the refund confirmation follows.
+                self.tell(record, message)
             record.update(state="refund_pending", reason=reason, next_at=0)
             self.save(record)
         else:
@@ -1441,25 +1864,29 @@ class TopUp:
             self.review(record, "Возврат запрещён: есть выполненная или неопределённая операция.")
             return
         order = self.get_order(record["id"])
-        if enum_name(order.status) == "REFUNDED":
+        status = enum_name(order.status)
+        if status == "REFUNDED":
             record.update(state="refunded", finished=time.time())
             self.tell(record, "refund")
-            self.notify(f"↩️ Заказ #{esc(record['id'])} возвращён. {esc(record.get('reason', ''))}")
+            self.notify(f"↩️ Заказ #{esc(record['id'])} возвращён. {esc(record.get('reason', ''))}", self.order_buttons(record))
             return
-        if enum_name(order.status) != "PAID":
+        if status != "PAID":
             self.review(record, "Возврат не выполнен: заказ FunPay больше не PAID.")
             return
-        if record.get("refund_sent"):
-            self.review(record, "Ответ FunPay на возврат неизвестен. Проверьте заказ вручную.", "refund_pending")
-            return
-        if not self.store.settings()["auto_refund"]:
+        if not record.get("refund_sent") and not self.store.settings()["auto_refund"]:
             self.review(record, "Автоматический возврат выключен.")
             return
-        record["refund_sent"] = True
+        attempts = record.get("refund_attempts", 1 if record.get("refund_sent") else 0)
+        if attempts >= 3:
+            self.review(record, "FunPay не подтвердил возврат после нескольких попыток. Проверьте заказ вручную.", "refund_pending")
+            return
+        # The order is still PAID, so a repeated request cannot refund twice.
+        record.update(refund_sent=True, refund_attempts=attempts + 1, next_at=time.time() + 30)
         self.save(record)
-        self.cardinal.account.refund(record["id"])
-        record["next_at"] = time.time() + 5
-        self.save(record)
+        try:
+            self.cardinal.account.refund(record["id"])
+        except Exception:
+            LOG.warning("AppRoute Top-Up: FunPay refund request failed; status will be re-checked")
 
     def record_balance(self, value):
         s = self.store.settings()
@@ -1485,26 +1912,32 @@ class TopUp:
 
     def maintenance(self):
         s = self.store.settings()
+        if time.time() - self.last_prune > 3600:
+            self.last_prune = time.time()
+            # Message de-duplication marks are only needed for recent events.
+            self.store.prune("seen", time.time() - 7 * 86400)
         if not s["api_key"]:
             return
         if time.time() - s["balance_at"] > 600:
             self.record_balance(self.api().balance())
         if time.time() - s["catalog_at"] > s["catalog_interval"] * 60 and time.time() >= s["catalog_retry_at"]:
             self.refresh_catalog()
-        if (s["auto_price"] or s["sync_stock"]) and time.time() - s["sync_at"] > s["interval"] * 60:
+        if (s["auto_price"] or s["sync_stock"]) and time.time() - s["sync_at"] > max(20, s["interval"]) * 60:
             self.sync_lots()
 
     def unit_cost(self, lot, item, service, fields):
         cost = quote_cost(item)
-        if not open_amount(fields):
+        amount = open_amount(fields)
+        if not amount:
             return cost
         nominal = dec(lot.get("price_nominal") or item.get("nominal") or 0)
         if nominal <= 0:
             raise ShopError("Для автоцены произвольной суммы нужен номинал, которому соответствует цена API. Задайте «База цены» в лоте.")
         s = self.store.settings()
         multiplier = dec(lot.get("fixed_amount") or 0) if lot.get("amount_mode") == "fixed" else dec(lot.get("multiplier") or s["multiplier"])
-        currency = lot.get("amount_currency") or ""
-        native = lot.get("native_currency") or native_currency(service, open_amount(fields))
+        # Same currency as the purchase body, otherwise the price and the top-up disagree.
+        currency = resolve_currency(lot, service, amount, s, service.get("name", ""))
+        native = (lot.get("native_currency") or native_currency(service, amount)).upper()
         if currency and not native:
             raise ShopError("Для автоцены укажите родную валюту номинала.")
         if currency and currency != native:
@@ -1522,11 +1955,16 @@ class TopUp:
             try:
                 service, item, fields = self.product_form(lot)
                 fp = self.cardinal.account.get_lot_fields(int(lot["id"]))
-                if enum_name(getattr(fp, "currency", "")) != "RUB" or getattr(fp, "auto_delivery", False):
+                currency = getattr(fp, "currency", None)
+                if currency is not None and enum_name(currency) != "RUB" or getattr(fp, "auto_delivery", False):
                     raise ShopError("Лот должен быть в RUB с выключенной встроенной автовыдачей.")
                 old = fp.price, fp.amount, fp.active
                 if (force or s["auto_price"]) and lot.get("auto_price", True):
-                    fp.price = float(calculate_price(self.unit_cost(lot, item, service, fields), s))
+                    new_price = dec(calculate_price(self.unit_cost(lot, item, service, fields), s))
+                    current = dec(fp.price or 0)
+                    # Skip noise: less than 0.5 ₽ or 5 % (whichever is smaller), as the guide promises.
+                    if current <= 0 or abs(new_price - current) >= min(Decimal("0.5"), current * Decimal("0.05")):
+                        fp.price = float(new_price)
                 if s["sync_stock"]:
                     if not available(item):
                         fp.active = False
@@ -1537,9 +1975,10 @@ class TopUp:
                 if old != (fp.price, fp.amount, fp.active):
                     self.cardinal.account.save_lot(fp.renew_fields())
                     changed += 1
-                    if s["price_notify"]:
-                        self.notify(f"💰 Лот {esc(lot['id'])}: {money(fp.price)} ₽")
-                self.store.patch("lot", lot["id"], last_price=str(fp.price), last_cost=str(item["price"]), sync_error="")
+                    if s["price_notify"] and old[0] != fp.price:
+                        self.notify(f"💰 Лот {esc(lot['id'])} · {esc(lot.get('name', ''))}: {money(old[0] or 0)} → {money(fp.price)} ₽",
+                                    [("🔗 Открыть лот на FunPay", f"https://funpay.com/lots/offer?id={lot['id']}")])
+                self.store.patch("lot", lot["id"], last_price=str(fp.price), last_cost=str(item.get("price", "")), sync_error="")
             except (RequestDeferred, RateLimitError):
                 raise
             except Exception as exc:
@@ -1547,11 +1986,14 @@ class TopUp:
                 self.store.patch("lot", lot["id"], sync_error=reason)
                 errors.append(f"{lot['id']}: {reason}")
         self.store.configure(sync_at=time.time())
-        if errors:
+        digest = hashlib.sha256("\n".join(sorted(errors)).encode()).hexdigest() if errors else ""
+        # Report a set of errors once, not on every interval.
+        if errors and (force or digest != s.get("sync_errors_digest")):
             self.notify("⚠️ Обновление лотов:\n" + esc("\n".join(errors[:10])))
+        self.store.configure(sync_errors_digest=digest)
         return changed, len(errors)
 
-    def read_lot(self, lid):
+    def read_lot(self, lid, reread=False):
         fields = self.cardinal.account.get_lot_fields(int(lid))
         if getattr(fields, "auto_delivery", False):
             raise ShopError("Сначала отключите встроенную автовыдачу FunPay у лота.")
@@ -1565,25 +2007,56 @@ class TopUp:
         lot = self.store.get("lot", lid, {"id": lid, "auto_price": True, "enabled": True, "fixed_fields": {}})
         lot.update(name=lot.get("name") or title or f"Лот {lid}", title=title,
                    subcategory=getattr(getattr(fields, "subcategory", None), "id", None), suggested_conditions=conditions)
-        if not lot.get("conditions"):
+        if not lot.get("conditions") or reread:
+            # «Перечитать лот» rebuilds the conditions from FunPay, as the guide describes.
             lot["conditions"] = conditions
+            lot.pop("conditions_manual", None)
         if "steam" in (title or "").casefold() and "amount_currency" not in lot:
-            codes = [c for c in ("RUB", "USD", "KZT", "UAH") if has_phrase(" ".join(conditions), c)]
-            if len(codes) == 1:
-                lot["amount_currency"] = codes[0]
+            code = detect_currency(" ".join(conditions))
+            if code:
+                lot["amount_currency"] = code
         self.store.put("lot", lid, lot)
         return lot
+
+    def rebind(self, lid, product_id, item_id):
+        """Bind a lot to another product. Fixed fields that still exist survive; amount settings only on amount forms."""
+        lot = self.store.get("lot", lid)
+        if not lot:
+            raise ShopError("Лот не найден.")
+        lot.update(product_id=str(product_id), item_id=str(item_id))
+        service, item, fields = self.product_form(lot)
+        keys = {field_key(f) for f in fields if not is_amount(f)}
+        lot.update(form=fields, service_name=service.get("name", ""), item_name=item.get("name", ""),
+                   last_cost=str(item.get("price", "")),
+                   native_currency=native_currency(service, open_amount(fields) or {}) or "",
+                   fixed_fields={k: v for k, v in (lot.get("fixed_fields") or {}).items() if k in keys},
+                   aliases={k: v for k, v in (lot.get("aliases") or {}).items() if k in keys})
+        if not open_amount(fields):
+            for key in ("amount_mode", "multiplier", "fixed_amount", "amount_currency", "limits", "price_nominal"):
+                lot.pop(key, None)
+        self.store.put("lot", lid, lot)
+        return lot, service, item, fields
+
+
+CURRENCY_WORDS = {"RUB": ("rub", "руб", "рубли", "рублей", "рубль"), "KZT": ("kzt", "тенге"),
+                  "UAH": ("uah", "гривна", "гривны", "гривен"), "USD": ("usd", "доллар", "доллары", "долларов")}
+
+
+def detect_currency(text):
+    """Steam «Тип валюты» from the lot parameters; only an unambiguous single currency is used."""
+    found = [code for code, words in CURRENCY_WORDS.items() if any(has_phrase(text, w) for w in words)]
+    return found[0] if len(found) == 1 else ""
 
 
 GUIDE = [
     ("Запуск", "<b>AppRoute Top-Up · быстрый запуск</b>\n\n1. Установите AppRouteTopUp_LuckyFunpay.py через загрузчик плагинов Cardinal. Включите плагин и перезапустите бота.\n2. Откройте /approute_topup → Настройки → API. Задайте ключ, регион и прокси, проверьте баланс.\n3. Витрина → Каталог → обновите каталог.\n4. Витрина → Лоты → добавьте ID/ссылку FunPay, выберите товар и номинал.\n5. Проверьте форму, сумму и валюту; отключите другие выдачи для этого лота.\n6. Финансы → Автоцены: задайте курс и наценку.\n7. Включите приём заказов на главном экране. Сделайте одну небольшую покупку с другого аккаунта."),
     ("API и прокси", "<b>Подключение AppRoute</b>\n\nСоздайте ключ в кабинете AppRoute → API Access. Нужны чтение каталога/баланса/заказов и создание заказов (product:read, orders:read, orders:write, доступ к accounts). Добавьте в IP allowlist внешний IP сервера или выбранного прокси. Выберите RU или IO по месту регистрации.\n\nПрокси от бота использует cardinal.account.proxy; без него — IP сервера. Собственный прокси: http://user:password@host:port или socks5h://host:port. Ключ и пароль прокси в панели скрыты. Сообщения с ними удаляются, если Telegram разрешает. Проверка ключа читает баланс, но не делает покупку."),
-    ("Лоты и формы", "<b>Привязка лота</b>\n\nДобавьте ID или ссылку FunPay, найдите товар по названию и выберите точный номинал/регион. В API product_id — ID сервиса, item_id — ID номинала. Диагностика читает форму и делает только бесплатные checkOnly-запросы.\n\nУсловия определения сравниваются вместе, без приблизительного подбора: строки текста или key=value. Если FunPayAPI передал ID лота, он имеет приоритет. Несколько совпадений — ручная проверка.\n\nФиксированные поля задаются строками key=value. «Поля заказа» сопоставляют поле поставщика с полем FunPay. Сумма через эти поля никогда не считывается."),
-    ("Сумма и валюта", "<b>Расчёт суммы</b>\n\nПроизвольная сумма = количество FunPay × множитель. Фиксированная сумма = сумма за одну позицию × количество. Покупатель вводит только аккаунт/сервер; он не может увеличить сумму в чате.\n\nSteam: укажите валюту суммы RUB/KZT/UAH/USD и родную валюту, в которой поставщик задаёт номинал/границы. Курсы приходят из /steam-currency/rates. Для Stars количество означает звёзды: множитель 1, валюту не отправлять. Для Premium выбирайте точный пакет месяцев.\n\nЕсли валюта границ неизвестна, задайте ручные min-max в валюте суммы; плагин остановит оплату до уточнения. Диапазон можно задать с одной границей: 10- или -1000."),
-    ("Автоцены", "<b>Цена на FunPay</b>\n\nЦена закупки USD × курс USD/USDT → RUB × (1 + наценка/100), с нижним/верхним пределом. Кнопка обновления сохраняет цену в лоте FunPay.\n\nДля открытой суммы: цена API / номинал API × сумма одной позиции, с пересчётом валюты. Если API не указал номинал, задайте «База цены» — сумму, которой соответствует эта цена. Если цена API относится к недостоверному номиналу, выключите автоцену для лота.\n\nСинхронизация выключает недоступные лоты и обновляет известные остатки фиксированных пакетов. Отключённые лоты включайте вручную после устранения причины. Баланс API обозначен USD; USDT — способ пополнения кабинета."),
-    ("Диалог", "<b>Данные покупателя</b>\n\nВопросы задаются по форме поставщика. В списках принимаются номер, название или значение. Необязательное поле можно пропустить символом -. Данные из точных полей заказа подставляются автоматически.\n\ncheckOnly проверяет аккаунт и цену без покупки. После проверки покупатель подтверждает найденный ник или введённый аккаунт. «Нет» запускает повторный ввод. Перед оплатой проверка и статус PAID выполняются ещё раз.\n\nНесколько заказов покупателя идут по очереди. Диалоги сохраняются при перезапуске. Слово «отмена» не возвращает деньги; отмену выполняет продавец. Таймаут передаёт заказ продавцу."),
+    ("Лоты и формы", "<b>Привязка лота</b>\n\nДобавьте ID или ссылку FunPay, найдите товар по названию и выберите точный номинал/регион. В API product_id — ID сервиса, item_id — ID номинала. Диагностика читает форму и делает только бесплатные checkOnly-запросы.\n\nУсловия определения сравниваются вместе, без приблизительного подбора: строки текста или key=value. Если FunPayAPI передал ID лота, он имеет приоритет. Несколько совпадений — ручная проверка.\n\nЧерез «/» в условиях, которые вы ввели сами, записываются равнозначные написания: «По логину / by login».\n\nФиксированные поля: карточка лота → 🧩 Фикс. поля → нажмите поле и отправьте значение («-» — снова спрашивать). «Поля заказа» сопоставляют поле поставщика с полем FunPay. Сумма через эти поля никогда не считывается. Ручная привязка: product_id:item_id или два ID через пробел."),
+    ("Сумма и валюта", "<b>Расчёт суммы</b>\n\nПроизвольная сумма = количество FunPay × множитель. «Сумма за 1 шт.» (фиксированная) = эта сумма × количество: покупатель платит за каждую штуку. Режима «спрашивать сумму у покупателя» нет намеренно. Покупатель вводит только аккаунт/сервер; он не может увеличить сумму в чате.\n\nSteam: укажите валюту суммы RUB/KZT/UAH/USD и родную валюту, в которой поставщик задаёт номинал/границы. Курсы приходят из /steam-currency/rates. Для Stars количество означает звёзды: множитель 1, валюту не отправлять. Для Premium выбирайте точный пакет месяцев.\n\nЕсли валюта границ неизвестна, задайте ручные min-max в валюте суммы; плагин остановит оплату до уточнения. Диапазон можно задать с одной границей: 10- или -1000."),
+    ("Автоцены", "<b>Цена на FunPay</b>\n\nЦена закупки USD × курс USD/USDT → RUB × (1 + наценка/100), с нижним/верхним пределом. Кнопка обновления сохраняет цену в лоте FunPay.\n\nДля открытой суммы: цена API / номинал API × сумма одной позиции, с пересчётом валюты. Если API не указал номинал, задайте «База цены» — сумму, которой соответствует эта цена. Если цена API относится к недостоверному номиналу, выключите автоцену для лота.\n\nСинхронизация выключает недоступные лоты и обновляет известные остатки фиксированных пакетов. Отключённые плагином лоты можно включить кнопкой «▶️ Включить отключённые» в списке лотов после устранения причины. Баланс API обозначен USD; USDT — способ пополнения кабинета."),
+    ("Диалог", "<b>Данные покупателя</b>\n\nВопросы задаются по форме поставщика. В списках принимаются номер, название или значение. Необязательное поле можно пропустить символом -. Данные из точных полей заказа подставляются автоматически.\n\ncheckOnly проверяет аккаунт и цену без покупки. Если поставщик вернул ник и включено подтверждение, покупатель отвечает «да»/«нет» (принимаются «Да.», «да, мой», «+»). Без ника вопрос не задаётся. «Нет» запускает повторный ввод. Если покупатель прислал данные сразу после оплаты, они станут ответом на первый вопрос. Перед оплатой проверка и статус PAID выполняются ещё раз.\n\nНесколько заказов покупателя идут по очереди. Диалоги сохраняются при перезапуске. Слово «отмена» не возвращает деньги; отмену выполняет продавец. Таймаут передаёт заказ продавцу."),
     ("Ошибки и возвраты", "<b>Защита оплаты</b>\n\nКаждая операция сохраняет уникальный referenceId и точное тело запроса до отправки денег. После сетевой ошибки плагин читает историю поставщика; новая оплата автоматически не создаётся. После изменения ключа/региона незавершённые операции требуют сверки.\n\nАвтовозврат возможен только до оплаты либо после достоверного отказа/отмены поставщика. Частичный результат, таймаут ответа покупателя, неизвестный итог поставщика, предохранитель и неизвестная форма передаются продавцу без возврата.\n\nПри недостатке баланса или лимите трат ключа лоты отключаются. Ограничение HTTP 429 сохраняет паузу и повторяет безопасные проверки позже. Не удаляйте базу storage/plugins/approute_topup."),
-    ("Заказы и история", "<b>Работа с заказами</b>\n\nЗаказы → Активные: состояние, покупатель и прогресс. История содержит все обслуживаемые заказы, в том числе ошибки и частичные пополнения, номер операции и списание. Финансы → Статистика: выполненные заказы и выручка за 24 часа, 7/30 дней и всё время; закупка отражает все известные списания.\n\n«Сверить операцию» выполняет только чтение AppRoute. «Продолжить диалог» доступно для ручной проверки до любых операций поставщика. «Остановить диалог» передаёт неоплаченный у поставщика заказ вам; деньги не возвращаются.\n\nШаблоны редактируются в Настройки → Сообщения. Обязательные подстановки защищены. Экспорт журнала содержит аккаунты покупателей — храните его приватно."),
+    ("Заказы и история", "<b>Работа с заказами</b>\n\nЗаказы → Активные: состояние, покупатель и прогресс. История содержит все обслуживаемые заказы, в том числе ошибки и частичные пополнения, номер операции и списание. Финансы → Статистика: выполненные заказы и выручка за 24 часа, 7/30 дней и всё время; закупка отражает все известные списания.\n\n«➕ Обработать заказ» ставит в работу заказ по номеру — например, оплаченный, пока бот был выключен. «Сверить операцию» выполняет только чтение AppRoute. «Продолжить диалог» доступно для ручной проверки до любых операций поставщика. «Остановить диалог» передаёт неоплаченный у поставщика заказ вам; деньги не возвращаются.\n\nШаблоны редактируются в Настройки → Сообщения. Подстановки из руководства ({label}, {total}, {error}, {attempt}, {max_attempts}, {done}, {count}) тоже работают. Обязательные подстановки защищены. В экспорте журнала секретные поля скрыты, но аккаунты покупателей остаются — храните его приватно."),
 ]
 
 SETTING_LABELS = {
@@ -1595,7 +2068,11 @@ SETTING_LABELS = {
     "fixed_fields": "Фиксированные поля", "aliases": "Поля из заказа FunPay", "ids": "product_id и item_id",
     "amount_currency": "Валюта суммы", "native_currency": "Родная валюта номинала", "fixed_amount": "Сумма одной позиции",
     "limits": "Границы суммы", "price_nominal": "База цены API", "lot_id": "ID или ссылка на лот", "search": "Поиск в каталоге",
+    "order_id": "Обработать заказ FunPay",
 }
+ORDER_OPS = {"execute", "reconcile"}  # panel actions that change orders run in the order worker
+SUGGEST_STOP = {"пополнение", "пополнения", "быстро", "дешево", "моментально", "авто", "автовыдача", "для", "без",
+                "через", "the", "and", "top", "up", "with", "руб", "шт", "лот", "игры", "игра"}
 
 
 class TelegramUI:
@@ -1634,16 +2111,25 @@ class TelegramUI:
         if mid:
             try:
                 return self.bot.edit_message_text(text, chat, mid, **kwargs)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Same text and buttons: Telegram refuses the edit; do not send a duplicate menu.
+                if "message is not modified" in str(exc):
+                    return None
         return self.bot.send_message(chat, text, **kwargs)
 
     def home(self, chat, mid=None):
         s = self.store.settings()
-        lots, orders = self.store.all("lot"), self.store.all("order")
+        lots, counts = self.store.all("lot"), self.store.count_states()
         products = self.store.get("catalog", "main", {}).get("products", [])
         status = "🟢 Приём заказов включён" if s["enabled"] else "⏸ Приём заказов на паузе"
-        text = f"⚡ <b>{NAME}</b> <code>{VERSION}</code>\n{status}\n\n<b>👛 Счёт</b>\n{esc(s['balance'] or '—')} USD · регион {s['region']}\n\n<b>🛍 Витрина</b>\nЛотов: {sum(bool(l.get('item_id')) for l in lots)} · товаров: {len(products)}\n\n<b>📋 Заказы</b>\nВ работе: {sum(r['state'] in ACTIVE_STATES for r in orders)} · выполнено: {sum(r['state']=='done' for r in orders)}\n\nАвтор: <a href='{SUPPORT_URL}'>{CREDITS}</a>"
+        key = "задан" if s["api_key"] else "не задан"
+        disabled = sum(bool(l.get("disabled_by_plugin")) for l in lots)
+        text = (f"⚡ <b>{NAME}</b> <code>{VERSION}</code>\n{status}\n\n<b>👛 Счёт</b>\n{esc(s['balance'] or '—')} USD · регион {s['region']} · ключ {key}"
+                f"\n\n<b>🛍 Витрина</b>\nЛотов: {sum(bool(l.get('item_id')) for l in lots)} · товаров: {len(products)}"
+                + (f" · отключено плагином: {disabled}" if disabled else "") +
+                f"\n\n<b>📋 Заказы</b>\nДиалогов: {sum(counts.get(x, 0) for x in WAIT_STATES)} · в работе: {sum(counts.get(x, 0) for x in ACTIVE_STATES)}"
+                f" · выполнено: {counts.get('done', 0)} · ждут продавца: {counts.get('review', 0) + counts.get('partial', 0)}"
+                f"\n\nАвтор: <a href='{SUPPORT_URL}'>{CREDITS}</a>")
         rows = [[("⏸ Пауза" if s["enabled"] else "▶️ Включить", ("enable", not s["enabled"])), ("🔔 Уведомления" if s["notifications"] else "🔕 Уведомления", ("toggle", "notifications", "home"))],
                 [("🛍 Витрина", ("showcase",)), ("📋 Заказы", ("orders",))],
                 [("💰 Финансы", ("finance",)), ("⚙️ Настройки", ("settings",))],
@@ -1656,10 +2142,12 @@ class TelegramUI:
         if not lot:
             raise ShopError("Лот удалён.")
         fixed = ", ".join(f"{k}={v}" for k, v in lot.get("fixed_fields", {}).items()) or "—"
-        text = f"🛍 <b>{esc(lot['name'])}</b>\nFunPay ID: <code>{lid}</code>\n\n<b>Привязка</b>\n{esc(lot.get('service_name', 'Товар не выбран'))}\n{esc(lot.get('item_name', ''))}\nproduct_id: <code>{esc(lot.get('product_id', '—'))}</code>\nitem_id: <code>{esc(lot.get('item_id', '—'))}</code>\n\n<b>Расчёт</b>\nРежим: {esc(lot.get('amount_mode') or self.store.settings()['amount_mode'])} · множитель {esc(lot.get('multiplier') or self.store.settings()['multiplier'])}\nФикс. сумма: {esc(lot.get('fixed_amount', '—'))} · валюта {esc(lot.get('amount_currency', 'как у поставщика') or 'не отправлять')}\nЦена API: {esc(lot.get('last_cost', '—'))} USD · FunPay {esc(lot.get('last_price', '—'))} ₽\nФикс. поля: {esc(fixed)}\nУсловия: {esc('; '.join(lot.get('conditions', [])))}\n{esc(lot.get('sync_error', ''))}"
-        rows = [[("🔗 Выбрать товар", ("ask", "search", lid)), ("🔎 Форма и диагностика", ("diagnose", lid))],
-                [("🧮 Сумма", ("amount", lid)), ("🌍 Валюта", ("currency", lid))],
-                [("🧩 Фикс. поля", ("ask", "fixed_fields", lid)), ("📥 Поля заказа", ("ask", "aliases", lid))],
+        disabled = f"\n⚠️ Отключён плагином: {lot.get('disabled_reason', '')}" if lot.get("disabled_by_plugin") else ""
+        text = f"🛍 <b>{esc(lot['name'])}</b>\nFunPay ID: <code>{lid}</code>\n\n<b>Привязка</b>\n{esc(lot.get('service_name', 'Товар не выбран'))}\n{esc(lot.get('item_name', ''))}\nproduct_id: <code>{esc(lot.get('product_id', '—'))}</code>\nitem_id: <code>{esc(lot.get('item_id', '—'))}</code>\n\n<b>Расчёт</b>\nРежим: {esc(lot.get('amount_mode') or self.store.settings()['amount_mode'])} · множитель {esc(lot.get('multiplier') or self.store.settings()['multiplier'])}\nСумма за 1 шт.: {esc(lot.get('fixed_amount', '—'))} · валюта {esc(lot.get('amount_currency', 'как у поставщика') or 'не отправлять')}\nЦена API: {esc(lot.get('last_cost', '—'))} USD · FunPay {esc(lot.get('last_price', '—'))} ₽\nФикс. поля: {esc(fixed)}\nУсловия: {esc('; '.join(lot.get('conditions', [])))}\n{esc(lot.get('sync_error', ''))}{esc(disabled)}"
+        rows = [[("🎯 Автоподбор", ("suggest", lid, 0)), ("🔍 Поиск товара", ("ask", "search", lid))],
+                [("🔎 Форма и диагностика", ("diagnose", lid)), ("🧮 Сумма", ("amount", lid))],
+                [("🌍 Валюта", ("currency", lid)), ("🧩 Фикс. поля", ("fixed", lid))],
+                [("📥 Поля заказа", ("ask", "aliases", lid))],
                 [("✏️ Название", ("ask", "name", lid)), ("🎯 Условия", ("ask", "conditions", lid))],
                 [("💰 Автоцена: " + ("вкл" if lot.get("auto_price", True) else "выкл"), ("lot_toggle", lid, "auto_price")), ("🔢 Ввести ID", ("ask", "ids", lid))],
                 [("♻️ Перечитать", ("reread", lid)), ("🗑 Удалить", ("confirm", "delete_lot", lid))],
@@ -1688,6 +2176,58 @@ class TelegramUI:
         self.paged(chat, values, "🗂 <b>Каталог прямого пополнения</b>\n" + ("Поиск: " + esc(query) if query else "Выберите сервис"),
                    ("catalog", lid, query), page, lambda p: str(p.get("name", p["id"])), lambda p: ("items", lid, p["id"], 0), mid,
                    [[("🔍 Поиск", ("ask", "search", lid)), ("🔄 Обновить", ("refresh_catalog",))]])
+
+    def suggest(self, chat, lid, page=0, mid=None):
+        """Auto-match: catalogue services sharing words with the FunPay lot title."""
+        lot = self.store.get("lot", lid)
+        if not lot:
+            raise ShopError("Лот не найден.")
+        if not self.products():
+            raise ShopError("Каталог ещё не загружен. Проверьте ключ и нажмите «🔄 Обновить» в каталоге.")
+        words = [w for w in normalized(lot.get("title") or lot.get("name", "")).split() if len(w) >= 3 and w not in SUGGEST_STOP]
+        scored = []
+        for p in self.products():
+            name = " " + normalized(str(p.get("name", "")) + " " + str(p.get("categoryName", ""))) + " "
+            score = sum(f" {w} " in name for w in words)
+            if score:
+                scored.append((-score, str(p.get("name", "")), p))
+        values = [p for *_, p in sorted(scored, key=lambda x: x[:2])][:60]
+        self.paged(chat, values, f"🎯 <b>Автоподбор для лота</b>\n{esc(lot.get('title') or lot['name'])}\n"
+                   + ("Выберите сервис, затем номинал." if values else "Совпадений нет — используйте поиск или каталог."),
+                   ("suggest", lid), page, lambda p: str(p.get("name", p["id"])), lambda p: ("items", lid, p["id"], 0), mid,
+                   [[("🔍 Поиск", ("ask", "search", lid)), ("🗂 Каталог", ("catalog", lid, "", 0))], [("📦 Лот", ("lot", lid))]])
+
+    def item_label(self, item):
+        s = self.store.settings()
+        try:
+            rub = " ≈ " + calculate_price(item["price"], s) + " ₽" if str(item.get("currency", "")).upper() in {"USD", "USDT"} else ""
+        except (KeyError, ShopError):
+            rub = ""
+        try:
+            mark = "" if available(item) else "🚫 "
+        except ShopError:
+            mark = ""
+        return f"{mark}{item.get('name', item['id'])} | {item.get('price', '—')} {item.get('currency', '')}{rub}"
+
+    def fixed(self, chat, lid, mid=None):
+        lot = self.store.get("lot", lid)
+        if not lot:
+            raise ShopError("Лот не найден.")
+        form = lot.get("form") or []
+        if not form:
+            raise ShopError("Форма товара ещё не загружена. Нажмите «🔎 Форма и диагностика» в карточке лота.")
+        fixed = lot.get("fixed_fields") or {}
+        lines, rows = [], []
+        for f in form:
+            key = field_key(f)
+            if is_amount(f):
+                lines.append(f"🔢 {f.get('label') or key} — сумма считается из заказа")
+                continue
+            mark = "📌" if key in fixed else "❓"
+            lines.append(f"{mark} {f.get('label') or key}" + (f" = {fixed[key]}" if key in fixed else " — спросим у покупателя"))
+            rows.append([(f"{mark} {f.get('label') or key}"[:60], ("ask", "fixed_field:" + key, lid))])
+        rows.append([("📦 Лот", ("lot", lid)), ("🏠 Главная", ("home",))])
+        self.show(chat, "🧩 <b>Фиксированные поля</b>\nНажмите поле, чтобы задать значение; «-» — снова спрашивать.\n\n" + esc("\n".join(lines)), rows, mid)
 
     def pricing(self, chat, mid=None):
         s = self.store.settings()
@@ -1718,9 +2258,9 @@ class TelegramUI:
         buttons = [(label + (" · вкл" if s[key] else " · выкл"), ("toggle", key, "dialog")) for key, label in fields]
         rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
         rows.extend([[("⏰ Ответ: " + str(s["timeout_min"]) + " мин", ("ask", "timeout_min", "")), ("🔁 Попытки: " + str(s["input_attempts"]), ("ask", "input_attempts", ""))],
-                     [("🧮 Множитель", ("ask", "multiplier", "")), ("⌛ Поставщик", ("ask", "poll_timeout", ""))],
+                     [("🧮 Множитель: " + str(s["multiplier"]), ("ask", "multiplier", "")), ("⌛ Поставщик: " + str(s["poll_timeout"]) + " мин", ("ask", "poll_timeout", ""))],
                      [("✉️ Сообщения", ("templates", 0)), ("⚙️ Настройки", ("settings",))]])
-        self.show(chat, "💬 <b>Сценарий покупателя</b>\n\nДанные → бесплатная проверка → подтверждение → пополнение.\nСумма определяется оплаченным количеством, не сообщениями покупателя.\nОчередь и ответы сохраняются после перезапуска.", rows, mid)
+        self.show(chat, "💬 <b>Сценарий покупателя</b>\n\nДанные → бесплатная проверка → подтверждение (если поставщик вернул ник) → пополнение.\nСумма определяется оплаченным количеством, не сообщениями покупателя.\nОчередь и ответы сохраняются после перезапуска.", rows, mid)
 
     def order(self, chat, oid, mid=None):
         r = self.store.get("order", oid)
@@ -1728,10 +2268,10 @@ class TelegramUI:
             raise ShopError("Заказ не найден.")
         transactions = r.get("transactions", [])
         refs = "\n".join(f"{t.get('provider_id', '—')} · {t['reference']} · {t['state']}" for t in transactions)
-        data = ", ".join(f"{k}: {'••••' if any(x in k.lower() for x in ('pass', 'secret', 'token')) else v}" for k, v in r.get("data", {}).items())
-        text = f"📋 <b>Заказ #{esc(oid)}</b>\n{esc(STATE_NAMES.get(r['state'], r['state']))}\n\n<b>Покупатель</b>\n{esc(r.get('buyer', '—'))} · ID {esc(r.get('buyer_id', '—'))}\nВыручка: {esc(r.get('revenue', '—'))} ₽\n\n<b>Пополнение</b>\n{esc(r.get('lot', {}).get('name', '—'))}\nКоличество: {r.get('quantity', '—')} · прогресс {r.get('completed', 0)}/{r.get('operations', '—')}\nЗакупка: {esc(r.get('cost', '0'))} USD\n{esc(data)}\n\n<b>Операции</b>\n<code>{esc(refs or 'не отправлялись')}</code>\n\n{esc(r.get('reason', ''))}"
+        data = ", ".join(f"{k}: {v}" for k, v in masked_data(r.get("data"), r.get("fields")).items())
+        text = f"📋 <b>Заказ #{esc(oid)}</b>\n{esc(STATE_NAMES.get(r['state'], r['state']))}\n\n<b>Покупатель</b>\n{esc(r.get('buyer', '—'))} · ID {esc(r.get('buyer_id', '—'))}\nВыручка: {esc(r.get('revenue', '—'))} ₽\n\n<b>Пополнение</b>\n{esc(r.get('lot', {}).get('name', '—'))}\nКоличество: {r.get('quantity', '—')} · прогресс {r.get('completed', 0)}/{r.get('operations', '—')}\nЗакупка: {esc(r.get('cost', '0'))} USD\n{esc(data)}\n\n<b>Операции</b>\n<code>{esc(refs or 'не отправлялись')}</code>\n\n{esc(r.get('reason', ''))}" + (f"\nПоследняя ошибка: {esc(r['last_error'])}" if r.get("last_error") and r["state"] in ACTIVE_STATES else "")
         rows = [[("💙 FunPay", f"https://funpay.com/orders/{quote(oid, safe='')}/")]]
-        if r.get("buyer_id", "").isdigit():
+        if str(r.get("buyer_id", "")).isdigit():
             rows[0].append(("👤 Покупатель", f"https://funpay.com/users/{r['buyer_id']}/"))
         if transactions:
             rows.append([("🔎 Сверить операцию", ("reconcile", oid))])
@@ -1758,9 +2298,13 @@ class TelegramUI:
 
     def prompt(self, chat, user, key, lid=""):
         hints = {"lot_id": "Отправьте ID или ссылку https://funpay.com/lots/offer?id=12345.",
-                 "fixed_fields": "Строки key=value. Список допустимых полей — в диагностике. Сумму здесь задавать нельзя. '-' — очистить.",
+                 "fixed_fields": "Строки key=value. Удобнее: карточка лота → 🧩 Фикс. поля. Сумму здесь задавать нельзя. '-' — очистить.",
+                 "order_id": "Номер заказа FunPay (например, ABCD1234) или ссылка на заказ. Подходит заказ, оплаченный пока бот был выключен, или пропущенный до привязки лота.",
+                 "fixed_amount": "Сумма пополнения за одну купленную штуку. Итог = сумма × количество в заказе. '-' — убрать.",
+                 "multiplier": "Сколько единиц пополнения даёт одна купленная штука (Steam 1 ₽ за шт. → 1; «100 алмазов» → 100). '-' — общий множитель.",
+                 "interval": "Минуты между обновлениями цен, не меньше 20.",
                  "aliases": "Строки ключ_поставщика=ключ_поля_FunPay. '-' — очистить.",
-                 "ids": "product_id item_id (два ID через пробел).", "conditions": "Все условия должны совпадать. По одному на строке: фраза или key=value. '-' — вернуть прочитанные условия.",
+                 "ids": "product_id:item_id или два ID через пробел.", "conditions": "Все условия должны совпадать. По одному на строке или через запятую: фраза или key=value. Равнозначные написания — через /: «По логину / by login». '-' — вернуть прочитанные условия.",
                  "limits": "min-max, например 50-10000. '-' — границы поставщика.",
                  "amount_currency": "Три латинские буквы, например RUB. '-' — не отправлять валюту.",
                  "native_currency": "Родная валюта, в которой задан номинал и границы API (например USD). '-' — убрать.",
@@ -1769,14 +2313,31 @@ class TelegramUI:
         if key.startswith("template:"):
             name = key.split(":", 1)[1]
             title = TEMPLATES[name][0]
-            hint = "Подстановки: " + ", ".join("{" + k + "}" for k in sorted(TEMPLATE_FIELDS)) + "\nОбязательные: " + ", ".join(REQUIRED_TEMPLATE_FIELDS.get(name, set())) + "\n'-' — стандартный текст."
+            hint = "Подстановки: " + ", ".join("{" + k + "}" for k in sorted(TEMPLATE_FIELDS)) + "\nОбязательные: " + required_hint(name) + "\n'-' — стандартный текст."
+        elif key.startswith("fixed_field:"):
+            field_name = key.split(":", 1)[1]
+            lot = self.store.get("lot", lid) or {}
+            field = next((f for f in lot.get("form") or [] if field_key(f) == field_name), {})
+            options = "\n".join(f"{o['value']} — {o.get('label', o['value'])}" for o in field.get("options") or [])
+            title = "Фиксированное поле: " + str(field.get("label") or field_name)
+            hint = ("Допустимые значения (код перед тире):\n" + options + "\n" if options else "") + "Отправьте значение. '-' — спрашивать у покупателя."
         else:
             title, hint = SETTING_LABELS.get(key, key), hints.get(key, "Отправьте новое значение одним сообщением.")
         sent = self.bot.send_message(chat, "✏️ <b>" + esc(title) + "</b>\n\n" + esc(hint) + "\n\nОтветьте на это сообщение. Отмена: /topup_cancel", parse_mode="HTML")
         self.pending[(str(chat), str(user))] = (key, lid, sent.message_id, time.time())
 
     def has_input(self, message):
-        return (str(message.chat.id), str(message.from_user.id)) in self.pending
+        key = (str(message.chat.id), str(message.from_user.id))
+        pending = self.pending.get(key)
+        if not pending:
+            return False
+        if time.time() - pending[3] > 900:
+            # An abandoned form must not capture the admin's later messages.
+            self.pending.pop(key, None)
+            return False
+        text = message.text or ""
+        # Other bot commands pass through to their own handlers.
+        return not (text.startswith("/") and text.split("@")[0] != "/topup_cancel")
 
     def message(self, message):
         if not self.allowed(message.from_user, message.chat):
@@ -1792,6 +2353,7 @@ class TelegramUI:
             return
         reply = getattr(message, "reply_to_message", None)
         if time.time()-created > 900 or reply and reply.message_id != prompt_id:
+            self.pending.pop(key, None)
             self.show(message.chat.id, "Форма ввода устарела или ответ относится к другому сообщению. Откройте настройку снова.")
             return
         value = message.text or ""
@@ -1802,20 +2364,31 @@ class TelegramUI:
                 pass
         def action():
             try:
-                self.apply_input(name, lid, value)
+                result = self.apply_input(name, lid, value)
                 self.pending.pop(key, None)
                 if name == "search":
                     self.catalog(message.chat.id, lid, value)
+                elif name == "lot_id":
+                    # Straight to auto-match, as the guide describes; the card when the catalogue is empty.
+                    if self.products():
+                        self.suggest(message.chat.id, result["id"])
+                    else:
+                        self.lot(message.chat.id, result["id"])
+                elif name == "order_id":
+                    self.order(message.chat.id, result)
+                elif name.startswith("fixed_field:"):
+                    self.fixed(message.chat.id, lid)
                 elif lid:
                     self.lot(message.chat.id, lid)
                 else:
                     self.home(message.chat.id)
             except Exception as exc:
                 self.show(message.chat.id, esc(str(exc) if isinstance(exc, ShopError) else "Ошибка сохранения. Проверьте данные и повторите."))
-        self.shop.submit(action)
+        # Order changes run with purchases; settings and lots in the service worker.
+        self.shop.submit(action, service=name != "order_id")
 
     def ensure_identity_change(self):
-        if any(r.get("transactions") and r["state"] in ACTIVE_STATES | {"review", "partial"} for r in self.store.all("order")):
+        if any(r.get("transactions") for r in self.store.orders_in(ACTIVE_STATES | {"review", "partial"})):
             raise ShopError("Сначала завершите сверку незавершённых операций; менять ключ/регион сейчас нельзя.")
 
     def apply_input(self, key, lid, value):
@@ -1825,7 +2398,25 @@ class TelegramUI:
                 raise ShopError("Поиск: не более 100 символов.")
             return
         if key == "lot_id":
-            self.shop.read_lot(lot_id_from_text(value))
+            return self.shop.read_lot(lot_id_from_text(value))
+        if key == "order_id":
+            oid = order_id_from_text(value)
+            self.shop.manual_enqueue(oid)
+            return oid
+        if key.startswith("fixed_field:"):
+            name = key.split(":", 1)[1]
+            lot = self.store.get("lot", lid)
+            if not lot:
+                raise ShopError("Лот не найден.")
+            field = next((f for f in lot.get("form") or [] if field_key(f) == name), None)
+            if not field or is_amount(field):
+                raise ShopError("Поле не найдено в форме товара. Выполните диагностику формы.")
+            fixed = dict(lot.get("fixed_fields") or {})
+            if value == "-":
+                fixed.pop(name, None)
+            else:
+                fixed[name] = validate_field(field, value, lot.get("service_name", ""), self.store.settings())
+            self.store.patch("lot", lid, fixed_fields=fixed)
             return
         if key.startswith("template:"):
             name = key.split(":", 1)[1]
@@ -1863,19 +2454,23 @@ class TelegramUI:
                     data[k] = validate_field(field, v, lot.get("service_name", ""), self.store.settings()) if key == "fixed_fields" else v
                 lot[key] = data
             elif key == "conditions":
-                lot[key] = lot.get("suggested_conditions", []) if value == "-" else [x.strip() for x in value.splitlines() if x.strip()]
+                if value == "-":
+                    lot[key] = lot.get("suggested_conditions", [])
+                    lot.pop("conditions_manual", None)
+                else:
+                    lines = value.splitlines() if "\n" in value else value.split(",")
+                    lot[key] = [x.strip() for x in lines if x.strip()]
+                    lot["conditions_manual"] = True
             elif key == "name":
                 if not 1 <= len(value) <= 120:
                     raise ShopError("Название: 1–120 символов.")
                 lot[key] = value
             elif key == "ids":
-                ids = value.split()
+                ids = value.replace(":", " ").split()
                 if len(ids) != 2 or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", x) for x in ids):
-                    raise ShopError("Нужны два ID через пробел.")
-                lot.update(product_id=ids[0], item_id=ids[1])
-                service, item, fields = self.shop.product_form(lot)
-                lot.update(form=fields, service_name=service.get("name", ""), item_name=item.get("name", ""),
-                           last_cost=str(item.get("price", "")), native_currency=native_currency(service, open_amount(fields) or {}) or lot.get("native_currency", ""), fixed_fields={}, aliases={})
+                    raise ShopError("Нужно product_id:item_id или два ID через пробел.")
+                self.shop.rebind(lid, ids[0], ids[1])
+                return
             elif key in {"amount_currency", "native_currency"}:
                 if value != "-" and not re.fullmatch(r"[A-Za-z]{3}", value):
                     raise ShopError("Нужен код валюты из трёх латинских букв или '-'.")
@@ -1911,6 +2506,9 @@ class TelegramUI:
         if not dec(low) <= number <= dec(high):
             raise ShopError(f"Допустимый диапазон: {low}–{high}.")
         val = integer(number) if key in {"interval", "max_quantity", "timeout_min", "input_attempts", "catalog_interval", "poll_timeout"} else str(number)
+        if key == "interval":
+            # Frequent full syncs hit FunPay and AppRoute limits; the guide's minimum is 20 minutes.
+            val = max(20, val)
         s = self.store.settings()
         s[key] = val
         if dec(s["min_price"]) > dec(s["max_price"]):
@@ -1939,7 +2537,8 @@ class TelegramUI:
             return
         action = entry[1]
         chat, user, mid = call.message.chat.id, call.from_user.id, call.message.message_id
-        # Keep HTTP out of the Telegram handler. All mutations run in the same worker as purchases.
+        # Keep HTTP out of the Telegram handler. Order mutations run in the same worker as purchases;
+        # catalogue/price/lot actions run in the service worker and do not delay buyer dialogs.
         def run():
             try:
                 self.dispatch(chat, user, action, mid)
@@ -1947,7 +2546,7 @@ class TelegramUI:
                 self.show(chat, esc(str(exc)), mid=mid)
             except Exception as exc:
                 self.show(chat, esc(str(exc) if isinstance(exc, ShopError) else "Не удалось выполнить действие. Проверьте подключение."), mid=mid)
-        self.shop.submit(run)
+        self.shop.submit(run, service=action[0] not in ORDER_OPS)
 
     def dispatch(self, chat, user, action, mid=None):
         op, *args = action
@@ -1957,9 +2556,9 @@ class TelegramUI:
         elif op in {"showcase", "orders", "finance", "settings"}:
             panels = {
                 "showcase": ("🛍 <b>Витрина</b>\nПривяжите ваши лоты к номиналам поставщика.", [[("📦 Лоты", ("lots", 0)), ("🗂 Каталог", ("catalog", "", "", 0))], [("➕ Добавить лот", ("ask", "lot_id", "")), ("🏠 Главная", ("home",))]]),
-                "orders": ("📋 <b>Центр заказов</b>\nДиалоги, выполнение и операции поставщика.", [[("💬 Активные", ("active", 0)), ("📜 История", ("history", 0))], [("📥 Экспорт", ("export",)), ("🏠 Главная", ("home",))]]),
+                "orders": ("📋 <b>Центр заказов</b>\nДиалоги, выполнение и операции поставщика.", [[("💬 Активные", ("active", 0)), ("📜 История", ("history", 0))], [("➕ Обработать заказ", ("ask", "order_id", "")), ("🛠 Ждут продавца", ("attention", 0))], [("📥 Экспорт", ("export",)), ("🏠 Главная", ("home",))]]),
                 "finance": ("💰 <b>Финансы</b>\nБаланс: " + esc(s["balance"] or "—") + " USD", [[("💱 Автоцены", ("pricing",)), ("📊 Статистика", ("stats",))], [("👛 Обновить баланс", ("balance",)), ("🛡 Защита", ("safety",))], [("🏠 Главная", ("home",))]]),
-                "settings": ("⚙️ <b>Настройки</b>\nПодключение и общие правила работы.", [[("🔑 API", ("api",)), ("💬 Диалог", ("dialog",))], [("✉️ Сообщения", ("templates", 0)), ("📖 Инструкция", ("guide", 0))], [("👤 Автор", SUPPORT_URL), ("📣 Канал", DEVELOPER_URL)], [("🏠 Главная", ("home",))]])}
+                "settings": ("⚙️ <b>Настройки</b>\nПодключение и общие правила работы.\nУведомления приходят в чаты: " + esc(", ".join(str(c) for c in s["notify_chats"]) or "—"), [[("🔑 API", ("api",)), ("💬 Диалог", ("dialog",))], [("✉️ Сообщения", ("templates", 0)), ("📖 Инструкция", ("guide", 0))], [("🔕 Убрать этот чат из уведомлений", ("unnotify",))], [("👤 Автор", SUPPORT_URL), ("📣 Канал", DEVELOPER_URL)], [("🏠 Главная", ("home",))]])}
             text, rows = panels[op]
             self.show(chat, text, rows, mid)
         elif op == "enable":
@@ -1989,18 +2588,36 @@ class TelegramUI:
             self.shop.record_balance(self.shop.api().balance())
             self.show(chat, "✅ Подключение работает. Баланс: <b>" + esc(self.store.settings()["balance"]) + " USD</b>\nПрава на создание заказов проверяются при работе; тестовая покупка не выполнялась.", [[("🔑 API", ("api",)), ("🏠 Главная", ("home",))]], mid)
         elif op == "lots":
-            self.paged(chat, self.store.all("lot"), "📦 <b>Лоты FunPay</b>", ("lots",), args[0], lambda l: f"{l['id']} · {l['name']}", lambda l: ("lot", l["id"]), mid,
-                       [[("➕ Добавить", ("ask", "lot_id", "")), ("🗂 Каталог", ("catalog", "", "", 0))]])
+            lots = self.store.all("lot")
+            extra = [[("➕ Добавить", ("ask", "lot_id", "")), ("🗂 Каталог", ("catalog", "", "", 0))]]
+            disabled = sum(bool(l.get("disabled_by_plugin")) for l in lots)
+            if disabled:
+                extra.append([(f"▶️ Включить отключённые ({disabled})", ("enable_lots",))])
+            self.paged(chat, lots, "📦 <b>Лоты FunPay</b>", ("lots",), args[0],
+                       lambda l: ("⛔ " if l.get("disabled_by_plugin") else "⏸ " if not l.get("auto_price", True) else "⚡ ") + f"{l['name']} (ID: {l['id']})",
+                       lambda l: ("lot", l["id"]), mid, extra)
+        elif op == "enable_lots":
+            enabled, errors = self.shop.enable_disabled_lots()
+            self.show(chat, f"▶️ Включено лотов: {enabled}. Ошибок: {errors}.", [[("📦 Лоты", ("lots", 0)), ("🏠 Главная", ("home",))]], mid)
         elif op == "lot":
             self.lot(chat, args[0], mid)
+        elif op == "suggest":
+            self.suggest(chat, args[0], args[1], mid)
+        elif op == "fixed":
+            self.fixed(chat, args[0], mid)
         elif op == "lot_toggle":
             lid, key = args
             lot = self.store.get("lot", lid)
+            if not lot:
+                raise ShopError("Лот не найден.")
             self.store.patch("lot", lid, **{key: not lot.get(key, True)})
             self.lot(chat, lid, mid)
         elif op == "reread":
-            self.shop.read_lot(args[0])
+            self.shop.read_lot(args[0], reread=True)
             self.lot(chat, args[0], mid)
+        elif op == "unnotify":
+            self.store.configure(notify_chats=[c for c in s["notify_chats"] if str(c) != str(chat)])
+            self.show(chat, "🔕 Этот чат убран из уведомлений. Вернуть: отправьте /approute_topup.", [[("🏠 Главная", ("home",))]], mid)
         elif op == "catalog":
             self.catalog(chat, *args, mid=mid)
         elif op == "refresh_catalog":
@@ -2011,18 +2628,32 @@ class TelegramUI:
             p = next((p for p in self.products() if str(p["id"]) == pid), None)
             if not p:
                 raise ShopError("Сервис не найден. Обновите каталог.")
-            self.paged(chat, p.get("items", []), "🗂 <b>" + esc(p.get("name", pid)) + "</b>", ("items", lid, pid), page,
-                       lambda i: f"{i.get('name', i['id'])} · {i.get('price', '—')} {i.get('currency', '')}", lambda i: ("bind" if lid else "inspect_item", lid, pid, i["id"]), mid)
+            self.paged(chat, p.get("items", []), "🗂 <b>" + esc(p.get("name", pid)) + "</b>\nЦена в ₽ — с вашим курсом и наценкой. 🚫 — недоступно у поставщика.", ("items", lid, pid), page,
+                       self.item_label, lambda i: ("bind" if lid else "inspect_item", lid, pid, i["id"]), mid,
+                       [[("⬅️ К автоподбору", ("suggest", lid, 0)), ("📦 Лот", ("lot", lid))]] if lid else None)
         elif op == "inspect_item":
             _, pid, iid = args
             self.show(chat, f"🔢 product_id: <code>{esc(pid)}</code>\nitem_id: <code>{esc(iid)}</code>\nДобавьте лот и выберите этот номинал в карточке.", [[("➕ Добавить лот", ("ask", "lot_id", "")), ("🏠 Главная", ("home",))]], mid)
         elif op == "bind":
             lid, pid, iid = args
-            self.apply_input("ids", lid, f"{pid} {iid}")
-            self.lot(chat, lid, mid)
+            lot, service, item, fields = self.shop.rebind(lid, pid, iid)
+            asks = [str(f.get("label") or field_key(f)) for f in fields if not is_amount(f) and field_key(f) not in (lot.get("fixed_fields") or {})]
+            try:
+                price = calculate_price(self.shop.unit_cost(lot, item, service, fields), s) + " ₽"
+            except ShopError as exc:
+                price = "не рассчитана: " + str(exc)
+            amount = open_amount(fields)
+            text = (f"✅ <b>Лот привязан!</b>\n{esc(lot['name'])} (ID {esc(lid)})\n\nAppRoute: {esc(service.get('name', ''))} · {esc(item.get('name', ''))}\n"
+                    f"Себестоимость: {esc(item.get('price', '—'))} {esc(item.get('currency', ''))}\nРасчётная цена лота: {esc(price)}\n"
+                    f"product_id <code>{esc(pid)}</code> · item_id <code>{esc(iid)}</code>\n\nСпросим у покупателя: {esc(', '.join(asks) or 'ничего')}"
+                    + ("\n\n💱 Сумма произвольная: она считается как количество в заказе × множитель. Проверьте «🧮 Сумма» и «🌍 Валюта»." if amount else ""))
+            rows = [[("📦 Карточка лота", ("lot", lid)), ("🔎 Диагностика", ("diagnose", lid))]]
+            if amount:
+                rows.insert(0, [("🧮 Сумма", ("amount", lid)), ("🌍 Валюта", ("currency", lid))])
+            self.show(chat, text, rows, mid)
         elif op == "diagnose":
             lot = self.store.get("lot", args[0])
-            if not lot.get("item_id"):
+            if not lot or not lot.get("item_id"):
                 raise ShopError("Сначала выберите товар.")
             service, item, fields = self.shop.product_form(lot)
             lines = [f"{field_key(f)} · {f.get('type', 'text')} · {'обязательно' if f.get('required') else 'необязательно'}" + (" · из оплаченного заказа" if is_amount(f) else "") + ("\nВарианты: " + ", ".join(str(o['value']) for o in f.get('options', [])) if f.get('options') else "") for f in fields]
@@ -2030,20 +2661,49 @@ class TelegramUI:
         elif op == "amount":
             lid = args[0]
             lot = self.store.get("lot", lid)
-            self.show(chat, "🧮 <b>Сумма лота</b>\nРежим: " + esc(lot.get("amount_mode") or s["amount_mode"]) + "\nСумма рассчитывается за каждую оплаченную позицию. Покупатель её не задаёт.",
-                      [[("Из количества", ("amount_mode", lid, "quantity")), ("Фиксированная", ("amount_mode", lid, "fixed"))],
-                       [("✖️ Множитель", ("ask", "multiplier", lid)), ("📌 Фикс. сумма", ("ask", "fixed_amount", lid))],
+            if not lot:
+                raise ShopError("Лот не найден.")
+            mode = lot.get("amount_mode") or s["amount_mode"]
+            try:
+                example = self.shop.amount_value(lot, 3, s)
+                example = f"\nПример: заказ на 3 шт. → пополнение на {example}" + (f" {lot.get('amount_currency')}" if lot.get("amount_currency") else "")
+            except ShopError as exc:
+                example = "\n⚠️ " + str(exc)
+            limits = lot.get("limits") or {}
+            self.show(chat, "🧮 <b>Сумма лота</b>\nРежим: " + ("🔘 из количества × множитель " + esc(lot.get("multiplier") or s["multiplier"]) if mode == "quantity" else "🔘 сумма за 1 шт. " + esc(lot.get("fixed_amount", "не задана")) + " × количество")
+                      + (f"\nРучные границы: {esc(limits.get('min') or '—')}–{esc(limits.get('max') or '—')}" if limits else "\nГраницы: как у поставщика")
+                      + esc(example) + "\nСумма считается из оплаченного количества. Покупатель её не задаёт.",
+                      [[("Из количества", ("amount_mode", lid, "quantity")), ("Сумма за 1 шт.", ("amount_mode", lid, "fixed"))],
+                       [("✖️ Множитель", ("ask", "multiplier", lid)), ("📌 Сумма за 1 шт.", ("ask", "fixed_amount", lid))],
+                       [("♻️ Вернуть общую настройку", ("amount_mode", lid, ""))],
                        [("📏 Границы", ("ask", "limits", lid)), ("💰 База цены", ("ask", "price_nominal", lid))],
                        [("🌍 Валюта", ("currency", lid)), ("📦 Лот", ("lot", lid))]], mid)
         elif op == "amount_mode":
+            if args[1] not in {"quantity", "fixed", ""}:
+                raise ShopError("Неизвестный режим суммы.")
             self.store.patch("lot", args[0], amount_mode=args[1])
             self.dispatch(chat, user, ("amount", args[0]), mid)
         elif op == "currency":
             lid = args[0]
             lot = self.store.get("lot", lid)
+            if not lot:
+                raise ShopError("Лот не найден.")
             self.show(chat, "🌍 <b>Валюта суммы</b>\nВыбрана: " + esc(lot.get("amount_currency", "поставщика") or "не отправлять") + "\nРодная: " + esc(lot.get("native_currency", "не задана")) + "\nДля Stars и TON валюту не отправляйте.",
-                      [[("💱 Код валюты", ("ask", "amount_currency", lid)), ("🏦 Родная валюта", ("ask", "native_currency", lid))],
+                      [[(("🔘 " if lot.get("amount_currency") == code else "⚪️ ") + code, ("set_currency", lid, code)) for code in ("RUB", "USD", "KZT", "UAH")],
+                       [(("🔘 " if lot.get("amount_currency") == "" else "⚪️ ") + "Не отправлять", ("set_currency", lid, "")), (("🔘 " if "amount_currency" not in lot else "⚪️ ") + "Как у поставщика", ("set_currency", lid, None))],
+                       [("💱 Код валюты", ("ask", "amount_currency", lid)), ("🏦 Родная валюта", ("ask", "native_currency", lid))],
                        [("📊 Курсы Steam", ("rates", lid)), ("📦 Лот", ("lot", lid))]], mid)
+        elif op == "set_currency":
+            lid, code = args
+            lot = self.store.get("lot", lid)
+            if not lot:
+                raise ShopError("Лот не найден.")
+            if code is None:
+                lot.pop("amount_currency", None)
+            else:
+                lot["amount_currency"] = code
+            self.store.put("lot", lid, lot)
+            self.dispatch(chat, user, ("currency", lid), mid)
         elif op == "rates":
             rates = rates_map(self.shop.api().rates())
             self.show(chat, "💱 <b>Курсы поставщика, база USD</b>\n\n" + esc("\n".join(f"{k}: {v}" for k, v in rates.items())), [[("🌍 Валюта лота", ("currency", args[0])), ("🏠 Главная", ("home",))]], mid)
@@ -2059,9 +2719,14 @@ class TelegramUI:
                       [[("🔢 Лимит", ("ask", "max_quantity", "")), ("👛 Порог баланса", ("ask", "low_balance", ""))],
                        [("🛡 Предохранитель", ("toggle", "sanity_enabled", "safety")), ("📐 Порог ×", ("ask", "sanity_ratio", ""))],
                        [("↩️ Автовозврат", ("toggle", "auto_refund", "safety")), ("💰 Финансы", ("finance",))]], mid)
-        elif op in {"active", "history"}:
-            values = sorted([r for r in self.store.all("order") if r["state"] != "ignored" and (op == "history" or r["state"] in ACTIVE_STATES)], key=lambda r: r["created"], reverse=True)
-            self.paged(chat, values, "📋 <b>" + ("Активные заказы" if op == "active" else "Журнал заказов") + "</b>", (op,), args[0],
+        elif op in {"active", "history", "attention"}:
+            if op == "history":
+                values = [r for r in self.store.all("order") if r["state"] != "ignored"]
+            else:
+                values = self.store.orders_in(ACTIVE_STATES if op == "active" else {"review", "partial"})
+            values = sorted(values, key=lambda r: r["created"], reverse=True)
+            titles = {"active": "Активные заказы", "history": "Журнал заказов", "attention": "Ждут продавца"}
+            self.paged(chat, values, "📋 <b>" + titles[op] + "</b>", (op,), args[0],
                        lambda r: f"#{r['id']} · {r.get('buyer', '')} · {STATE_NAMES.get(r['state'], r['state'])}", lambda r: ("order", r["id"]), mid)
         elif op == "order":
             self.order(chat, args[0], mid)
@@ -2078,7 +2743,17 @@ class TelegramUI:
             self.stats(chat, mid)
         elif op == "export":
             import io
-            content = io.BytesIO(json.dumps(self.store.all("order"), ensure_ascii=False, indent=2).encode("utf-8"))
+            orders = self.store.all("order")
+            for r in orders:
+                # Passwords/tokens never leave the database, including in the provider request copy.
+                r["data"] = masked_data(r.get("data"), r.get("fields"))
+                for op_ in r.get("transactions", []):
+                    for entry in (op_.get("body") or {}).get("orders", []):
+                        for field in entry.get("fields", []):
+                            if secret_field(field.get("key"), r.get("fields")):
+                                field["value"] = "••••"
+                r.pop("outbox", None)
+            content = io.BytesIO(json.dumps(orders, ensure_ascii=False, indent=2).encode("utf-8"))
             content.name = "AppRouteTopUp_orders.json"
             self.bot.send_document(chat, content, caption="Журнал заказов · @LuckyFunPay_Support")
         elif op == "templates":
@@ -2169,9 +2844,12 @@ def stop(cardinal, *args):
     if SHOP:
         SHOP.stop_event.set()
         SHOP.wakeup.set()
-        if SHOP.thread:
-            SHOP.thread.join(timeout=5)
-        if SHOP.instance_lock and (not SHOP.thread or not SHOP.thread.is_alive()):
+        SHOP.service_wakeup.set()
+        for thread in (SHOP.thread, SHOP.service_thread):
+            if thread:
+                thread.join(timeout=5)
+        alive = any(t and t.is_alive() for t in (SHOP.thread, SHOP.service_thread))
+        if SHOP.instance_lock and not alive:
             SHOP.instance_lock.close()
             SHOP.instance_lock = None
 
@@ -2180,7 +2858,25 @@ def new_order(cardinal, event, *args):
     if SHOP and SHOP.active():
         order = getattr(event, "order", None)
         if order is not None and enum_name(getattr(order, "status", "")) == "PAID":
-            SHOP.enqueue(str(order.id))
+            buyer = str(getattr(order, "buyer_id", "") or "")
+            chat = str(getattr(order, "chat_id", "") or "")
+            if not chat.startswith("users-"):
+                chat = chat_for(cardinal.account.id, buyer) if buyer.isdigit() else ""
+            SHOP.enqueue(str(order.id), chat, buyer if chat else "")
+
+
+def order_status_changed(cardinal, event, *args):
+    if not SHOP or not SHOP.active():
+        return
+    order = getattr(event, "order", None)
+    if order is None:
+        return
+    if enum_name(getattr(order, "status", "")) == "PAID":
+        new_order(cardinal, event, *args)
+    elif SHOP.store.get("order", str(order.id)):
+        # A refund/close on FunPay ends a dialog that is still waiting for the buyer.
+        SHOP.store.put("status", str(order.id), {"id": str(order.id), "created": time.time()})
+        SHOP.wakeup.set()
 
 
 def new_message(cardinal, event, *args):
@@ -2196,8 +2892,14 @@ def new_message(cardinal, event, *args):
     kind = getattr(msg, "type", None)
     if kind is not None and enum_name(kind) not in {"NON_SYSTEM", "USER_MESSAGE", "DEFAULT"}:
         return
+    if author == str(getattr(cardinal.account, "id", "")):
+        return
     key = f"{chat}:{mid}"
     if SHOP.store.get("seen", key):
+        return
+    chats = [chat, chat_for(cardinal.account.id, author) if chat.isdigit() else ""]
+    if not any(r.get("buyer_id") == author for r in SHOP.store.orders_in(ACTIVE_STATES, chats)):
+        # Only buyers with an active order are stored; other chats never touch the journal.
         return
     SHOP.store.put("message", key, {"id": key, "chat": chat, "buyer_id": author, "text": text, "created": time.time()})
     SHOP.store.put("seen", key, {"at": time.time()})
@@ -2212,7 +2914,7 @@ BIND_TO_PRE_INIT = [init]
 BIND_TO_POST_START = [start]
 BIND_TO_PRE_STOP = [stop]
 BIND_TO_NEW_ORDER = [new_order]
-BIND_TO_ORDER_STATUS_CHANGED = [new_order]
+BIND_TO_ORDER_STATUS_CHANGED = [order_status_changed]
 BIND_TO_NEW_MESSAGE = [new_message]
 BIND_TO_DELETE = delete
 
