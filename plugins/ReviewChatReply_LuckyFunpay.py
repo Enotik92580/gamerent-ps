@@ -780,7 +780,7 @@ class ReplyPanel(Panel):
 
     def on_home(self, chat, mid=None, *args):
         d = self.plugin.store.snapshot()
-        lines = [f"💬 <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"💬 <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Плагин: {'🟢 работает' if d['enabled'] else '🔴 выключен'} · вотермарка "
                  f"{'🟢' if d['watermark'] else '🔴'}",
                  f"Подарки: {'🟢' if d['gifts']['enabled'] else '🔴'}", "", "Оценки (🟢 — бот отвечает):"]

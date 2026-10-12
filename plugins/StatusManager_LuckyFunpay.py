@@ -606,7 +606,7 @@ class StatusPanel(Panel):
 
     def on_home(self, chat, mid=None, *args):
         d = self.plugin.store.snapshot()
-        lines = [f"🚦 <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"🚦 <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Текущий статус: <b>{esc(d['current']) if d['current'] else '🟢 Онлайн'}</b>",
                  f"Установлен: {ago(d['since']) + ' назад' if d['since'] else '—'}",
                  f"Последняя активность: {ago(d['last_activity']) + ' назад' if d['last_activity'] else 'нет данных'}",

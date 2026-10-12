@@ -621,10 +621,20 @@ def fresh_profile(cardinal):
     return profile
 
 
-def my_subcategories(cardinal, profile=None, extra_ids=(), include_currency=False) -> list:
-    """Подкатегории с лотами продавца: из профиля (активные лоты) + известные плагину ID."""
+def my_subcategories(cardinal, profile=None, extra_ids=(), include_currency=False, from_sales=False) -> list:
+    """Подкатегории с лотами продавца: из профиля (активные лоты) + известные плагину ID
+    (+ разделы из фильтра страницы продаж, если from_sales=True)."""
     profile = profile or fresh_profile(cardinal)
     found = {}
+    if from_sales:
+        try:
+            result = cardinal.account.get_sales()
+            sales_subs = result[3] if len(result) > 3 and isinstance(result[3], dict) else {}
+            for sub in sales_subs.values():
+                if sub is not None and enum_name(sub.type) == "COMMON":
+                    found[("COMMON", sub.id)] = sub
+        except Exception:
+            LOG.debug("%s: разделы со страницы продаж не получены", NAME)
     try:
         for sub in profile.get_sorted_lots(2).keys():
             if include_currency or not sub.type or enum_name(sub.type) == "COMMON":
@@ -974,7 +984,7 @@ class SchedulePanel(Panel):
         data = p.store.snapshot()
         now = p.local_now()
         work = in_window(data["start"], data["end"], now.hour * 60 + now.minute)
-        lines = [f"⏰ <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"⏰ <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Расписание: {'🟢 включено' if data['enabled'] else '🔴 выключено'}",
                  f"Часовой пояс: UTC{data['offset']:+d} · сейчас <b>{now:%H:%M}</b>",
                  f"График: <b>{data['start']}–{data['end']}</b> ({'рабочее время' if work else 'вне графика'})",

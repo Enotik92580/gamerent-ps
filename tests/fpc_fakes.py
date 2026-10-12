@@ -284,7 +284,9 @@ class FakeAccount:
             start = ids.index(start_from) if start_from in ids else len(items)
         page = items[start:start + self.page_size]
         nxt = items[start + self.page_size].id if start + self.page_size < len(items) else None
-        return nxt, page, "ru", {}
+        subs = {f"{s.category.name}, {s.name}": s for s in
+                [o.subcategory for o in self.sales if o.subcategory] + list(getattr(self, "sales_subs", []))}
+        return nxt, page, "ru", subs if not start_from else None
 
     def refund(self, order_id):
         self.refunded.append(order_id)
@@ -358,6 +360,64 @@ class Obj(pytypes.SimpleNamespace):
     pass
 
 
+
+# ----------------------------------------------------------------------------- проверки как у Telegram
+import html.parser as _hp
+
+TG_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a", "tg-spoiler",
+           "blockquote", "span"}
+
+
+class _TgHtml(_hp.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        assert tag in TG_TAGS, f"Telegram не поддерживает тег <{tag}>"
+        if tag == "a":
+            href = dict(attrs).get("href", "")
+            assert href.startswith(("http://", "https://", "tg://")), f"Плохая ссылка: {href!r}"
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        assert self.stack and self.stack[-1] == tag, f"Незакрытый/лишний тег </{tag}>, стек {self.stack}"
+        self.stack.pop()
+
+
+def check_tg_html(text):
+    assert len(text) <= 4096, f"Сообщение длиннее 4096: {len(text)}"
+    raw = text
+    import re as _re0
+    assert not _re0.search(r"<(?![a-zA-Z/])", raw), f"Неэкранированный '<' в {raw[:200]!r}"
+    assert not _re0.search(r"&(?!(lt|gt|amp|quot|#x27|#\d+);)", raw), f"Неэкранированный '&' в {raw[:200]!r}"
+    parser = _TgHtml()
+    parser.feed(raw)
+    parser.close()
+    assert not parser.stack, f"Незакрытые теги: {parser.stack} в {raw[:200]!r}"
+    import re as _re
+    for m in _re.finditer(r"&(#?\w+);?", raw):
+        ent = m.group(0)
+        assert ent in ("&lt;", "&gt;", "&amp;", "&quot;", "&#x27;") or _re.fullmatch(r"&#\d+;", ent), \
+            f"Неподдерживаемая HTML-сущность {ent}"
+
+
+def check_markup(markup):
+    if markup is None or not hasattr(markup, "keyboard"):
+        return
+    for row in markup.keyboard:
+        assert len(row) <= 8, "Слишком много кнопок в ряду"
+        for b in row:
+            text = getattr(b, "text", "")
+            assert text and len(text) <= 120, f"Пустой/длинный текст кнопки {text!r}"
+            data = getattr(b, "callback_data", None)
+            url = getattr(b, "url", None)
+            if data is not None:
+                assert len(data.encode()) <= 64, f"callback_data > 64 байт: {data}"
+            else:
+                assert url and url.startswith(("http://", "https://", "tg://")), f"Плохой url кнопки {url!r}"
+
+
 _BOT_IDS = itertools.count(1000)
 
 
@@ -389,6 +449,10 @@ class FakeBot:
 
     def send_message(self, chat_id, text, reply_markup=None, parse_mode=None, disable_web_page_preview=None,
                      message_thread_id=None, disable_notification=None, **kwargs):
+        if parse_mode == "HTML":
+            check_tg_html(text)
+        assert len(text) <= 4096, len(text)
+        check_markup(reply_markup)
         msg = self._msg(chat_id, text, reply_markup, message_thread_id)
         self.sent.append(Obj(chat_id=chat_id, text=text, markup=reply_markup, mid=msg.message_id,
                              thread=message_thread_id, parse_mode=parse_mode, silent=disable_notification))
@@ -396,6 +460,9 @@ class FakeBot:
 
     def edit_message_text(self, text, chat_id=None, message_id=None, reply_markup=None, parse_mode=None,
                           disable_web_page_preview=None, **kwargs):
+        if parse_mode == "HTML":
+            check_tg_html(text)
+        check_markup(reply_markup)
         self.edits.append(Obj(chat_id=chat_id, text=text, markup=reply_markup, mid=message_id))
         return Obj(message_id=message_id)
 

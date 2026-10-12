@@ -600,7 +600,7 @@ class BigOrderPanel(Panel):
 
     def on_home(self, chat, mid=None, *args):
         data = self.plugin.store.snapshot()
-        lines = [f"🚨 <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"🚨 <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Мониторинг: {'🟢 включен' if data['enabled'] else '🔴 выключен'}",
                  f"Закреплять уведомления: {'да' if data['pin'] else 'нет'}", "", "Крупным считается заказ от:"]
         for code, flag, sign in CURRENCIES:

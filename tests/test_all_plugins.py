@@ -22,7 +22,7 @@ def test_plugin_contract(env, file_name):
     # открытие панели из списка плагинов Cardinal
     assert tg.callback(f"47:{mod.UUID}:0")
     home = tg.screen()
-    assert mod.NAME in home.text
+    assert mod.html.escape(mod.NAME, quote=False) in home.text
     labels = [b.text for b in tg.buttons(home)]
     assert any("Инструкция" in t for t in labels), labels
     urls = [b.url for b in tg.buttons(home) if b.url]

@@ -656,7 +656,7 @@ class NotesPanel(Panel):
             notes = [kv for kv in notes if q in kv[0] or q in kv[1]["text"].casefold()]
         pages = max(1, (len(notes) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
-        lines = [f"📝 <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"📝 <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Заметок: <b>{len(data['notes'])}</b>" + (f" · поиск «{esc(query)}»: {len(notes)}" if query else ""),
                  f"Уведомления: 💬 сообщения {'🟢' if data['on_message'] else '🔴'} · 🛒 заказы "
                  f"{'🟢' if data['on_order'] else '🔴'} · антиспам {data['cooldown'] // 60} мин", ""]

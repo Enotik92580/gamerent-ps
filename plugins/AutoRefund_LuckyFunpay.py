@@ -744,7 +744,7 @@ class RefundPanel(Panel):
     def on_home(self, chat, mid=None, *args):
         d = self.plugin.store.snapshot()
         stars = [s for s in "12345" if d["stars"].get(s)]
-        lines = [f"🛡️ <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"🛡️ <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Плагин: {'🟢 работает' if d['enabled'] else '🔴 выключен'}",
                  f"Реагирую на: {', '.join(s + '⭐' for s in stars) or 'ничего'}",
                  f"Лимит цены: <b>{d['limit']:g} ₽</b>",

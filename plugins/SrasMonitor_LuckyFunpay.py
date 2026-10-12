@@ -686,7 +686,7 @@ class SrasPanel(Panel):
 
     def on_home(self, chat, mid=None, *args):
         data = self.plugin.store.snapshot()
-        lines = [f"🛡️ <b>{NAME}</b> v{VERSION}", ""]
+        lines = [f"🛡️ <b>{esc(NAME)}</b> v{VERSION}", ""]
         if not data["checked"]:
             lines.append("⏳ Ещё не проверялось. Нажмите «🔄 Проверить сейчас».")
         elif data["error"]:

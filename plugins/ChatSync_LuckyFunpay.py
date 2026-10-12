@@ -1255,7 +1255,7 @@ class SyncPanel(Panel):
             for key, bot_id, _ in bots:
                 if bot_id:
                     self.statuses[key] = self.check_status(bot_id)
-        text = (f"💬 <b>{NAME}</b> v{VERSION}\n\n"
+        text = (f"💬 <b>{esc(NAME)}</b> v{VERSION}\n\n"
                 f"Группа для FunPay чатов: {shown}\n"
                 f"Готов к работе: {'✅ Да' if ready else '❌ Нет'}\n"
                 f"Что сейчас делать? {esc(self.hint())}\n"

@@ -672,7 +672,7 @@ class ReminderPanel(Panel):
     def on_home(self, chat, mid=None, *args):
         d = self.plugin.store.snapshot()
         queue = self.plugin.queue["items"]
-        lines = [f"⏳ <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"⏳ <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"Плагин: {'🟢 включен' if d['enabled'] else '🔴 выключен'}",
                  f"1️⃣ Первое: через <b>{d['delay1']} мин</b> после оплаты",
                  f"2️⃣ Второе: " + (f"через <b>{d['delay2']} мин</b> после первого" if d["second"] else "выключено"),

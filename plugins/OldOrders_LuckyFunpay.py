@@ -628,7 +628,7 @@ class OldOrdersPanel(Panel):
 
     def on_home(self, chat, mid=None, *args):
         data = self.plugin.store.snapshot()
-        text = (f"🕰️ <b>{NAME}</b> v{VERSION}\n\nИщет заказы «Оплачен», которые висят дольше "
+        text = (f"🕰️ <b>{esc(NAME)}</b> v{VERSION}\n\nИщет заказы «Оплачен», которые висят дольше "
                 f"<b>{data['hours']} ч</b>, и готовит обращение в поддержку.\n\n" + self.result_text(data))
         rows = [[("🔎 Начать сканирование", ("scan",))]]
         if data["result"]:

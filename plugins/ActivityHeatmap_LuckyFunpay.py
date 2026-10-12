@@ -626,7 +626,7 @@ class Heatmap:
         d, grid = self.totals()
         cells = [[sum(grid[day][start:start + 6]) for _, _, start in BLOCKS] for day in range(7)]
         peak = max(max(row) for row in cells)
-        lines = [f"📊 <b>{NAME}</b> — пульс магазина", f"Часовой пояс: UTC{d['offset']:+d}", "",
+        lines = [f"📊 <b>{esc(NAME)}</b> — пульс магазина", f"Часовой пояс: UTC{d['offset']:+d}", "",
                  "<code>    " + "  ".join(icon for icon, _, _ in BLOCKS) + "</code>"]
         for day in range(7):
             lines.append(f"<code>{DAYS[day]}</code>  " + "  ".join(level(v, peak) for v in cells[day]))

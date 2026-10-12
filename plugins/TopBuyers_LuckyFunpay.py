@@ -615,7 +615,7 @@ class TopBuyers:
         d = self.store.snapshot()
         total = sum(b["rub"] for b in d["buyers"].values())
         orders = sum(b["orders"] for b in d["buyers"].values())
-        lines = [f"👑 <b>{NAME}</b> v{VERSION}", "",
+        lines = [f"👑 <b>{esc(NAME)}</b> v{VERSION}", "",
                  f"👥 Клиентов в базе: <b>{len(d['buyers'])}</b>",
                  f"🧾 Закрытых заказов: <b>{orders}</b>",
                  f"💰 Общая выручка: <b>{rub(total)}</b>"]
@@ -720,7 +720,7 @@ def start(cardinal, *args):
     def run():
         added = PLUGIN.scan(full=True)
         if added >= 0 and PLUGIN.ui:
-            PLUGIN.ui.notify(f"👑 <b>{NAME}</b>: анализ истории продаж завершён, учтено заказов: {added}.",
+            PLUGIN.ui.notify(f"👑 <b>{esc(NAME)}</b>: анализ истории продаж завершён, учтено заказов: {added}.",
                              [[("👑 Топ покупателей", ("home",))]])
 
     threading.Thread(target=run, name="TopBuyersScan", daemon=True).start()
