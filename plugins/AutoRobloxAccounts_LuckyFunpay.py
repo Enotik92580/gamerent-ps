@@ -26,7 +26,8 @@ import requests
 
 NAME = "Auto Roblox Accounts"
 VERSION = "1.0.0"
-DESCRIPTION = "Автовыдача Roblox-аккаунтов с LZT Market. Панель: /roblox_panel"
+DESCRIPTION = ("🧱 Автовыдача Roblox-аккаунтов с LZT Market: Robux, Premium, почта и 2FA-коды по команде !2faroblox. "
+               "Панель: /roblox_panel")
 CREDITS = "@LuckyFunPay_Support"
 AUTHOR_URL = "https://t.me/LuckyFunPay_Support"
 CHANNEL_URL = "https://t.me/LuckyFunPay"
