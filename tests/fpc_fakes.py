@@ -305,7 +305,15 @@ class FakeAccount:
         return 555
 
     def get_chat_by_name(self, name, make_request=False):
-        return None
+        return next((c for c in getattr(self, "chats", {}).values() if c.name == name), None)
+
+    def get_chats(self, update=False):
+        return dict(getattr(self, "chats", {}))
+
+    def add_chat(self, chat_id, name, text="привет"):
+        self.chats = getattr(self, "chats", {})
+        self.chats[chat_id] = fpt.ChatShortcut(chat_id, name, text, 0, 0, "", True)
+        return self.chats[chat_id]
 
     def get_chat(self, chat_id, with_history=True, locale=None):
         return fpt.Chat(chat_id, "Buyer1", None, None, [])
@@ -349,6 +357,9 @@ class Obj(pytypes.SimpleNamespace):
     pass
 
 
+_BOT_IDS = itertools.count(1000)
+
+
 class FakeBot:
     def __init__(self, token="1:main", username="main_bot"):
         self.token = token
@@ -363,7 +374,7 @@ class FakeBot:
         self.topics = {}
         self.topic_edits = []
         self.chat_members = {}
-        self.ids = itertools.count(1000)
+        self.ids = _BOT_IDS
         self.handlers = []
         self.photos = []
 
@@ -426,7 +437,7 @@ class FakeBot:
         return True
 
     def get_forum_topic_icon_stickers(self):
-        return [Obj(custom_emoji_id=str(9000 + i), emoji=e) for i, e in enumerate("🔥❤️⭐️💰⚡️🎮💬❗️🛍🔴🟢")]
+        return [Obj(custom_emoji_id=str(9000 + i), emoji=e) for i, e in enumerate(["🔥", "❤️", "⭐️", "💰", "⚡️", "🎮", "💬", "❗️", "🛍", "🔴", "🟢"])]
 
     def get_chat(self, chat_id):
         return Obj(id=chat_id, type="supergroup", is_forum=True, username="syncgroup", invite_link=None,
