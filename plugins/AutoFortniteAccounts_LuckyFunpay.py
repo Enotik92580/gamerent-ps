@@ -43,6 +43,7 @@ DEFAULT_TEMPLATE = """🎮 Ваш аккаунт Fortnite (Epic Games)
 📧 Почта: {email}
 🔐 Пароль от почты: {email_password}
 🌐 Вход в почту: {email_login_url}
+
 📊 Об аккаунте:
 🎭 Скинов: {skins}
 💎 В-Баксов: {vbucks}
@@ -51,11 +52,15 @@ DEFAULT_TEMPLATE = """🎮 Ваш аккаунт Fortnite (Epic Games)
 🖥 Платформа: {platform}
 ✉️ Смена почты: {change_email}
 
-💡 Если Epic Games попросит код с почты — напишите {code_command} в этот чат.
-⚠️ Сразу смените пароль аккаунта и почты.
+💡 Если при входе Epic Games попросит код подтверждения с почты — напишите в этот чат команду {code_command}, и бот пришлёт код автоматически.
 
-Спасибо за покупку! Буду благодарен за отзыв и подтверждение заказа!"""
-DEFAULT_WAIT = "👋 Ваш заказ принят. Подбираю и проверяю аккаунт Fortnite. Ожидайте данные в этом чате."
+⚠️ Сразу после покупки смените пароль от аккаунта и от почты.
+
+Спасибо за покупку! Пожалуйста, проверьте аккаунт и подтвердите выполнение заказа. Буду благодарен за отзыв!"""
+DEFAULT_WAIT = """👋 Здравствуйте! Ваш заказ принят в автоматическую обработку.
+
+🤖 Система подбирает и проверяет ваш аккаунт Fortnite...
+⏳ Это может занять около 2-3 минут. Ожидайте данные прямо в этом чате."""
 TEMP_WARNING = ("\n\n──────────\n⚠️ Временная почта предназначена для входа и смены данных. "
                 "Смените почту и пароль Epic Games на свои. Получение пароля временной почты отменяет гарантию LZT.")
 DEFAULTS = {"enabled": False, "token": "", "proxy_mode": "bot", "proxy": "",
@@ -75,6 +80,7 @@ class APIError(FortniteError):
     def __init__(self, kind, message="", status=0):
         super().__init__(message or kind)
         self.kind, self.status = kind, status
+        self.detail = ''
 
 
 def money(value, positive=False):
@@ -173,6 +179,13 @@ def clean_error(value):
     return text[:500]
 
 
+def provider_error(data):
+    errors = data.get('errors') or data.get('error') or data.get('message') or ''
+    if isinstance(errors, dict): errors = list(errors.values())
+    if isinstance(errors, list): errors = ' '.join(str(e) for e in errors)
+    return clean_error(errors).strip()
+
+
 def classify_error(data, status):
     raw = json.dumps(data.get('errors') or data.get('error') or data.get('message') or '', ensure_ascii=False).casefold()
     if status == 401: return "access"
@@ -182,7 +195,7 @@ def classify_error(data, status):
     if any(x in raw for x in ("not enough balance", "not have enough money", "insufficient funds", "недостаточно средств", "недостаточно денег", "недостаточно баланса")): return "balance"
     if any(x in raw for x in ("paid access", "api access", "market scope", "доступ к api", "доступа к api", "200 sympath")): return "access"
     if status == 429 or any(x in raw for x in ("daily check limit", "daily limit of checks", "rate_limit")): return "rate"
-    if any(x in raw for x in ("item is sold", "item deleted", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
+    if any(x in raw for x in ("item is sold", "item deleted", "requested item not found", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
     if status >= 500: return "network"
     return "unknown"
 
@@ -259,6 +272,12 @@ class Store:
     def orders(self):
         with self.tx() as db:
             return [json.loads(r[0]) for r in db.execute("SELECT value FROM orders ORDER BY rowid DESC")]
+
+    def active_orders(self):
+        marks = ','.join('?'*len(ACTIVE_STATES))
+        with self.tx() as db:
+            return [json.loads(r[0]) for r in db.execute(
+                f"SELECT value FROM orders WHERE state IN ({marks}) ORDER BY rowid ASC", tuple(ACTIVE_STATES))]
 
     def reserve(self, item, oid):
         with self.tx() as db:
@@ -339,7 +358,9 @@ class Market:
                             "invalid": "Аккаунт невалиден, продан, удалён или продавец запретил покупку.",
                             "retry": "Маркет просит повторить запрос.", "rate": "Лимит запросов API.",
                             "no_code": "Письмо с кодом пока не найдено.", "permission": "Нет прав на чтение почты."}
-            raise APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error = APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error.detail = provider_error(data)
+            raise error
         return data
 
     def profile(self, token_override=None):
@@ -394,7 +415,10 @@ def fortnite_item(item):
     category = str(item.get('category_id'))
     if category == '9': return True  # legacy Fortnite category
     if category != '12': return False
-    games = item.get('epicgames_games') or {}
+    games = item.get('epicgames_games')
+    # Fortnite-specific statistics prove the game even when the games map is omitted.
+    if any(number(item.get('epicgames_fortnite_'+k)) > 0 for k in ('level', 'skin_count', 'lifetime_wins')): return True
+    if isinstance(games, list): games = dict(enumerate(games))  # PHP encodes some maps as lists
     if not isinstance(games, dict): return False
     return any(str(key).casefold() == 'fortnite' or
                (isinstance(game, dict) and any(str(game.get(f, '')).casefold() == 'fortnite'
@@ -457,11 +481,17 @@ def statistics(item):
     return fields
 
 
+def usable_secret(value):
+    return isinstance(value, str) and bool(value.strip()) and value.strip().casefold() not in {
+        '0', '1', 'hidden', 'скрыт', 'нет данных', 'none', 'null'}
+
+
 def credentials(item, oid, market):
     data = item.get('loginData') or {}
-    if not data.get('login') or not data.get('password'):
+    if not isinstance(data, dict) or not usable_secret(data.get('login')) or not usable_secret(data.get('password')):
         raise FortniteError("Купленный аккаунт не содержит логин/пароль. Нужна ручная выдача.")
     email_data = item.get('emailLoginData') or {}
+    if not isinstance(email_data, dict): email_data = {}
     temp = item.get('temp_email')
     warning = bool(temp)
     email = temp or email_data.get('login') or 'Не предоставлена'
@@ -478,7 +508,7 @@ def credentials(item, oid, market):
                     email_password = account
             else: raise FortniteError('Не получен пароль временной почты.')
         except FortniteError:
-            email_password = 'Скрыт (напишите продавцу для выдачи)'
+            email_password = 'Скрыт (Требуется ручная выдача)'
             missing_email = True
     return {'login': str(data['login']), 'password': str(data['password']), 'email': str(email),
             'email_password': str(email_password), 'email_login_url': str(item.get('emailLoginUrl') or 'Не предоставлен'),
@@ -692,6 +722,11 @@ class Shop:
                     self.reconcile(order); return 'stop'
                 except APIError as error:
                     try: item = self.market.item(order['item_id'])
+                    except APIError as lookup:
+                        if lookup.kind != 'invalid' or error.kind != 'invalid':
+                            self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
+                            return 'stop'
+                        item = {}
                     except FortniteError:
                         self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
                         return 'stop'
@@ -844,7 +879,7 @@ class Shop:
         def run():
             try:
                 if not purchases:
-                    self.say(reply, '❌ У вас нет подходящих аккаунтов Fortnite, купленных через этого продавца.'); return
+                    self.say(reply, '❌ У вас нет аккаунтов Fortnite, купленных через этого продавца.'); return
                 order = max(purchases, key=lambda o: o.get('purchased_at', 0))
                 if len(purchases) > 1 and len(words) == 1:
                     self.say(order, 'ℹ️ Использую последний купленный аккаунт. Для другого укажите логин или номер заказа после команды.')
@@ -890,9 +925,10 @@ class Shop:
                                           not owned(response_item, order['market_user'])):
                         raise APIError('permission')
                     code_data = data.get('codeData') or {}
-                    code = str(code_data.get('code', ''))
+                    code = str(code_data.get('code', '')).strip()
                     stamp = float(code_data.get('date') or 0)
-                    if re.fullmatch(r'[0-9]{6}', code) and -60 <= time.time()-stamp <= 600 and stamp >= order.get('purchased_at', 0)-60:
+                    fresh = not stamp or (-60 <= time.time()-stamp <= 600 and stamp >= order.get('purchased_at', 0)-60)
+                    if re.fullmatch(r'[A-Za-z0-9]{6}', code) and fresh:
                         current = self.store.settings()
                         if self.stop_event.is_set() or not current['enabled'] or not current['code_enabled']: return
                         login = str((order['item'].get('loginData') or {}).get('login', ''))
@@ -956,7 +992,7 @@ class Shop:
                     next_balance = time.time()+1800
                     try: self.balances(force=True)
                     except FortniteError: pass
-                for order in reversed(self.store.orders()):
+                for order in self.store.active_orders():
                     state = order['state']
                     if state not in ACTIVE_STATES or order.get('check_after', 0) > time.time(): continue
                     if state in {'queued', 'searching'} and not settings['enabled']: continue
@@ -1243,7 +1279,7 @@ class TelegramUI:
                 self.store.setting('wait_text', '' if raw == '-' else message.text); self.settings(chat)
         except (FortniteError, ValueError) as error:
             text = str(error) if isinstance(error, FortniteError) else 'Неверный формат значения.'
-            if field == 'new_tag':
+            if field in {'new_tag', 'url', 'max_price', 'min_skins', 'min_vbucks'}:
                 self.ask(chat, field, key)
                 self.bot.send_message(chat, '⚠️ '+esc(text), parse_mode='HTML')
                 return

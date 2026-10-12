@@ -37,12 +37,17 @@ DEFAULT_TEMPLATE = """🎮 Ваш аккаунт Supercell (Supercell ID)
 
 👤 Почта (Supercell ID): {login}
 🔑 Пароль от почты: {email_password}
+
 🌐 Вход в почту: {email_login_url}
 
-Для входа в игру выберите Supercell ID и введите почту выше. Запросите код в игре, откройте почту по указанной ссылке и возьмите код из письма. Проверьте папку «Спам», если письмо не появилось сразу.
+⚠️ ВАЖНО: 
+Для входа в игру используйте вход через Supercell ID. Введите почту, затем зайдите на почту по ссылке выше и возьмите код подтверждения.
 
-Спасибо за покупку! Проверьте аккаунт и подтвердите выполнение заказа. Буду благодарен за отзыв!"""
-DEFAULT_WAIT = "👋 Ваш заказ принят в автоматическую обработку. Подбираю аккаунт Supercell по вашим критериям. Ожидайте данные в этом чате."
+Спасибо за покупку! Пожалуйста, проверьте аккаунт и подтвердите выполнение заказа. Буду благодарен за отзыв!"""
+DEFAULT_WAIT = """👋 Здравствуйте! Ваш заказ принят в автоматическую обработку.
+
+🤖 Система проверяет и подготавливает ваш аккаунт Supercell...
+⏳ Это может занять около 2-3 минут. Ожидайте данные прямо в этом чате."""
 DEFAULTS = {"enabled": False, "token": "", "proxy_mode": "bot", "proxy": "",
             "auto_refund": True, "balance_alert": True, "balance_threshold": "50",
             "low_notified": False, "template": DEFAULT_TEMPLATE, "wait_text": DEFAULT_WAIT,
@@ -59,6 +64,7 @@ class APIError(SupercellError):
     def __init__(self, kind, message="", status=0):
         super().__init__(message or kind)
         self.kind, self.status = kind, status
+        self.detail = ''
 
 
 def money(value, positive=False):
@@ -90,7 +96,7 @@ def tag(value):
 
 
 def find_tag(description):
-    found = re.findall(r"(?<![\w:])sc:([A-Za-z0-9_-]{1,25})(?![\w-])", description or "", re.I)
+    found = re.findall(r"(?<![\w:])(?:sc|supercell):([A-Za-z0-9_-]{1,25})(?![\w-])", description or "", re.I)
     unique = set(t.upper() for t in found)
     if len(unique) > 1:
         raise SupercellError("В описании несколько разных тегов sc:. Оставьте один.")
@@ -143,6 +149,13 @@ def clean_error(value):
     return text[:500]
 
 
+def provider_error(data):
+    errors = data.get('errors') or data.get('error') or data.get('message') or ''
+    if isinstance(errors, dict): errors = list(errors.values())
+    if isinstance(errors, list): errors = ' '.join(str(e) for e in errors)
+    return clean_error(errors).strip()
+
+
 def classify_error(data, status):
     raw = json.dumps(data.get('errors') or data.get('error') or data.get('message') or '', ensure_ascii=False).casefold()
     if status == 401: return "access"
@@ -150,7 +163,7 @@ def classify_error(data, status):
     if any(x in raw for x in ("not enough balance", "not have enough money", "insufficient funds", "недостаточно средств", "недостаточно денег", "недостаточно баланса")): return "balance"
     if any(x in raw for x in ("paid access", "api access", "market scope", "доступ к api", "доступа к api", "200 sympath")): return "access"
     if status == 429 or any(x in raw for x in ("daily check limit", "daily limit of checks", "rate_limit")): return "rate"
-    if any(x in raw for x in ("item is sold", "item deleted", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
+    if any(x in raw for x in ("item is sold", "item deleted", "requested item not found", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
     if status >= 500: return "network"
     return "unknown"
 
@@ -227,6 +240,12 @@ class Store:
     def orders(self):
         with self.tx() as db:
             return [json.loads(r[0]) for r in db.execute("SELECT value FROM orders ORDER BY rowid DESC")]
+
+    def active_orders(self):
+        marks = ','.join('?'*len(ACTIVE_STATES))
+        with self.tx() as db:
+            return [json.loads(r[0]) for r in db.execute(
+                f"SELECT value FROM orders WHERE state IN ({marks}) ORDER BY rowid ASC", tuple(ACTIVE_STATES))]
 
     def reserve(self, item, oid):
         with self.tx() as db:
@@ -306,7 +325,9 @@ class Market:
             descriptions = {"access": "Проверьте токен, права market и доступ к API.", "balance": "Недостаточно средств на выбранном балансе.",
                             "invalid": "Аккаунт невалиден, продан, удалён или продавец запретил покупку.",
                             "retry": "Маркет просит повторить запрос.", "rate": "Лимит запросов API."}
-            raise APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error = APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error.detail = provider_error(data)
+            raise error
         return data
 
     def profile(self, token_override=None):
@@ -405,19 +426,20 @@ def mail_url(item, email):
         return 'https://outlook.live.com/mail/'
     if domain in {'mail.ru', 'bk.ru', 'list.ru', 'inbox.ru'} or provider == 'mail_ru':
         return 'https://e.mail.ru/'
-    return 'Сайт почты (firstmail / rambler); адрес уточните у продавца'
+    return 'Сайт почты (firstmail / rambler)'
 
 
 def credentials(item, oid):
     email = mailbox(item)
     mail = item.get('emailLoginData') or {}
     if not isinstance(mail, dict): mail = {}
-    if not email_address(mail.get('login')) or mail['login'].casefold() != email.casefold() or not usable_secret(mail.get('password')):
-        raise SupercellError('Пароль почты Supercell ID отсутствует или относится к другой почте. Передайте данные вручную.')
+    # Per the guide a missing mailbox password is shown as «Нет данных»; the seller is notified separately.
+    email_password = (mail['password'] if email_address(mail.get('login')) and mail['login'].casefold() == email.casefold()
+                      and usable_secret(mail.get('password')) else 'Нет данных')
     data = item.get('loginData') or {}
     if not isinstance(data, dict): data = {}
     return {'login': email, 'password': data.get('password') if usable_secret(data.get('password')) else 'Нет данных',
-            'email': email, 'email_password': mail['password'], 'email_login_url': mail_url(item, email),
+            'email': email, 'email_password': email_password, 'email_login_url': mail_url(item, email),
             'title': str(item.get('title') or 'Аккаунт Supercell'), 'item_id': str(item['item_id']), 'order_id': oid}
 
 
@@ -632,6 +654,11 @@ class Shop:
                     self.reconcile(order); return 'stop'
                 except APIError as error:
                     try: item = self.market.item(order['item_id'])
+                    except APIError as lookup:
+                        if lookup.kind != 'invalid' or error.kind != 'invalid':
+                            self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
+                            return 'stop'
+                        item = {}
                     except SupercellError:
                         self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
                         return 'stop'
@@ -721,6 +748,8 @@ class Shop:
         if not self.say(order, order['payload']):
             if order['attempts'] >= 5:
                 self.hold(order, 'Аккаунт куплен, но данные не доставлены после 5 попыток. Нажмите «Повторить выдачу».')
+                self.notify(f"⚠️ Ошибка отправки в чат для заказа #{esc(order['id'])}\n"
+                            f"Отправьте покупателю вручную:\n\n{esc(order['payload'])}")
             elif order['attempts'] == 1:
                 self.notify('⚠️ Данные не доставлены для #'+esc(order['id'])+'. Повторю отправку того же аккаунта.')
             return
@@ -741,9 +770,7 @@ class Shop:
         email = mailbox(item)
         data = item.get('emailLoginData') or {}
         if not isinstance(data, dict): data = {}
-        if order.get('email_ready'):
-            credentials(item, order['id'])
-            return
+        if order.get('email_ready') or order.get('email_fetch_finished'): return
         if (not item.get('temp_email') and email_address(data.get('login'))
                 and data['login'].casefold() == email.casefold() and usable_secret(data.get('password'))):
             order['email_ready'] = True
@@ -769,8 +796,10 @@ class Shop:
         except SupercellError:
             item['emailLoginData'] = {'login': email, 'password': ''}
             order['email_missing'] = True
+            order['email_fetch_finished'] = True
             self.store.save(order)
-            raise SupercellError('Пароль почты Supercell ID не получен. Аккаунт уже куплен; откройте его на LZT и передайте данные вручную.') from None
+            self.notify(f"⚠️ {NAME} #{esc(order['id'])}: пароль почты Supercell ID не получен. "
+                        f"Покупатель получит «Нет данных» — передайте пароль вручную: https://lzt.market/{order['item_id']}/")
 
     def balances(self, force=False):
         if not force and self.balance_cache is not None and time.time()-self.balance_stamp < 60:
@@ -836,7 +865,7 @@ class Shop:
                     next_balance = time.time()+1800
                     try: self.balances(force=True)
                     except SupercellError: pass
-                for order in reversed(self.store.orders()):
+                for order in self.store.active_orders():
                     state = order['state']
                     if state not in ACTIVE_STATES or order.get('check_after', 0) > time.time(): continue
                     if state in {'queued', 'searching'} and not settings['enabled']: continue
@@ -873,8 +902,8 @@ GUIDE = [
      'Плагин поддерживает 1 шт. за заказ; RUB на FunPay и LZT. Профит учитывается без комиссии FunPay.'),
     ('💬 Покупатель и почта', 'Покупатель получает почту Supercell ID, пароль от неё и сайт почты. Код входа он берёт из письма сам. '
      'Для временной почты и при отсутствии пароля вызывается temp-email-password: этот запрос снимает гарантию LZT. '
-     'При отсутствии пароля или несовпадении почты выдача остановлена: аккаунт остаётся у этого заказа, продавец получает уведомление. '
-     'Тег sc:ТЕГ должен точно совпадать с профилем. Без тега заказ игнорируется.'),
+     'Если пароль почты не получен, покупатель видит «Нет данных», а продавец получает уведомление со ссылкой для ручной выдачи. '
+     'Тег sc:ТЕГ или supercell:ТЕГ должен точно совпадать с профилем. Без тега заказ игнорируется.'),
     ('⚠️ Ошибки и возвраты', 'Если аккаунтов нет, действует настройка Автовозврат. Заказы не на 1 шт., '
      'заблокированные покупатели (при блокировке автовыдачи Cardinal) и нехватка средств возвращаются принудительно до покупки. '
      'Отсутствие токена/профиля, неверная валюта, ошибки API передаются продавцу. '
@@ -1008,6 +1037,7 @@ class TelegramUI:
         if o.get('item_id') and not o.get('item'): actions.append(('🔎 Проверить покупку', ('action', oid, 'reconcile')))
         if not o.get('item_id') and o['state'] == 'manual': actions.append(('🔁 Повторить обработку', ('action', oid, 'retry_order')))
         if actions: rows.append(actions)
+        if o.get('payload'): rows.append([('📄 Данные выдачи', ('payload', oid))])
         if o['state'] in {'manual', 'uncertain'}:
             rows.append([('📝 Завершить вручную', ('confirm_resolve', oid))])
         rows += [[('🔄 Обновить', ('order', oid)), ('📦 Заказы', ('orders', 0))]]
@@ -1134,6 +1164,12 @@ class TelegramUI:
         elif op == 'profile': self.profile(chat, args[0], mid)
         elif op == 'orders': self.orders(chat, args[0], mid)
         elif op == 'order': self.order(chat, args[0], mid)
+        elif op == 'payload':
+            order = self.store.get(args[0])
+            if not order or not order.get('payload'): raise SupercellError('Сохранённых данных выдачи нет.')
+            payload = order['payload']
+            for offset in range(0, len(payload), 3500):
+                self.bot.send_message(chat, payload[offset:offset+3500], parse_mode=None, disable_web_page_preview=True)
         elif op == 'ask': self.ask(chat, *args)
         elif op == 'cancel':
             with self.lock: self.pending.pop(chat, None)

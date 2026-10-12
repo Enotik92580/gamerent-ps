@@ -48,8 +48,10 @@ DEFAULT_TEMPLATE = """🎵 Ваш TikTok аккаунт
 📹 Видео: {videos}
 🌍 Регион: {region}
 
-Спасибо за покупку! Буду благодарен за отзыв и подтверждение заказа!"""
-DEFAULT_WAIT = "👋 Заказ принят в работу! Подбираю TikTok-аккаунт по вашим критериям. Ожидайте данные в этом чате."
+Спасибо за покупку! Буду благодарен за отзыв."""
+DEFAULT_WAIT = """👋 Заказ принят в работу!
+🤖 Система подбирает лучший аккаунт по вашим критериям...
+⏳ Ожидайте выдачу в течение 1-3 минут."""
 DEFAULTS = {"enabled": False, "token": "", "proxy_mode": "bot", "proxy": "",
             "auto_refund": True, "balance_alert": True, "balance_threshold": "50",
             "low_notified": False, "template": DEFAULT_TEMPLATE, "wait_text": DEFAULT_WAIT,
@@ -66,6 +68,7 @@ class APIError(TTError):
     def __init__(self, kind, message="", status=0):
         super().__init__(message or kind)
         self.kind, self.status = kind, status
+        self.detail = ''
 
 
 def money(value, positive=False):
@@ -150,6 +153,13 @@ def clean_error(value):
     return text[:500]
 
 
+def provider_error(data):
+    errors = data.get('errors') or data.get('error') or data.get('message') or ''
+    if isinstance(errors, dict): errors = list(errors.values())
+    if isinstance(errors, list): errors = ' '.join(str(e) for e in errors)
+    return clean_error(errors).strip()
+
+
 def classify_error(data, status):
     raw = json.dumps(data.get('errors') or data.get('error') or data.get('message') or '', ensure_ascii=False).casefold()
     if status == 401: return "access"
@@ -157,7 +167,7 @@ def classify_error(data, status):
     if any(x in raw for x in ("not enough balance", "not have enough money", "insufficient funds", "недостаточно средств", "недостаточно денег", "недостаточно баланса")): return "balance"
     if any(x in raw for x in ("paid access", "api access", "market scope", "доступ к api", "доступа к api", "200 sympath")): return "access"
     if status == 429 or any(x in raw for x in ("daily check limit", "daily limit of checks", "rate_limit")): return "rate"
-    if any(x in raw for x in ("item is sold", "item deleted", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
+    if any(x in raw for x in ("item is sold", "item deleted", "requested item not found", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
     if status >= 500: return "network"
     return "unknown"
 
@@ -235,6 +245,12 @@ class Store:
         with self.tx() as db:
             return [json.loads(r[0]) for r in db.execute("SELECT value FROM orders ORDER BY rowid DESC")]
 
+    def active_orders(self):
+        marks = ','.join('?'*len(ACTIVE_STATES))
+        with self.tx() as db:
+            return [json.loads(r[0]) for r in db.execute(
+                f"SELECT value FROM orders WHERE state IN ({marks}) ORDER BY rowid ASC", tuple(ACTIVE_STATES))]
+
     def reserve(self, item, oid):
         with self.tx() as db:
             return bool(db.execute("INSERT OR IGNORE INTO reserved VALUES (?,?)", (str(item), oid)).rowcount)
@@ -277,9 +293,9 @@ class Market:
         self.rate_lock = threading.Lock()
         self.next_request = 0.0
 
-    def request(self, method, path, params=None, body=None):
+    def request(self, method, path, params=None, body=None, token_override=None):
         settings = self.store.settings()
-        token = settings['token']
+        token = settings['token'] if token_override is None else token_override
         if not token: raise APIError("access", "Не установлен токен LZT.")
         if not path.startswith('/') or '..' in path or '?' in path:
             raise TTError("Некорректный путь API.")
@@ -313,11 +329,13 @@ class Market:
             descriptions = {"access": "Проверьте токен, права market и доступ к API.", "balance": "Недостаточно средств на выбранном балансе.",
                             "invalid": "Аккаунт невалиден, продан, удалён или продавец запретил покупку.",
                             "retry": "Маркет просит повторить запрос.", "rate": "Лимит запросов API."}
-            raise APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error = APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error.detail = provider_error(data)
+            raise error
         return data
 
-    def profile(self):
-        data = self.request('GET', '/me')
+    def profile(self, token_override=None):
+        data = self.request('GET', '/me', token_override=token_override)
         user = data.get('user')
         if not isinstance(user, dict) or not str(user.get('user_id', '')).isdigit():
             raise APIError('unknown', 'API не вернул профиль пользователя.')
@@ -370,9 +388,10 @@ def tiktok_item(item):
 
 
 def password_login(item):
-    """Require an explicit false cookie-login flag; unknown values are not safe to buy."""
-    values = [item[k] for k in ('tiktok_cookie_login', 'cookie_login') if k in item]
-    return bool(values) and all(str(v).strip().casefold() in {'0', 'false', 'no'} for v in values)
+    """Reject accounts the market marks as cookie-login. The search already sends cookie_login=no,
+    so a response without the flag (e.g. a fast-buy body) is not treated as cookie-login."""
+    values = [item[k] for k in ('tiktok_cookie_login', 'cookie_login') if k in item and item[k] is not None]
+    return all(str(v).strip().casefold() in {'0', 'false', 'no', ''} for v in values)
 
 
 def select_profile(profiles, selected):
@@ -384,20 +403,22 @@ def select_profile(profiles, selected):
 
 def credentials(item, oid):
     data = item.get('loginData') or {}
+    if not isinstance(data, dict): data = {}
     def usable(value):
         return isinstance(value, str) and bool(value.strip()) and value.strip() not in {'0', '1'}
-    if not isinstance(data, dict) or not all(usable(data.get(k)) for k in ('login', 'password')):
-        raise TTError("Купленный аккаунт не содержит действительные логин/пароль. Откройте его на LZT и передайте данные вручную.")
+    # Per the guide a placeholder login/password is shown as an error mark; the seller is notified.
+    login = data['login'] if usable(data.get('login')) else 'Ошибка (см. на LZT)'
+    password = data['password'] if usable(data.get('password')) else 'Ошибка (см. на LZT)'
     email_data = item.get('emailLoginData') or {}
     if not isinstance(email_data, dict): email_data = {}
     email = email_data.get('login') or item.get('temp_email') or 'Нет'
-    email_password = email_data.get('password') or 'Нет'
+    email_password = email_data.get('password') if usable(email_data.get('password')) else 'Нет'
     # Keep zero values. Missing statistics must not be advertised as zero.
     def statistic(key):
         value = item.get('tiktok_'+key)
         return str(value) if str(value).isdigit() else 'Неизвестно'
     region = item.get('tiktok_top_country') or item.get('tiktok_country') or item.get('country') or 'Неизвестно'
-    return {'login': str(data['login']), 'password': str(data['password']), 'email': str(email),
+    return {'login': str(login), 'password': str(password), 'email': str(email),
             'email_password': str(email_password), 'email_login_url': str(item.get('emailLoginUrl') or 'Нет'),
             'followers': statistic('followers'), 'likes': statistic('likes'), 'videos': statistic('videos'),
             'region': str(region), 'item_id': str(item['item_id']), 'order_id': oid}
@@ -613,6 +634,11 @@ class Shop:
                     self.reconcile(order); return 'stop'
                 except APIError as error:
                     try: item = self.market.item(order['item_id'])
+                    except APIError as lookup:
+                        if lookup.kind != 'invalid' or error.kind != 'invalid':
+                            self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
+                            return 'stop'
+                        item = {}
                     except TTError:
                         self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
                         return 'stop'
@@ -691,6 +717,9 @@ class Shop:
             if not password_login(order['item']):
                 raise TTError('Купленный аккаунт требует ручной проверки способа входа.')
             fields = credentials(order['item'], order['id'])
+            if 'Ошибка (см. на LZT)' in (fields['login'], fields['password']):
+                self.notify(f"⚠️ {NAME} #{esc(order['id'])}: маркет вернул пустые логин/пароль. "
+                            f"Передайте данные вручную: https://lzt.market/{order['item_id']}/")
             try: text = self.store.settings()['template'].format(**fields)
             except (ValueError, KeyError, IndexError, AttributeError):
                 text = DEFAULT_TEMPLATE.format(**fields)
@@ -703,6 +732,8 @@ class Shop:
         if not self.say(order, order['payload']):
             if order['attempts'] >= 5:
                 self.hold(order, 'Аккаунт куплен, но данные не доставлены после 5 попыток. Нажмите «Повторить выдачу».')
+                self.notify(f"⚠️ Ошибка отправки в чат для заказа #{esc(order['id'])}\n"
+                            f"Отправьте покупателю вручную:\n\n{esc(order['payload'])}")
             elif order['attempts'] == 1:
                 self.notify('⚠️ Данные не доставлены для #'+esc(order['id'])+'. Повторю отправку того же аккаунта.')
             return
@@ -779,7 +810,7 @@ class Shop:
                     next_balance = time.time()+1800
                     try: self.balances(force=True)
                     except TTError: pass
-                for order in reversed(self.store.orders()):
+                for order in self.store.active_orders():
                     state = order['state']
                     if state not in ACTIVE_STATES or order.get('check_after', 0) > time.time(): continue
                     if state in {'queued', 'searching'} and not settings['enabled']: continue
@@ -808,7 +839,7 @@ GUIDE = [
      'Внутренняя автовыдача сначала выключена.'),
     ('🔑 API и прокси', 'Создайте API-приложение на https://lolz.live/account/api и получите токен с правом market. '
      'Доступ к API определяется текущими правилами LZT. Установите валюту RUB на LZT. '
-     'В Общих настройках сохраните токен. Кнопка «Проверить API» показывает каждый баланс отдельно. '
+     'В Общих настройках токен проверяется перед сохранением; при ошибке прежний остаётся. Кнопка «Проверить API» показывает каждый баланс отдельно. '
      'Прокси бота используется по умолчанию; отдельный прокси LZT принимает HTTP/HTTPS, IPv4.'),
     ('🗂 Профили и лоты', 'Создайте профиль с тегом (латиница, цифры, _ и -, до 25 символов) и названием. '
      'Установите ссылку поиска https://lzt.market/tiktok/ с фильтрами либо ссылку подраздела TikTok и максимальную цену в RUB. '
@@ -950,6 +981,7 @@ class TelegramUI:
         if o.get('item_id') and not o.get('item'): actions.append(('🔎 Проверить покупку', ('action', oid, 'reconcile')))
         if not o.get('item_id') and o['state'] == 'manual': actions.append(('🔁 Повторить обработку', ('action', oid, 'retry_order')))
         if actions: rows.append(actions)
+        if o.get('payload'): rows.append([('📄 Данные выдачи', ('payload', oid))])
         if o['state'] in {'manual', 'uncertain'}:
             rows.append([('📝 Завершить вручную', ('confirm_resolve', oid))])
         rows += [[('🔄 Обновить', ('order', oid)), ('📦 Заказы', ('orders', 0))]]
@@ -1004,9 +1036,14 @@ class TelegramUI:
                 self.check_access_editable()
             if field == 'token':
                 if len(raw) > 4096 or not raw or any(c.isspace() for c in raw): raise TTError('Токен должен быть одной строкой без пробелов.')
+                self.show(chat, '⏳ Проверяю токен LZT…')
+                try: self.shop.market.profile(token_override=raw)
+                except TTError as error:
+                    raise TTError(f'Токен не сохранён. {error}' + (f' HTTP {error.status}.' if isinstance(error, APIError) and error.status else '')) from None
+                self.check_access_editable()
                 self.store.setting('token', raw)
                 self.shop.balance_cache = None
-                self.show(chat, '✅ Токен сохранён. Нажмите «Проверить API».', [[('🔄 Проверить API', ('balance',)), ('⚙️ Настройки', ('settings',))]])
+                self.show(chat, '✅ TT LOLZ Токен сохранен и проверен.', [[('🔄 Проверить API', ('balance',)), ('⚙️ Настройки', ('settings',))]])
             elif field == 'proxy':
                 value = proxy_url(raw)
                 self.store.change(lambda s: s.update({'proxy': value, 'proxy_mode': 'custom' if value else 'bot'}))
@@ -1072,6 +1109,12 @@ class TelegramUI:
         elif op == 'profile': self.profile(chat, args[0], mid)
         elif op == 'orders': self.orders(chat, args[0], mid)
         elif op == 'order': self.order(chat, args[0], mid)
+        elif op == 'payload':
+            order = self.store.get(args[0])
+            if not order or not order.get('payload'): raise TTError('Сохранённых данных выдачи нет.')
+            payload = order['payload']
+            for offset in range(0, len(payload), 3500):
+                self.bot.send_message(chat, payload[offset:offset+3500], parse_mode=None, disable_web_page_preview=True)
         elif op == 'ask': self.ask(chat, *args)
         elif op == 'cancel':
             with self.lock: self.pending.pop(chat, None)

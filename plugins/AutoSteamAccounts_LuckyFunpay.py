@@ -41,15 +41,20 @@ DEFAULT_TEMPLATE = """🎮 Ваш Steam аккаунт
 📧 Почта: {email}
 🔐 Пароль от почты: {email_password}
 🌐 Вход в почту: {email_login_url}
+
 🔗 Профиль Steam: {steam_link}
 
-🛡 Код Steam Guard: !steamguard
-Отвязать Steam Guard (необратимо): !steamremove
+💬 Если аккаунт защищен Steam Guard:
+Напишите в этот чат команду !steamguard для получения кода.
+Напишите команду !steamremove для отвязки защиты.
 
 Спасибо за покупку! Буду благодарен за отзыв и подтверждение заказа!"""
-DEFAULT_WAIT = "👋 Ваш заказ принят. Подбираю и проверяю Steam-аккаунт. Ожидайте данные в этом чате."
-TEMP_WARNING = ("\n\n──────────\n⚠️ Временная почта предназначена для входа и смены данных. "
-                "Смените почту и пароль Steam на свои. Получение пароля временной почты отменяет гарантию LZT.")
+DEFAULT_WAIT = """👋 Здравствуйте! Ваш заказ принят в автоматическую обработку.
+
+🤖 Система проверяет и подготавливает аккаунт...
+⏳ Это может занять до 3-5 минут. Ожидайте данные прямо в этом чате."""
+TEMP_WARNING = ("\n\n──────────\n⚠️ Не храните аккаунт на временной почте: используйте её только для входа и смены данных. "
+                "Обязательно смените почту и пароль Steam на свои.")
 DEFAULTS = {"enabled": False, "token": "", "proxy_mode": "bot", "proxy": "",
             "auto_refund": True, "balance_alert": True, "balance_threshold": "50",
             "low_notified": False, "template": DEFAULT_TEMPLATE, "wait_text": DEFAULT_WAIT,
@@ -66,6 +71,7 @@ class APIError(SteamError):
     def __init__(self, kind, message="", status=0):
         super().__init__(message or kind)
         self.kind, self.status = kind, status
+        self.detail = ''
 
 
 def money(value, positive=False):
@@ -150,6 +156,13 @@ def clean_error(value):
     return text[:500]
 
 
+def provider_error(data):
+    errors = data.get('errors') or data.get('error') or data.get('message') or ''
+    if isinstance(errors, dict): errors = list(errors.values())
+    if isinstance(errors, list): errors = ' '.join(str(e) for e in errors)
+    return clean_error(errors).strip()
+
+
 def classify_error(data, status):
     raw = json.dumps(data.get('errors') or data.get('error') or data.get('message') or '', ensure_ascii=False).casefold()
     if status == 401: return "access"
@@ -157,7 +170,7 @@ def classify_error(data, status):
     if any(x in raw for x in ("not enough balance", "not have enough money", "insufficient funds", "недостаточно средств", "недостаточно денег", "недостаточно баланса")): return "balance"
     if any(x in raw for x in ("paid access", "api access", "market scope", "доступ к api", "доступа к api", "200 sympath")): return "access"
     if status == 429 or any(x in raw for x in ("daily check limit", "daily limit of checks", "rate_limit")): return "rate"
-    if any(x in raw for x in ("item is sold", "item deleted", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
+    if any(x in raw for x in ("item is sold", "item deleted", "requested item not found", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
     if any(x in raw for x in ("authenticator not found", "authenticator is not added", "mafile not found", "no mafile", "не привязан", "нет mafile")): return "no_guard"
     if status >= 500: return "network"
     return "unknown"
@@ -236,6 +249,12 @@ class Store:
         with self.tx() as db:
             return [json.loads(r[0]) for r in db.execute("SELECT value FROM orders ORDER BY rowid DESC")]
 
+    def active_orders(self):
+        marks = ','.join('?'*len(ACTIVE_STATES))
+        with self.tx() as db:
+            return [json.loads(r[0]) for r in db.execute(
+                f"SELECT value FROM orders WHERE state IN ({marks}) ORDER BY rowid ASC", tuple(ACTIVE_STATES))]
+
     def reserve(self, item, oid):
         with self.tx() as db:
             return bool(db.execute("INSERT OR IGNORE INTO reserved VALUES (?,?)", (str(item), oid)).rowcount)
@@ -278,9 +297,9 @@ class Market:
         self.rate_lock = threading.Lock()
         self.next_request = 0.0
 
-    def request(self, method, path, params=None, body=None):
+    def request(self, method, path, params=None, body=None, token_override=None):
         settings = self.store.settings()
-        token = settings['token']
+        token = settings['token'] if token_override is None else token_override
         if not token: raise APIError("access", "Не установлен токен LZT.")
         if not path.startswith('/') or '..' in path or '?' in path:
             raise SteamError("Некорректный путь API.")
@@ -315,11 +334,13 @@ class Market:
                             "invalid": "Аккаунт невалиден, продан, удалён или продавец запретил покупку.",
                             "retry": "Маркет просит повторить запрос.", "rate": "Лимит запросов API.",
                             "no_guard": "На этом аккаунте нет привязанного Steam Guard (maFile)."}
-            raise APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error = APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error.detail = provider_error(data)
+            raise error
         return data
 
-    def profile(self):
-        data = self.request('GET', '/me')
+    def profile(self, token_override=None):
+        data = self.request('GET', '/me', token_override=token_override)
         user = data.get('user')
         if not isinstance(user, dict) or not str(user.get('user_id', '')).isdigit():
             raise APIError('unknown', 'API не вернул профиль пользователя.')
@@ -337,7 +358,7 @@ class Market:
     def search(self, profile):
         parts = urlsplit(search_url(profile['url']))
         base = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-                if k not in {'pmax', 'page', 'currency', 'fields_include', 'fields_exclude'}]
+                if k.split('[')[0].casefold() not in {'pmax', 'page', 'currency', 'fields_include', 'fields_exclude'}]
         base += [('pmax', profile['max_price']), ('currency', 'rub')]
         for page in range(1, 6):
             data = self.request('GET', parts.path.rstrip('/'), base+[('page', page)])
@@ -366,40 +387,58 @@ def owned(item, user_id):
 
 
 def steam_item(item):
-    return str(item.get('category_id')) == '1'
+    return isinstance(item, dict) and str(item.get('category_id')) == '1'
+
+
+def has_guard(item):
+    # LZT exposes the attached authenticator as steam_mfa (0/1).
+    return any(str(item.get(k, '')).casefold() in {'1', 'true', 'yes'} for k in ('steam_mfa', 'steam_has_mafile', 'hasMaFile'))
+
+
+def usable_secret(value):
+    return isinstance(value, str) and bool(value.strip()) and value.strip().casefold() not in {
+        '0', '1', 'hidden', 'скрыт', 'нет данных', 'none', 'null'}
 
 
 def credentials(item, oid, market):
     data = item.get('loginData') or {}
-    if not data.get('login') or not data.get('password'):
+    if not isinstance(data, dict) or not usable_secret(data.get('login')) or not usable_secret(data.get('password')):
         raise SteamError("Купленный аккаунт не содержит логин/пароль. Нужна ручная выдача.")
     email_data = item.get('emailLoginData') or {}
-    temp = item.get('temp_email')
-    guard = bool(item.get('steam_has_mafile') or item.get('hasMaFile'))
-    warning = bool(temp or guard)
-    email = temp or email_data.get('login') or 'Не предоставлена'
-    email_password = email_data.get('password') or 'Не предоставлен'
+    if not isinstance(email_data, dict): email_data = {}
+    temp = item.get('temp_email') if usable_secret(item.get('temp_email')) else ''
+    # Guarantee account: temporary mail or attached maFile.
+    warning = bool(temp or has_guard(item))
+    if warning:
+        email = temp or 'Скрыта'
+        email_password = email_data.get('password') if not temp and usable_secret(email_data.get('password')) else ''
+    else:
+        email = email_data.get('login') if usable_secret(email_data.get('login')) else 'Не предоставлена'
+        email_password = email_data.get('password') if usable_secret(email_data.get('password')) else 'Не предоставлен'
     missing_email = False
-    if temp:
+    if warning and not email_password:
         try:
+            if not temp: raise SteamError('У аккаунта нет временной почты.')
+            # This request cancels the LZT guarantee; it is made once, the result is saved in the payload.
             response = market.request('GET', '/'+str(item['item_id'])+'/temp-email-password')
             account = (response.get('item') or {}).get('account')
-            if isinstance(account, str) and account:
-                if ':' in account:
-                    email, email_password = account.split(':', 1)
-                else:
-                    email_password = account
-            else: raise SteamError('Не получен пароль временной почты.')
+            if not isinstance(account, str) or not account.strip(): raise SteamError('Не получен пароль временной почты.')
+            if ':' in account:
+                login, email_password = account.split(':', 1)
+                if usable_secret(login): email = login
+            else:
+                email_password = account
+            if not usable_secret(email_password): raise SteamError('Не получен пароль временной почты.')
         except SteamError:
-            email_password = 'Скрыт (напишите продавцу для выдачи)'
+            email_password = 'Скрыт (Напишите в чат для выдачи)'
             missing_email = True
     link = item.get('accountLink') or ''
-    if not link:
+    if not isinstance(link, str) or not link.strip():
         sid = str(item.get('steam_id', ''))
         link = 'https://steamcommunity.com/profiles/'+sid if re.fullmatch(r'\d{17}', sid) else 'Нет ссылки'
     return {'login': str(data['login']), 'password': str(data['password']), 'email': str(email),
             'email_password': str(email_password), 'email_login_url': str(item.get('emailLoginUrl') or 'Не предоставлен'),
-            'steam_link': str(link).removeprefix('https://'), 'item_id': str(item['item_id']),
+            'steam_link': re.sub(r'^https?://', '', str(link).strip()), 'item_id': str(item['item_id']),
             'order_id': oid}, warning, missing_email
 
 
@@ -415,7 +454,7 @@ class Shop:
         self.inflight = set()
         self.threads = []
         self.command_lock = threading.Lock()
-        self.command_busy = False
+        self.command_inflight = set()
         self.ui = None
         self.balance_cache = None
         self.balance_stamp = 0
@@ -582,7 +621,7 @@ class Shop:
                     self.refund(order, 'Недостаточно средств на LZT.', force=True); return
                 if not self.store.reserve(item_id, order['id']): continue
                 order.update({'item_id': item_id, 'market_user': user_id, 'cost': str(price),
-                              'state': 'buying', 'buy_started': time.time()})
+                              'state': 'buying', 'buy_started': time.time(), 'candidate': item})
                 self.store.save(order)  # committed before any mutating API call
                 result = self.attempt_purchase(order, available)
                 if result == 'next': continue
@@ -606,6 +645,11 @@ class Shop:
                     self.reconcile(order); return 'stop'
                 except APIError as error:
                     try: item = self.market.item(order['item_id'])
+                    except APIError as lookup:
+                        if lookup.kind != 'invalid' or error.kind != 'invalid':
+                            self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
+                            return 'stop'
+                        item = {}
                     except SteamError:
                         self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
                         return 'stop'
@@ -653,6 +697,7 @@ class Shop:
             self.hold(order, 'Результат покупки неизвестен. Автоматическая сверка продолжается.', uncertain=True)
 
     def accept_purchase(self, order, item):
+        item = {**order.get('candidate', {}), **item}
         if not steam_item(item):
             self.hold(order, 'Купленный товар не относится к Steam. Нужна ручная выдача.'); return
         # Persist credentials immediately; later email requests / delivery failures cannot trigger repurchase.
@@ -691,6 +736,8 @@ class Shop:
         if not self.say(order, order['payload']):
             if order['attempts'] >= 5:
                 self.hold(order, 'Аккаунт куплен, но данные не доставлены после 5 попыток. Нажмите «Повторить выдачу».')
+                self.notify(f"⚠️ Ошибка отправки в чат для заказа #{esc(order['id'])}\n"
+                            f"Отправьте покупателю вручную:\n\n{esc(order['payload'])}")
             elif order['attempts'] == 1:
                 self.notify('⚠️ Данные не доставлены для #'+esc(order['id'])+'. Повторю отправку того же аккаунта.')
             return
@@ -734,46 +781,59 @@ class Shop:
         key = f"{chat}:{getattr(message, 'id', '')}"
         if not getattr(message, 'id', None) or not self.store.message_once(key): return
         with self.command_lock:
-            if self.command_busy: return
+            if author in self.command_inflight: return
             last = self.command_times.get(author, 0)
             if time.time()-last < 5: return
+            self.command_times = {k: v for k, v in self.command_times.items() if time.time()-v < 3600}
             self.command_times[author] = time.time()
-            self.command_busy = True
+            self.command_inflight.add(author)
         def run():
             try: self.guard(order, command)
             finally:
-                with self.command_lock: self.command_busy = False
+                with self.command_lock: self.command_inflight.discard(author)
         thread = threading.Thread(target=run, name='AutoSteamGuard', daemon=True)
-        with self.lock: self.threads.append(thread)
+        with self.lock:
+            self.threads = [t for t in self.threads if t.is_alive()]
+            self.threads.append(thread)
         thread.start()
 
     def guard(self, order, command):
+        remove = command == '!steamremove'
+        no_guard = ('ℹ️ На этом аккаунте нет привязанного maFile. Удалять нечего.' if remove
+                    else 'ℹ️ На этом аккаунте нет привязанного Steam Guard (maFile).')
         try:
+            # Re-read the stored order: another command may have removed the maFile meanwhile.
+            order = self.store.get(order['id']) or order
+            if order.get('guard_removed'):
+                self.say(order, no_guard); return
             item = self.market.item(order['item_id'])
             if not owned(item, order['market_user']):
                 self.say(order, '⚠️ Не удалось подтвердить доступ к этому аккаунту. Свяжитесь с продавцом.'); return
-            if item.get('steam_community_ban') in {True, 1, '1'}:
-                self.say(order, 'ℹ️ На аккаунте присутствует красная табличка (КТ). Операция со Steam Guard невозможна.'); return
-            if order.get('guard_removed'):
-                self.say(order, 'ℹ️ Steam Guard (maFile) уже отвязан от аккаунта.'); return
-            if command == '!steamremove':
-                data = self.market.request('DELETE', '/'+order['item_id']+'/mafile')
-                if data.get('status') not in {'ok', 'success'}:
-                    self.say(order, '⚠️ API не подтвердил отвязку Steam Guard. Свяжитесь с продавцом.'); return
+            if str(item.get('steam_community_ban', '')).casefold() in {'1', 'true'}:
+                self.say(order, 'ℹ️ На аккаунте присутствует красная табличка (КТ). '
+                         + ('Отвязка аутентификатора невозможна.' if remove else 'Запросить код Steam Guard невозможно.')); return
+            if remove:
+                self.market.request('DELETE', '/'+order['item_id']+'/mafile')
                 order['guard_removed'] = True
                 self.store.save(order)
                 self.store.audit('guard_removed', order['id'])
-                self.say(order, '✅ Steam Guard (maFile) успешно отвязан. Теперь вы можете привязать свой номер телефона.')
+                self.say(order, '✅ Steam Guard (maFile) успешно отвязан от аккаунта. Теперь вы можете привязать свой номер телефона.')
             else:
                 data = self.market.request('GET', '/'+order['item_id']+'/guard-code')
-                code = str((data.get('codeData') or {}).get('code', ''))
-                if re.fullmatch(r'[A-Z0-9]{5}', code): self.say(order, '🛡 Ваш Steam Guard код: '+code)
-                else: self.say(order, '⚠️ Код Steam Guard не найден.')
+                code = str((data.get('codeData') or {}).get('code', '')).strip()
+                if re.fullmatch(r'[A-Za-z0-9]{5}', code): self.say(order, '🛡 Ваш Steam Guard код: '+code.upper())
+                else: self.say(order, '⚠️ Код не найден.')
         except APIError as error:
-            self.say(order, '⚠️ '+clean_error(str(error))+' Попробуйте позже или свяжитесь с продавцом.')
+            if error.kind == 'network':
+                # Per the guide, the buyer simply repeats the command.
+                LOG.warning('Guard request network error for order %s', order['id']); return
+            if error.kind == 'no_guard':
+                self.say(order, no_guard); return
+            reason = error.detail or clean_error(str(error))
+            self.say(order, ('⚠️ Произошла ошибка при отвязке maFile: ' if remove
+                             else '⚠️ Не удалось получить код. Возможная причина: ')+reason)
         except Exception:
             LOG.warning('Guard request failed for order %s', order['id'])
-            self.say(order, '⚠️ Не удалось обработать команду. Попробуйте позже.')
 
     def admin_action(self, oid, action):
         order = self.store.get(oid)
@@ -825,7 +885,7 @@ class Shop:
                     next_balance = time.time()+1800
                     try: self.balances(force=True)
                     except SteamError: pass
-                for order in reversed(self.store.orders()):
+                for order in self.store.active_orders():
                     state = order['state']
                     if state not in ACTIVE_STATES or order.get('check_after', 0) > time.time(): continue
                     if state in {'queued', 'searching'} and not settings['enabled']: continue
@@ -854,7 +914,7 @@ GUIDE = [
      'Внутренняя автовыдача сначала выключена.'),
     ('🔑 API и прокси', 'Создайте API-приложение на https://lolz.live/account/api и получите токен с правом market. '
      'Доступ к API определяется текущими правилами LZT. Установите валюту RUB на LZT. '
-     'В Общих настройках сохраните токен. Кнопка «Проверить API» показывает каждый баланс отдельно. '
+     'В Общих настройках токен проверяется перед сохранением; при ошибке прежний остаётся. Кнопка «Проверить API» показывает каждый баланс отдельно. '
      'Прокси бота используется по умолчанию; отдельный прокси LZT принимает HTTP/HTTPS, IPv4.'),
     ('🗂 Профили и лоты', 'Создайте профиль с тегом (латиница, цифры, _ и -, до 25 символов) и названием. '
      'Установите ссылку поиска https://lzt.market/steam/ с фильтрами либо ссылку подраздела Steam и максимальную цену в RUB. '
@@ -996,6 +1056,7 @@ class TelegramUI:
         if o.get('item_id') and not o.get('item'): actions.append(('🔎 Проверить покупку', ('action', oid, 'reconcile')))
         if not o.get('item_id') and o['state'] == 'manual': actions.append(('🔁 Повторить обработку', ('action', oid, 'retry_order')))
         if actions: rows.append(actions)
+        if o.get('payload'): rows.append([('📄 Данные выдачи', ('payload', oid))])
         if o['state'] in {'manual', 'uncertain'}:
             rows.append([('📝 Завершить вручную', ('confirm_resolve', oid))])
         rows += [[('🔄 Обновить', ('order', oid)), ('📦 Заказы', ('orders', 0))]]
@@ -1041,17 +1102,22 @@ class TelegramUI:
             if field in {'token', 'proxy'}:
                 try: self.bot.delete_message(chat, message.message_id)
                 except Exception: pass
-                if (self.store.settings()['enabled'] or self.shop.inflight or self.shop.command_busy
+                if (self.store.settings()['enabled'] or self.shop.inflight or self.shop.command_inflight
                         or any(o['state'] in {'buying', 'uncertain', 'purchased', 'delivery_pending'} for o in self.store.orders())):
                     raise SteamError('Выключите автовыдачу и завершите активные покупки/сверку перед изменением API-доступа.')
             if field == 'token':
                 if len(raw) > 4096 or not raw or any(c.isspace() for c in raw): raise SteamError('Токен должен быть одной строкой без пробелов.')
+                self.show(chat, '⏳ Проверяю токен LZT…')
+                try: self.shop.market.profile(token_override=raw)
+                except SteamError as error:
+                    raise SteamError(f'Токен не сохранён. {error}' + (f' HTTP {error.status}.' if isinstance(error, APIError) and error.status else '')) from None
                 self.store.setting('token', raw)
                 self.shop.balance_cache = None
-                self.show(chat, '✅ Токен сохранён. Нажмите «Проверить API».', [[('🔄 Проверить API', ('balance',)), ('⚙️ Настройки', ('settings',))]])
+                self.show(chat, '✅ Steam LOLZ Токен сохранен и проверен.', [[('🔄 Проверить API', ('balance',)), ('⚙️ Настройки', ('settings',))]])
             elif field == 'proxy':
                 value = proxy_url(raw)
                 self.store.change(lambda s: s.update({'proxy': value, 'proxy_mode': 'custom' if value else 'bot'}))
+                self.shop.balance_cache = None
                 self.dispatch(chat, None, ('proxy',))
             elif field == 'new_tag':
                 key = tag(raw)
@@ -1113,6 +1179,12 @@ class TelegramUI:
         elif op == 'profile': self.profile(chat, args[0], mid)
         elif op == 'orders': self.orders(chat, args[0], mid)
         elif op == 'order': self.order(chat, args[0], mid)
+        elif op == 'payload':
+            order = self.store.get(args[0])
+            if not order or not order.get('payload'): raise SteamError('Сохранённых данных выдачи нет.')
+            payload = order['payload']
+            for offset in range(0, len(payload), 3500):
+                self.bot.send_message(chat, payload[offset:offset+3500], parse_mode=None, disable_web_page_preview=True)
         elif op == 'ask': self.ask(chat, *args)
         elif op == 'cancel':
             with self.lock: self.pending.pop(chat, None)
@@ -1149,6 +1221,7 @@ class TelegramUI:
                 if args[0] == 'custom' and not self.store.settings()['proxy']: raise SteamError('Сначала задайте свой прокси.')
                 self.store.setting('proxy_mode', args[0])
             else: self.store.change(lambda s: s.update({'proxy': '', 'proxy_mode': 'bot'}))
+            self.shop.balance_cache = None
             self.dispatch(chat, mid, ('proxy',))
         elif op == 'sellers':
             sellers = self.store.settings()['sellers']

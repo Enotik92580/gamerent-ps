@@ -45,7 +45,10 @@ DEFAULT_TEMPLATE = """📸 Ваш Instagram аккаунт
 ⚠️ При входе рекомендуем использовать качественные прокси, чтобы избежать блокировок от Instagram.
 
 Спасибо за покупку! Пожалуйста, проверьте аккаунт и подтвердите выполнение заказа. Буду благодарен за отзыв!"""
-DEFAULT_WAIT = "👋 Заказ принят в работу! Подбираю Instagram-аккаунт по вашим критериям. Ожидайте данные в этом чате."
+DEFAULT_WAIT = """👋 Здравствуйте! Ваш заказ принят в автоматическую обработку.
+
+🤖 Система подбирает лучший Instagram аккаунт...
+⏳ Это может занять около 1-3 минут. Ожидайте данные прямо в этом чате."""
 DEFAULTS = {"enabled": False, "token": "", "proxy_mode": "bot", "proxy": "",
             "auto_refund": True, "balance_alert": True, "balance_threshold": "50",
             "low_notified": False, "template": DEFAULT_TEMPLATE, "wait_text": DEFAULT_WAIT,
@@ -62,6 +65,7 @@ class APIError(InstagramError):
     def __init__(self, kind, message="", status=0):
         super().__init__(message or kind)
         self.kind, self.status = kind, status
+        self.detail = ''
 
 
 def money(value, positive=False):
@@ -146,6 +150,13 @@ def clean_error(value):
     return text[:500]
 
 
+def provider_error(data):
+    errors = data.get('errors') or data.get('error') or data.get('message') or ''
+    if isinstance(errors, dict): errors = list(errors.values())
+    if isinstance(errors, list): errors = ' '.join(str(e) for e in errors)
+    return clean_error(errors).strip()
+
+
 def classify_error(data, status):
     raw = json.dumps(data.get('errors') or data.get('error') or data.get('message') or '', ensure_ascii=False).casefold()
     if status == 401: return "access"
@@ -153,7 +164,7 @@ def classify_error(data, status):
     if any(x in raw for x in ("not enough balance", "not have enough money", "insufficient funds", "недостаточно средств", "недостаточно денег", "недостаточно баланса")): return "balance"
     if any(x in raw for x in ("paid access", "api access", "market scope", "доступ к api", "доступа к api", "200 sympath")): return "access"
     if status == 429 or any(x in raw for x in ("daily check limit", "daily limit of checks", "rate_limit")): return "rate"
-    if any(x in raw for x in ("item is sold", "item deleted", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
+    if any(x in raw for x in ("item is sold", "item deleted", "requested item not found", "ad was removed", "account is invalid", "account invalid", "невалид", "аккаунт продан", "аккаунт удален", "аккаунт удалён", "seller have added you", "seller has added you")): return "invalid"
     if status >= 500: return "network"
     return "unknown"
 
@@ -230,6 +241,12 @@ class Store:
     def orders(self):
         with self.tx() as db:
             return [json.loads(r[0]) for r in db.execute("SELECT value FROM orders ORDER BY rowid DESC")]
+
+    def active_orders(self):
+        marks = ','.join('?'*len(ACTIVE_STATES))
+        with self.tx() as db:
+            return [json.loads(r[0]) for r in db.execute(
+                f"SELECT value FROM orders WHERE state IN ({marks}) ORDER BY rowid ASC", tuple(ACTIVE_STATES))]
 
     def reserve(self, item, oid):
         with self.tx() as db:
@@ -309,7 +326,9 @@ class Market:
             descriptions = {"access": "Проверьте токен, права market и доступ к API.", "balance": "Недостаточно средств на выбранном балансе.",
                             "invalid": "Аккаунт невалиден, продан, удалён или продавец запретил покупку.",
                             "retry": "Маркет просит повторить запрос.", "rate": "Лимит запросов API."}
-            raise APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error = APIError(kind, descriptions.get(kind, "API не подтвердил выполнение запроса."), response.status_code)
+            error.detail = provider_error(data)
+            raise error
         return data
 
     def profile(self, token_override=None):
@@ -366,9 +385,10 @@ def instagram_item(item):
 
 
 def password_login(item):
-    """Cookies may exist alongside password login. Require explicit password-login support."""
-    values = [item[k] for k in ('instagram_login_without_cookies', 'login_without_cookies') if k in item]
-    return bool(values) and all(str(v).strip().casefold() in {'1', 'true', 'yes'} for v in values)
+    """Reject accounts the market marks as cookie-only. The search already sends
+    login_without_cookies=yes, so a response without the flag is not treated as cookie-only."""
+    values = [item[k] for k in ('instagram_login_without_cookies', 'login_without_cookies') if k in item and item[k] is not None]
+    return all(str(v).strip().casefold() in {'1', 'true', 'yes'} for v in values)
 
 
 def select_profile(profiles, selected):
@@ -605,6 +625,11 @@ class Shop:
                     self.reconcile(order); return 'stop'
                 except APIError as error:
                     try: item = self.market.item(order['item_id'])
+                    except APIError as lookup:
+                        if lookup.kind != 'invalid' or error.kind != 'invalid':
+                            self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
+                            return 'stop'
+                        item = {}
                     except InstagramError:
                         self.hold(order, 'Нет подтверждения результата покупки и не удалось проверить владельца.', uncertain=True)
                         return 'stop'
@@ -698,6 +723,8 @@ class Shop:
         if not self.say(order, order['payload']):
             if order['attempts'] >= 5:
                 self.hold(order, 'Аккаунт куплен, но данные не доставлены после 5 попыток. Нажмите «Повторить выдачу».')
+                self.notify(f"⚠️ Ошибка отправки в чат для заказа #{esc(order['id'])}\n"
+                            f"Отправьте покупателю вручную:\n\n{esc(order['payload'])}")
             elif order['attempts'] == 1:
                 self.notify('⚠️ Данные не доставлены для #'+esc(order['id'])+'. Повторю отправку того же аккаунта.')
             return
@@ -820,7 +847,7 @@ class Shop:
                     next_balance = time.time()+1800
                     try: self.balances(force=True)
                     except InstagramError: pass
-                for order in reversed(self.store.orders()):
+                for order in self.store.active_orders():
                     state = order['state']
                     if state not in ACTIVE_STATES or order.get('check_after', 0) > time.time(): continue
                     if state in {'queued', 'searching'} and not settings['enabled']: continue
@@ -993,6 +1020,7 @@ class TelegramUI:
         if o.get('item_id') and not o.get('item'): actions.append(('🔎 Проверить покупку', ('action', oid, 'reconcile')))
         if not o.get('item_id') and o['state'] == 'manual': actions.append(('🔁 Повторить обработку', ('action', oid, 'retry_order')))
         if actions: rows.append(actions)
+        if o.get('payload'): rows.append([('📄 Данные выдачи', ('payload', oid))])
         if o['state'] in {'manual', 'uncertain'}:
             rows.append([('📝 Завершить вручную', ('confirm_resolve', oid))])
         rows += [[('🔄 Обновить', ('order', oid)), ('📦 Заказы', ('orders', 0))]]
@@ -1119,6 +1147,12 @@ class TelegramUI:
         elif op == 'profile': self.profile(chat, args[0], mid)
         elif op == 'orders': self.orders(chat, args[0], mid)
         elif op == 'order': self.order(chat, args[0], mid)
+        elif op == 'payload':
+            order = self.store.get(args[0])
+            if not order or not order.get('payload'): raise InstagramError('Сохранённых данных выдачи нет.')
+            payload = order['payload']
+            for offset in range(0, len(payload), 3500):
+                self.bot.send_message(chat, payload[offset:offset+3500], parse_mode=None, disable_web_page_preview=True)
         elif op == 'ask': self.ask(chat, *args)
         elif op == 'cancel':
             with self.lock: self.pending.pop(chat, None)
