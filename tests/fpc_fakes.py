@@ -65,6 +65,7 @@ class FakeResponse:
         self.content = self.text.encode()
         self.status_code = status_code
         self._data = data
+        self.request = pytypes.SimpleNamespace(url="https://funpay.com/test", headers={}, body="", method="POST")
 
     def json(self):
         return self._data if self._data is not None else json.loads(self.text)
