@@ -173,12 +173,15 @@ class JsonStore:
             os.replace(tmp, self.path)
 
     def __getitem__(self, key):
+        """Возвращает копию значения: изменять данные можно только через set()/change()."""
         with self.lock:
-            return self.data[key]
+            value = self.data[key]
+            return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
 
     def get(self, key, default=None):
         with self.lock:
-            return self.data.get(key, default)
+            value = self.data.get(key, default)
+            return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -233,8 +236,24 @@ class Panel:
         self.tokens: dict = {}
         self.pending: dict = {}
         self.lock = threading.RLock()
-        self.message = None
-        self.call = None
+        self._local = threading.local()
+
+    # текущие сообщение и нажатие — свои у каждого потока telebot
+    @property
+    def message(self):
+        return getattr(self._local, "message", None)
+
+    @message.setter
+    def message(self, value):
+        self._local.message = value
+
+    @property
+    def call(self):
+        return getattr(self._local, "call", None)
+
+    @call.setter
+    def call(self, value):
+        self._local.call = value
 
     # --- доступ
     def admins(self) -> list[int]:
@@ -260,6 +279,9 @@ class Panel:
             if len(self.tokens) > 4000:
                 border = time.time() - 6 * 3600
                 self.tokens = {k: v for k, v in self.tokens.items() if v[0] > border}
+                if len(self.tokens) > 20000:
+                    newest = sorted(self.tokens.items(), key=lambda kv: kv[1][0])[-10000:]
+                    self.tokens = dict(newest)
             for row in rows:
                 buttons = []
                 for label, action in row:
@@ -327,6 +349,18 @@ class Panel:
         with self.lock:
             self.pending[chat] = {"t": time.time(), "action": tuple(action), "prompt": prompt, "doc": doc,
                                   "mid": getattr(msg, "message_id", mid)}
+        self.input_owners()[chat] = UUID
+
+    def input_owners(self) -> dict:
+        """Общий для всех плагинов LuckyFunpay реестр: какой плагин сейчас ждёт ввод в чате."""
+        owners = getattr(self.cardinal, "_lucky_input_owner", None)
+        if owners is None:
+            owners = {}
+            try:
+                setattr(self.cardinal, "_lucky_input_owner", owners)
+            except Exception:
+                pass
+        return owners
 
     def pending_for(self, message, doc=False):
         if not self.allowed(getattr(message, "from_user", None), getattr(message, "chat", None)):
@@ -334,6 +368,8 @@ class Panel:
         with self.lock:
             item = self.pending.get(message.chat.id)
         if not item or time.time() - item["t"] > 900:
+            return None
+        if self.input_owners().get(message.chat.id, UUID) != UUID:
             return None
         if doc != item["doc"]:
             return None
@@ -978,18 +1014,28 @@ class StalePanel(Panel):
     def on_off_all(self, chat, mid, page):
         d = self.plugin.store.snapshot()
         items = [i for i in d["result"] if not i.get("off")][page * PAGE:(page + 1) * PAGE]
+        if self.plugin.busy.locked():
+            raise UserError("Подождите, идёт другая операция.")
         self.send(chat, f"⏳ Выключаю {len(items)} лот(ов)…", mid=mid)
-        done, failed = 0, []
-        for item in items:
-            ok, why = self.plugin.deactivate(item["id"])
-            if ok:
-                done += 1
-            else:
-                failed.append(f"{item['name'][:30]}: {why}")
-            time.sleep(0 if self.plugin.sync else random.uniform(1.0, 2.0))
-        self.on_home(chat, mid, page)
-        self.send(chat, f"🗑️ Выключено: <b>{done}</b>" + ("\n⚠️ Ошибки:\n" + "\n".join(esc(f) for f in failed[:10])
-                                                         if failed else ""), [[("📉 К списку", ("home", 0))]])
+
+        def run():
+            done, failed = 0, []
+            with self.plugin.busy:
+                for item in items:
+                    ok, why = self.plugin.deactivate(item["id"])
+                    if ok:
+                        done += 1
+                    else:
+                        failed.append(f"{item['name'][:30]}: {why}")
+                    time.sleep(0 if self.plugin.sync else random.uniform(1.0, 2.0))
+            self.on_home(chat, mid, page)
+            self.send(chat, f"🗑️ Выключено: <b>{done}</b>" + ("\n⚠️ Ошибки:\n" + "\n".join(esc(f) for f in failed[:10])
+                                                             if failed else ""), [[("📉 К списку", ("home", 0))]])
+
+        if self.plugin.sync:
+            run()
+        else:
+            threading.Thread(target=run, name="StaleLotsOff", daemon=True).start()
 
     def on_days(self, chat, mid):
         self.ask(chat, "⏳ Сколько дней без продаж считать «залежавшимся» лотом? (от 7 до 3650)", ("days",), mid)

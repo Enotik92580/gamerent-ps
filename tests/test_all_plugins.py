@@ -45,3 +45,17 @@ def test_plugin_contract(env, file_name):
 def test_plugin_without_telegram(env, file_name):
     mod, c = env(file_name, telegram=False)
     assert mod.PLUGIN is not None
+
+
+def test_input_goes_to_last_asking_plugin(env):
+    a, c = env("StockNotifier_LuckyFunpay.py")
+    b = __import__("fpc_fakes").load_plugin("SrasMonitor_LuckyFunpay.py", __import__("os").getcwd())
+    b.init(c)
+    tg = c.telegram
+    tg.message("/stock_notifier")
+    tg.click("Добавить лот")  # плагин A ждёт ID лота
+    tg.message("/sras")
+    tg.click("Интервал")  # плагин B ждёт интервал
+    tg.message("60")
+    assert b.PLUGIN.store["interval"] == 60
+    assert a.PLUGIN.store["lots"] == {}

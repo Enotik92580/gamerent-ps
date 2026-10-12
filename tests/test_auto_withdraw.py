@@ -99,3 +99,12 @@ def test_manual_and_funpay_error(env):
     tg.click("Меню")
     tg.click("История")
     assert "✅ 700" in tg.screen().text and "❌" in tg.screen().text
+
+
+def test_balance_fallback_for_old_cardinal(env):
+    mod, c, sent = setup(env)
+    lot = c.account.add_lot(301, "Публичный лот")
+    p = mod.PLUGIN
+    p.cardinal = type("OldCardinal", (), {"account": c.account})()
+    assert p.balance(force=True)["rub"] == 1500.0
+    assert ("get_balance", lot) in c.account.calls

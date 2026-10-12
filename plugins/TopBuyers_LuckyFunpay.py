@@ -173,12 +173,15 @@ class JsonStore:
             os.replace(tmp, self.path)
 
     def __getitem__(self, key):
+        """Возвращает копию значения: изменять данные можно только через set()/change()."""
         with self.lock:
-            return self.data[key]
+            value = self.data[key]
+            return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
 
     def get(self, key, default=None):
         with self.lock:
-            return self.data.get(key, default)
+            value = self.data.get(key, default)
+            return copy.deepcopy(value) if isinstance(value, (dict, list)) else value
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -233,8 +236,24 @@ class Panel:
         self.tokens: dict = {}
         self.pending: dict = {}
         self.lock = threading.RLock()
-        self.message = None
-        self.call = None
+        self._local = threading.local()
+
+    # текущие сообщение и нажатие — свои у каждого потока telebot
+    @property
+    def message(self):
+        return getattr(self._local, "message", None)
+
+    @message.setter
+    def message(self, value):
+        self._local.message = value
+
+    @property
+    def call(self):
+        return getattr(self._local, "call", None)
+
+    @call.setter
+    def call(self, value):
+        self._local.call = value
 
     # --- доступ
     def admins(self) -> list[int]:
@@ -260,6 +279,9 @@ class Panel:
             if len(self.tokens) > 4000:
                 border = time.time() - 6 * 3600
                 self.tokens = {k: v for k, v in self.tokens.items() if v[0] > border}
+                if len(self.tokens) > 20000:
+                    newest = sorted(self.tokens.items(), key=lambda kv: kv[1][0])[-10000:]
+                    self.tokens = dict(newest)
             for row in rows:
                 buttons = []
                 for label, action in row:
@@ -327,6 +349,18 @@ class Panel:
         with self.lock:
             self.pending[chat] = {"t": time.time(), "action": tuple(action), "prompt": prompt, "doc": doc,
                                   "mid": getattr(msg, "message_id", mid)}
+        self.input_owners()[chat] = UUID
+
+    def input_owners(self) -> dict:
+        """Общий для всех плагинов LuckyFunpay реестр: какой плагин сейчас ждёт ввод в чате."""
+        owners = getattr(self.cardinal, "_lucky_input_owner", None)
+        if owners is None:
+            owners = {}
+            try:
+                setattr(self.cardinal, "_lucky_input_owner", owners)
+            except Exception:
+                pass
+        return owners
 
     def pending_for(self, message, doc=False):
         if not self.allowed(getattr(message, "from_user", None), getattr(message, "chat", None)):
@@ -334,6 +368,8 @@ class Panel:
         with self.lock:
             item = self.pending.get(message.chat.id)
         if not item or time.time() - item["t"] > 900:
+            return None
+        if self.input_owners().get(message.chat.id, UUID) != UUID:
             return None
         if doc != item["doc"]:
             return None
@@ -551,29 +587,38 @@ class TopBuyers:
         return float(data["rates"].get(code, 0) or 0)
 
     def add(self, order) -> bool:
-        oid = str(order.id)
-        if oid in self.counted:
-            return False
-        code = cur_code(order.currency)
-        try:
-            price = float(order.price)
-        except (TypeError, ValueError):
-            return False
-        value = price * self.rate(code)
-        buyer_id = str(getattr(order, "buyer_id", "") or getattr(order, "buyer_username", ""))
-        name = getattr(order, "buyer_username", "") or buyer_id
+        return self.add_many([order]) > 0
+
+    def add_many(self, orders) -> int:
+        """Учитывает закрытые заказы (один раз каждый) и сохраняет базу одной записью."""
+        rows = []
+        for order in orders:
+            oid = str(order.id)
+            if oid in self.counted:
+                continue
+            try:
+                price = float(order.price)
+            except (TypeError, ValueError):
+                continue
+            code = cur_code(order.currency)
+            buyer_id = str(getattr(order, "buyer_id", "") or getattr(order, "buyer_username", ""))
+            rows.append((oid, buyer_id, getattr(order, "buyer_username", "") or buyer_id, code, price,
+                         price * self.rate(code)))
+            self.counted.add(oid)
+        if not rows:
+            return 0
 
         def save(d):
-            b = d["buyers"].setdefault(buyer_id, {"name": name, "rub": 0.0, "orders": 0, "cur": {}})
-            b["name"] = name
-            b["rub"] = round(b["rub"] + value, 2)
-            b["orders"] += 1
-            b["cur"][code] = round(b["cur"].get(code, 0) + price, 2)
-            d["counted"].append(oid)
+            for oid, buyer_id, name, code, price, value in rows:
+                b = d["buyers"].setdefault(buyer_id, {"name": name, "rub": 0.0, "orders": 0, "cur": {}})
+                b["name"] = name
+                b["rub"] = round(b["rub"] + value, 2)
+                b["orders"] += 1
+                b["cur"][code] = round(b["cur"].get(code, 0) + price, 2)
+                d["counted"].append(oid)
 
-        self.counted.add(oid)
         self.store.change(save)
-        return True
+        return len(rows)
 
     def scan(self, full=True) -> int:
         if not self.scanning.acquire(blocking=False):
@@ -594,10 +639,7 @@ class TopBuyers:
                     break
                 start, orders = result[0], result[1]
                 pages += 1
-                new = 0
-                for order in orders:
-                    if enum_name(order.status) == "CLOSED" and self.add(order):
-                        new += 1
+                new = self.add_many([o for o in orders if enum_name(o.status) == "CLOSED"])
                 added += new
                 if not start or (not full and orders and new == 0):
                     break

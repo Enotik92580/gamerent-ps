@@ -333,7 +333,12 @@ class FakeAccount:
         return 14400
 
     def get_balance(self, lot_id=None):
+        self.calls.append(("get_balance", lot_id))
         return getattr(self, "balance", fpt.Balance(0, 0, 0, 0, 0, 0))
+
+    def get_subcategory_public_lots(self, subcategory_type, subcategory_id, locale=None):
+        return [self._shortcut(i, fpt.LotShortcut) for i, f in self.lots.items()
+                if int(f["node_id"]) == subcategory_id and f.get("active") == "on"]
 
     def method(self, request_method, api_method, headers, payload, exclude_phpsessid=False,
                raise_not_200=False, locale=None):
@@ -684,6 +689,9 @@ class FakeCardinal:
     def get_exchange_rate(self, base_currency, target_currency, min_interval=60):
         rates = {"usd": 90.0, "eur": 100.0, "rub": 1.0}
         return rates[base_currency.code] / rates[target_currency.code]
+
+    def get_balance(self, attempts=3):
+        return self.account.get_balance(1)
 
     def run_handlers(self, handlers, args):
         for h in handlers:
