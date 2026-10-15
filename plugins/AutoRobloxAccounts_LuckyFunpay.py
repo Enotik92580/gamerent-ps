@@ -112,9 +112,10 @@ def esc(value):
 
 
 def tag(value):
-    raw = str(value).strip().upper()
+    # Sellers often paste the whole lot tag (roblox:PREMIUM); keep only the part after the prefix.
+    raw = re.sub(r"^(?:roblox)\s*:\s*", "", str(value).strip(), flags=re.I).strip().upper()
     if not re.fullmatch(r"[A-Z0-9_-]{1,25}", raw):
-        raise RobloxError("Тег: 1–25 латинских букв, цифр, _ или -, без пробелов.")
+        raise RobloxError("Тег: 1–25 латинских букв, цифр, _ или -, без пробелов. Пример: PREMIUM или roblox:PREMIUM.")
     return raw
 
 
@@ -1210,7 +1211,7 @@ class TelegramUI:
             'token': 'Пришлите API-токен LZT с правом market. Сообщение с токеном будет удалено, если Telegram разрешит.',
             'proxy': 'Пришлите HTTP/HTTPS IPv4-прокси: http://логин:пароль@IP:PORT. Символ - очищает прокси.',
             'balance_threshold': 'Введите положительный порог низкого баланса в рублях.',
-            'new_tag': 'Введите новый тег: латиница, цифры, _ и -, до 25 символов.',
+            'new_tag': 'Введите тег профиля: латиница, цифры, _ и -, до 25 символов. Например PREMIUM — можно прислать и целиком roblox:PREMIUM.',
             'new_name': 'Введите название нового профиля (до 80 символов).',
             'name': 'Введите новое название профиля (до 80 символов).',
             'url': 'Пришлите ссылку поиска HTTPS с lzt.market из раздела /roblox/ или подраздела. Фильтры сохранятся.',
