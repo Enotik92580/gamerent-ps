@@ -374,10 +374,33 @@ class Market:
         return self.request('POST', '/'+str(item_id)+'/fast-buy', body=body)
 
 
+# Listing states in which nobody has bought the account yet. A purchased item is "paid" on LZT
+# (the API has no "sold" state), so ownership is decided by the buyer block, not by one state name.
+LISTING_STATES = {'active', 'stickied', 'awaiting', 'pre_active', 'pre_upload'}
+
+
+def truthy(value):
+    return value is True or str(value).strip().casefold() in {'1', 'true', 'yes'}
+
+
 def owned(item, user_id):
     buyer = item.get('buyer') or {}
-    return (buyer.get('visitorIsBuyer') is True and str(buyer.get('user_id')) == str(user_id)
-            and item.get('item_state') == 'sold')
+    if not isinstance(buyer, dict): return False
+    return (truthy(buyer.get('visitorIsBuyer')) and str(buyer.get('user_id')) == str(user_id)
+            and str(item.get('item_state', '')).casefold() not in LISTING_STATES)
+
+
+def not_purchased(item, order):
+    """Why the reserved listing is certainly not ours, or None while that is still unclear."""
+    buyer = item.get('buyer')
+    state = str(item.get('item_state', '')).casefold()
+    if (isinstance(buyer, dict) and buyer.get('user_id') not in (None, '', 0)
+            and not owned(item, order.get('market_user')) and state not in LISTING_STATES):
+        return 'его купил другой покупатель'
+    # Still on sale with no buyer long after our request: the purchase did not happen.
+    if state in LISTING_STATES and not buyer and time.time()-order.get('buy_started', time.time()) > 600:
+        return 'он по-прежнему выставлен на продажу, покупка не прошла'
+    return None
 
 
 def supercell_item(item):
@@ -692,6 +715,7 @@ class Shop:
         return 'stop'
 
     def reconcile(self, order):
+        item = None
         try:
             item = self.market.item(order['item_id'])
             if owned(item, order['market_user']):
@@ -699,12 +723,34 @@ class Shop:
                 return
         except SupercellError:
             pass
+        reason = not_purchased(item, order) if isinstance(item, dict) else None
+        if reason:
+            # The money was not spent on this listing: skip it and continue with the next account.
+            self.store.reject(order['item_id'], order['id'])
+            self.notify(f"ℹ️ {NAME} #{esc(order['id'])}: аккаунт {esc(order['item_id'])} не куплен — {reason}. "
+                        "Ищу другой подходящий аккаунт.")
+            for key in ('item_id', 'candidate', 'uncertain_notified', 'uncertain_escalated'):
+                order.pop(key, None)
+            order['state'] = 'searching'
+            order['check_after'] = 0
+            self.store.save(order)
+            self.wake.set()
+            return
         order['state'] = 'uncertain'
         order['check_after'] = time.time()+60
         self.store.save(order)
         if not order.get('uncertain_notified'):
             order['uncertain_notified'] = True
-            self.hold(order, 'Результат покупки неизвестен. Автоматическая сверка продолжается.', uncertain=True)
+            self.hold(order, 'Результат покупки неизвестен. Автоматическая сверка продолжается: обычно это решается само за 1–2 минуты.', uncertain=True)
+        elif not order.get('uncertain_escalated') and time.time()-order.get('buy_started', time.time()) > 900:
+            order['uncertain_escalated'] = True
+            self.store.save(order)
+            self.notify(f"⏰ {NAME} #{esc(order['id'])}: покупка не подтверждается уже 15 минут.\n\n"
+                        f"1. Откройте https://lzt.market/{order['item_id']}/\n"
+                        "2. Если аккаунт куплен вами — передайте данные покупателю вручную, "
+                        f"затем /sc_panel → 📦 Заказы → #{esc(order['id'])} → «📝 Завершить вручную».\n"
+                        "3. Если покупки нет и деньги не списаны — сделайте возврат на FunPay и тоже нажмите «📝 Завершить вручную».\n\n"
+                        "Пока вы не нажмёте кнопку, плагин продолжит проверку раз в минуту и не купит второй аккаунт.")
 
     def accept_purchase(self, order, item):
         if not supercell_item(item):
