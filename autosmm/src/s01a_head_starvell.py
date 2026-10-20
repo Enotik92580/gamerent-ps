@@ -71,7 +71,7 @@ class InlineKeyboardMarkup:
         return self
 
 NAME = "AutoSMM"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Автоматическая продажа SMM-услуг на Starvell: заказы через SMM-панели, автоцена, рефилл"
 AUTHOR = "@LuckyFunPay_Support"
 CREDITS = "@LuckyFunPay_Support"

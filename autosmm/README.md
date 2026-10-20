@@ -3,9 +3,14 @@
 | Файл | Для чего | Версия |
 |---|---|---|
 | `AutoSMM_LuckyFunpay.py` | FunPay Cardinal (папка `plugins`) | 23.2.0 |
-| `AutoSMM_Starvell.py` | Starvell Cardinal на aiogram 3 — сборки Hackep1551 и etheriumflipper (папка `plugins`) | 1.0.1 |
+| `AutoSMM_Starvell.py` | Starvell Cardinal на aiogram 3 — сборки Hackep1551 и etheriumflipper (папка `plugins`) | 1.0.2 |
 
 Оба файла собираются из общих исходников: `python3 src/build.py` (части `p*` — общие и FunPay, `s*` — Starvell).
+
+## AutoSMM для Starvell 1.0.2
+
+- В карточке плагина (Плагины → AutoSMM) появилась кнопка «⚙️ Настройки AutoSMM».
+- Команда `/auto_smm_settings` добавляется в список команд бота и видна в подсказках Telegram.
 
 ## AutoSMM для Starvell 1.0.1
 

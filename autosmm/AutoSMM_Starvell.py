@@ -71,7 +71,7 @@ class InlineKeyboardMarkup:
         return self
 
 NAME = "AutoSMM"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Автоматическая продажа SMM-услуг на Starvell: заказы через SMM-панели, автоцена, рефилл"
 AUTHOR = "@LuckyFunPay_Support"
 CREDITS = "@LuckyFunPay_Support"
@@ -7745,11 +7745,56 @@ def _retry_bootstrap() -> None:
             continue
 
 
+def _install_plugin_card_button() -> bool:
+    """Карточка плагина в Starvell Cardinal не умеет кнопку настроек — добавляем свою только для AutoSMM."""
+    try:
+        import importlib
+        cp = importlib.import_module('bot.plugins.cp')
+    except Exception:
+        return False
+    original = getattr(cp, 'edit_plugin', None)
+    if not callable(original):
+        return False
+    if getattr(original, '_autosmm', False):
+        return True
+
+    def edit_plugin(plugin_data: Any, CBT: Any, uuid: str, offset: int, ask_delete: bool = False, *args: Any, **kwargs: Any) -> Any:
+        keyboard = original(plugin_data, CBT, uuid, offset, ask_delete, *args, **kwargs)
+        if str(uuid) != UUID or ask_delete:
+            return keyboard
+        try:
+            from aiogram.types import InlineKeyboardButton as AioButton, InlineKeyboardMarkup as AioMarkup
+            rows = [[AioButton(text='⚙️ Настройки AutoSMM', callback_data='autosmm:home')]] + list(keyboard.inline_keyboard)
+            return AioMarkup(inline_keyboard=rows)
+        except Exception:
+            return keyboard
+
+    edit_plugin._autosmm = True
+    cp.edit_plugin = edit_plugin
+    return True
+
+
+async def _add_bot_commands(aio_bot: Any) -> None:
+    """Ядро задаёт свой список команд — дописываем в него команду AutoSMM, чтобы она была в подсказках."""
+    if aio_bot is None:
+        return
+    try:
+        from aiogram.types import BotCommand
+        current = list(await aio_bot.get_my_commands())
+        if not any(getattr(c, 'command', '') == 'auto_smm_settings' for c in current):
+            await aio_bot.set_my_commands(current + [BotCommand(command='auto_smm_settings', description='🚀 AutoSMM: настройки')])
+    except Exception as exc:
+        logger.warning('[AutoSMM] Cannot add bot command: %s', type(exc).__name__)
+
+
 async def on_init(aio_bot: Any = None, starvell: Any = None, db: Any = None, plugin_manager: Any = None, *args: Any, **kwargs: Any) -> None:
     """BIND_TO_INIT: ядро и сервис Starvell готовы."""
     logger.info('[AutoSMM] Initialising plugin %s for Starvell Cardinal', VERSION)
     _SV['loop'], _SV['loop_thread'] = asyncio.get_running_loop(), threading.get_ident()
     _attach(starvell, aio_bot)
+    if _install_plugin_card_button():
+        logger.info('[AutoSMM] Settings button added to the plugin card')
+    await _add_bot_commands(aio_bot)
     await asyncio.to_thread(_bootstrap)
 
 
