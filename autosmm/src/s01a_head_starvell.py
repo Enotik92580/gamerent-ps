@@ -30,7 +30,10 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, quote, quote_plus, urljoin, urlparse, urlunparse
 
-import requests
+try:
+    import requests
+except ImportError:  # Starvell Cardinal ставит только aiohttp — ниже подключается обёртка над ним
+    requests = None
 
 BeautifulSoup = None
 LotFields = None
@@ -68,7 +71,7 @@ class InlineKeyboardMarkup:
         return self
 
 NAME = "AutoSMM"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Автоматическая продажа SMM-услуг на Starvell: заказы через SMM-панели, автоцена, рефилл"
 AUTHOR = "@LuckyFunPay_Support"
 CREDITS = "@LuckyFunPay_Support"

@@ -154,7 +154,15 @@ class _StarvellAccount:
     is_initiated = True
     csrf_token = None
     currency = 'RUB'
-    proxy = None
+
+    @property
+    def proxy(self) -> Optional[Dict[str, str]]:
+        """Прокси из настроек Starvell Cardinal — режим «прокси бота» в AutoSMM."""
+        try:
+            url = getattr(getattr(getattr(_service(), 'api', None), 'config', None), 'proxy_url', None)
+        except RuntimeError:
+            url = None
+        return {'http': url, 'https': url} if url else None
 
     @property
     def id(self) -> Any:

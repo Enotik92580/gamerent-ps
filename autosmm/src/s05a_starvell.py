@@ -24,6 +24,115 @@ def _run(coro: Any, timeout: float = 90) -> Any:
     return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
 
 
+# ---------------------------------------------------------------------------
+# HTTP без requests: обёртка над aiohttp (его ставит сам Starvell Cardinal)
+# ---------------------------------------------------------------------------
+
+class _HttpExceptions:
+    class RequestException(IOError):
+        pass
+
+    class Timeout(RequestException):
+        pass
+
+    class ConnectionError(RequestException):
+        pass
+
+    class SSLError(ConnectionError):
+        pass
+
+    class ProxyError(ConnectionError):
+        pass
+
+    class InvalidURL(RequestException):
+        pass
+
+    class InvalidSchema(RequestException):
+        pass
+
+    class MissingSchema(RequestException):
+        pass
+
+
+class _HttpResponse:
+    def __init__(self, status: int, headers: Any, body: bytes, charset: Optional[str]):
+        self.status_code = status
+        self.headers = headers
+        self.content = body
+        self.text = body.decode(charset or 'utf-8', 'replace')
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+    def close(self) -> None:
+        pass
+
+
+class _AioRequests:
+    """Синхронный интерфейс requests поверх aiohttp: запрос выполняется в цикле событий бота."""
+    exceptions = _HttpExceptions
+    RequestException = _HttpExceptions.RequestException
+    Timeout = _HttpExceptions.Timeout
+
+    def get(self, url: str, params: Any = None, **kwargs: Any) -> _HttpResponse:
+        return self._call('GET', url, params=params, **kwargs)
+
+    def post(self, url: str, data: Any = None, **kwargs: Any) -> _HttpResponse:
+        return self._call('POST', url, data=data, **kwargs)
+
+    def _call(self, method: str, url: str, params: Any = None, data: Any = None, headers: Optional[Dict[str, str]] = None,
+              timeout: Any = 30, proxies: Optional[Dict[str, str]] = None, allow_redirects: bool = True) -> _HttpResponse:
+        connect, read = timeout if isinstance(timeout, (tuple, list)) else (timeout, timeout)
+        proxy = (proxies or {}).get('https') or (proxies or {}).get('http')
+        return _run(self._request(method, url, params, data, headers, float(connect), float(read), proxy, allow_redirects),
+                    timeout=float(connect) + float(read) + 15)
+
+    async def _request(self, method: str, url: str, params: Any, data: Any, headers: Any, connect: float, read: float,
+                       proxy: Optional[str], allow_redirects: bool) -> _HttpResponse:
+        import aiohttp
+        from multidict import CIMultiDict
+        errors = _HttpExceptions
+        if not re.match(r'https?://', str(url), re.I):
+            raise errors.MissingSchema(f'Нет схемы в адресе: {url}')
+        connector, proxy_url = None, None
+        if proxy:
+            if proxy.lower().startswith('socks'):
+                try:
+                    from aiohttp_socks import ProxyConnector
+                except ImportError:
+                    raise errors.InvalidSchema('Для SOCKS-прокси нужен пакет aiohttp_socks.') from None
+                connector = ProxyConnector.from_url(proxy)
+            else:
+                proxy_url = proxy
+        timeout = aiohttp.ClientTimeout(total=connect + read, sock_connect=connect, sock_read=read)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.request(method, url, params=params, data=data, headers=headers, proxy=proxy_url,
+                                           allow_redirects=allow_redirects) as response:
+                    body = await response.read()
+                    return _HttpResponse(response.status, CIMultiDict(response.headers), body, response.charset)
+        except asyncio.TimeoutError:
+            raise errors.Timeout('Таймаут запроса.') from None
+        except (aiohttp.ClientProxyConnectionError, aiohttp.ClientHttpProxyError):
+            raise errors.ProxyError('Ошибка прокси.') from None
+        except aiohttp.ClientSSLError:
+            raise errors.SSLError('Ошибка SSL.') from None
+        except aiohttp.InvalidURL:
+            raise errors.InvalidURL('Неверный адрес.') from None
+        except aiohttp.ClientError as exc:
+            if 'proxy' in type(exc).__name__.lower():
+                raise errors.ProxyError('Ошибка прокси.') from None
+            raise errors.ConnectionError(type(exc).__name__) from None
+        except Exception as exc:
+            if 'proxy' in type(exc).__name__.lower():  # ошибки aiohttp_socks
+                raise errors.ProxyError(str(exc)) from None
+            raise
+
+
+if requests is None:
+    requests = _AioRequests()
+
+
 def _service() -> Any:
     service = _SV.get('service')
     if service is None:

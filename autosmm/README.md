@@ -3,9 +3,15 @@
 | Файл | Для чего | Версия |
 |---|---|---|
 | `AutoSMM_LuckyFunpay.py` | FunPay Cardinal (папка `plugins`) | 23.2.0 |
-| `AutoSMM_Starvell.py` | Starvell Cardinal на aiogram 3 — сборки Hackep1551 и etheriumflipper (папка `plugins`) | 1.0.0 |
+| `AutoSMM_Starvell.py` | Starvell Cardinal на aiogram 3 — сборки Hackep1551 и etheriumflipper (папка `plugins`) | 1.0.1 |
 
 Оба файла собираются из общих исходников: `python3 src/build.py` (части `p*` — общие и FunPay, `s*` — Starvell).
+
+## AutoSMM для Starvell 1.0.1
+
+- Исправлено: «No module named 'requests'» при загрузке. Starvell Cardinal ставит только aiohttp —
+  без requests плагин работает через встроенную обёртку над aiohttp (прокси HTTP и SOCKS через aiohttp_socks).
+- Режим прокси «прокси бота» берёт прокси из настроек Starvell Cardinal.
 
 ## AutoSMM для Starvell 1.0.0
 
