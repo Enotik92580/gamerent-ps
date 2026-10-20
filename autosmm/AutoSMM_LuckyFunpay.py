@@ -36,13 +36,24 @@ except ImportError:  # pragma: no cover - зависит от окружения
     BeautifulSoup = None
 
 NAME = "AutoSMM"
-VERSION = "23.1.1"
+VERSION = "23.2.0"
 DESCRIPTION = "Автоматическая продажа SMM-услуг: автовыгрузка, ручные лоты, автоцена, рефилл"
 CREDITS = "@LuckyFunPay_Support"
 AUTHOR_URL = "https://t.me/LuckyFunPay_Support"
 CHANNEL_URL = "https://t.me/LuckyFunPay"
 UUID = "c800e7e9-05ce-43eb-addc-4f5841f79726"
 SETTINGS_PAGE = False
+
+# Возможности площадки: общий код меню и заказов один для FunPay и Starvell.
+PLATFORM = 'funpay'
+MARKET = 'FunPay'
+CAN_CREATE_LOTS = True      # создание, автовыгрузка и переоформление лотов
+CAN_DELETE_LOTS = True
+HAS_LOT_TAGS = True         # заказ определяется по тегу #SMM в описании
+ORDER_URL = 'https://funpay.com/orders/{}/'
+LOT_URL = 'https://funpay.com/lots/offer?id={}'
+LOT_ID_HINT = 'число из ссылки редактирования лота (<code>offerEdit?…offer=ЧИСЛО</code>)'
+MAX_MESSAGE_LEN = 2000
 
 ROOT = os.path.join("storage", "cache")
 CONFIG_PATH = os.path.join(ROOT, "auto_lots.json")
@@ -2451,7 +2462,7 @@ def _send(c: Any, chat_id: Any, text: str) -> bool:
 
 
 def _order_url(funpay_id: Any) -> str:
-    return f'https://funpay.com/orders/{funpay_id}/'
+    return ORDER_URL.format(funpay_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2585,6 +2596,12 @@ def _find_lot(order: Any, c: Any) -> Tuple[Optional[str], str]:
     lots = load_config()['lot_mapping']
     if not lots:
         return None, ''
+    lot_id = _int(getattr(order, 'lot_id', 0))
+    if lot_id:
+        # Площадка сообщила ID лота (Starvell) — это точное совпадение.
+        exact = next((k for k, v in lots.items() if v.get('funpay_lot_id') and _int(v['funpay_lot_id']) == lot_id), None)
+        if exact:
+            return exact, ''
     key, count = _match_by_name(order, lots)
     if key and count == 1:
         return key, ''
@@ -2758,6 +2775,12 @@ def _is_paused(cfg: Dict[str, Any], buyer_id: Any, username: Any) -> bool:
 
 
 def _is_blacklisted(c: Any, username: Any) -> bool:
+    check = getattr(c, 'is_blacklisted', None)
+    if callable(check):
+        try:
+            return bool(check(username))
+        except Exception:
+            return False
     names = getattr(c, 'blacklist', None) or []
     return bool(username) and str(username).lower() in {str(x).lower() for x in names}
 
@@ -4198,7 +4221,7 @@ def scr_home() -> Tuple[str, InlineKeyboardMarkup]:
     kb = _kb([B('⏸ Остановить' if RUNNING else '▶️ Запустить', 'run'),
               B('✅ Вернуть в продажу' if sales_off else '🛑 Снять с продажи', 'sales')],
              [B('🛍 Лоты', 'lots'), B('➕ Новый лот', 'new')],
-             [B('📦 Автовыгрузка', 'auto'), B('🎨 Оформление', 'ds')],
+             [B('📦 Автовыгрузка', 'auto') if CAN_CREATE_LOTS else B('📋 Текст для лота', 'ntx'), B('🎨 Оформление', 'ds')],
              [B('🔌 Панели', 'panels'), B('💰 Цены', 'pr')],
              [B('💬 Сообщения', 'msg'), B('♻️ Рефилл', 'rf')],
              [B('⚙️ Настройки', 'st'), B('🌐 Домены', 'dm')],
@@ -4430,8 +4453,8 @@ def r_lots(q: Any) -> None:
             + (f'\n🏷 Тег ещё не записан: {no_tag} (допишется в фоне)' if no_tag else ''))
     kb = _kb([B('🔍 Поиск лота', 'lsearch'), B('📋 Все лоты', 'll:all:0')],
              [B('🤖 Автовыгрузка', 'll:auto:0'), B('✋ Ручные', 'll:man:0')],
-             [B('❗ Без FunPay ID', 'll:nofp:0'), B('📦 Выгрузки', 'bts')],
-             [B('🎨 Переоформить лоты', 'dsr'), B('♻️ Рефилл: массово', 'rfb')],
+             [B('❗ Без FunPay ID', 'll:nofp:0'), B('📦 Выгрузки', 'bts') if CAN_CREATE_LOTS else B('📋 Текст для лота', 'ntx')],
+             [B('🎨 Переоформить лоты', 'dsr') if CAN_CREATE_LOTS else None, B('♻️ Рефилл: массово', 'rfb')],
              [B('📦 Кол-во за 1 шт. всем лотам', 'lqall')],
              [B('◀️ Назад', 'home')])
     _edit(q, text, kb)
@@ -4494,9 +4517,10 @@ def scr_lot(key: str) -> Tuple[str, InlineKeyboardMarkup]:
     text = (f'🛍 <b>{escape(lot["name"])}</b>\n<code>{key}</code> · {source}\n━━━━━━━━━━━━━━━━\n'
             f'🔌 Панель: {escape(panel["name"]) if panel else "❌ удалена (#" + escape(lot["panel_id"]) + ")"}\n'
             f'🆔 Услуга: <code>{escape(lot["service_id"])}</code> · 📦 За 1 шт.: <b>{lot["quantity"]}</b>\n'
-            f'🏷 FunPay ID: ' + (f'<a href="https://funpay.com/lots/offer?id={lot["funpay_lot_id"]}">{lot["funpay_lot_id"]}</a>'
+            f'🏷 FunPay ID: ' + (f'<a href="{LOT_URL.format(lot["funpay_lot_id"])}">{lot["funpay_lot_id"]}</a>'
                                if lot['funpay_lot_id'] else '❗️ не привязан (цена меняться не будет)') + '\n'
-            f'🔖 Тег: <code>#SMM:{lot["tag"]}</code> — {"✅ записан на FunPay" if lot["tag_written"] else "⚠️ не записан"}\n'
+            + (f'🔖 Тег: <code>#SMM:{lot["tag"]}</code> — {"✅ записан на FunPay" if lot["tag_written"] else "⚠️ не записан"}\n'
+               if HAS_LOT_TAGS else '') +
             f'🧭 Тип: {platform["emoji"]} {escape(platform["name"])} · {kind["emoji"]} {escape(kind["ru"].lower())}\n'
             f'🌐 Домены: {escape(", ".join(lot["domains"]) or "общий список")}\n'
             f'🔢 Опрос: {"ВКЛ" if lot["poll"] else "ВЫКЛ"} · 💰 Автоцена: {"ВКЛ" if lot["autoprice"] else "ВЫКЛ"}\n'
@@ -4509,12 +4533,12 @@ def scr_lot(key: str) -> Tuple[str, InlineKeyboardMarkup]:
     mm = {'global': '🌍 глоб.', 'fixed': '💵 фикс', 'percent': '➗ %'}[lot['markup_mode']]
     kb = _kb([B('✏️ Название', f'le:name:{key}'), B('🆔 ID услуги', f'le:svc:{key}')],
              [B('📦 Количество', f'le:qty:{key}'), B('🔌 Панель', f'lpanel:{key}')],
-             [B('🔗 FunPay ID', f'le:fpid:{key}'), B('🏷 Записать тег', f'ltag:{key}')],
+             [B('🔗 FunPay ID', f'le:fpid:{key}'), B('🏷 Записать тег', f'ltag:{key}') if HAS_LOT_TAGS else B('📋 Текст для лота', f'ltx:{key}')],
              [B('🌐 Домены', f'le:dom:{key}'), B(f'🔢 Опрос: {"ВКЛ" if lot["poll"] else "ВЫКЛ"}', f'lt:poll:{key}')],
              [B(f'💰 Автоцена: {"ВКЛ" if lot["autoprice"] else "ВЫКЛ"}', f'lt:ap:{key}'), B(f'📈 Наценка: {mm}', f'lt:mm:{key}')],
              [B('✏️ Значение наценки', f'le:mval:{key}'), B('💱 Рассчитать цену', f'lcalc:{key}')],
              [B('💵 Цена на FunPay', f'le:price:{key}'), B(f'♻️ Рефилл: {"ВКЛ" if refill["enabled"] else "ВЫКЛ"}', f'lref:{key}')],
-             [B('🎨 Оформление', f'ldes:{key}'), B('📦 Остаток', f'le:stock:{key}')],
+             [B('🎨 Оформление', f'ldes:{key}') if CAN_CREATE_LOTS else None, B('📦 Остаток', f'le:stock:{key}')],
              [B('🟢 Вкл. на FunPay', f'lact:{key}:1'), B('🔴 Выкл. на FunPay', f'lact:{key}:0')],
              [B('❌ Удалить', f'ldel:{key}'), B('◀️ К списку', 'll:all:0')])
     return text, kb
@@ -4529,7 +4553,7 @@ LOT_EDIT_PROMPTS = {
     'name': ('✏️ Введите название лота <b>как на FunPay</b> (по нему бот узнаёт заказ, если нет тега):', 'name'),
     'svc': ('🆔 Введите ID услуги в панели (число из раздела Services):', 'svc'),
     'qty': ('📦 Сколько единиц услуги заказывать за 1 шт. лота на FunPay?', 'qty'),
-    'fpid': ('🔗 Введите ID лота FunPay (число из ссылки offer=…). Бот проверит лот и запишет тег:', 'fpid'),
+    'fpid': (f'🔗 Введите ID лота FunPay — {LOT_ID_HINT}. Бот проверит, что лот существует:', 'fpid'),
     'dom': ('🌐 Введите домены через запятую (например <code>t.me, telegram.me</code>), <code>auto</code> — по типу услуги, '
             '<code>*</code> — любые, <code>-</code> — общий список:', 'dom'),
     'mval': ('✏️ Введите значение наценки лота (процент или рубли — зависит от режима):', 'mval'),
@@ -4817,7 +4841,7 @@ def r_lot_delete(q: Any, key: str) -> None:
         _answer(q, 'Лот уже удалён.', True)
         return
     rows = [[B('🗑 Только из плагина', f'ldd:{key}:0')]]
-    if lot.get('funpay_lot_id'):
+    if lot.get('funpay_lot_id') and CAN_DELETE_LOTS:
         rows.append([B('🔥 Из плагина и с FunPay', f'ldd:{key}:1')])
     rows.append([B('Отмена', 'lot:' + key)])
     _edit(q, f'❌ <b>Удалить лот?</b>\n\n{escape(lot["name"])}\n\nПосле удаления из плагина заказы по этому лоту '
@@ -4851,6 +4875,9 @@ def r_lot_delete_do(q: Any, key: str, remote: str) -> None:
 
 @route('ldes')
 def r_lot_design(q: Any, key: str) -> None:
+    if not CAN_CREATE_LOTS:
+        r_lot_text(q, key)
+        return
     cfg = load_config()
     lot = cfg['lot_mapping'].get(key)
     if not lot or not lot.get('funpay_lot_id'):
@@ -4864,6 +4891,9 @@ def r_lot_design(q: Any, key: str) -> None:
 
 @route('ldset')
 def r_lot_design_set(q: Any, key: str, token: str) -> None:
+    if not CAN_CREATE_LOTS:
+        _answer(q, 'На этой площадке тексты лотов меняются вручную — используйте «📋 Текст для лота».', True)
+        return
     choice = _token_choice(token)
     _answer(q, '⏳ Переоформляю лот…')
     with config_tx() as tx:
@@ -4873,6 +4903,47 @@ def r_lot_design_set(q: Any, key: str, token: str) -> None:
         done, errors = _restyle_lots([key], choice)
         _show(q.message.chat.id, '✅ Лот переоформлен.' if done else '❌ ' + escape('; '.join(errors) or 'Не удалось.'),
               _back_kb('lot:' + key, '◀️ К лоту'))
+    _submit(job)
+
+
+# ---------------------------------------------------------------------------
+# Готовый текст лота (для ручного создания или правки на площадке)
+# ---------------------------------------------------------------------------
+
+def _text_message(service: Dict[str, Any], quantity: int, price: float, choice: str, header: str) -> List[str]:
+    cfg = load_config()
+    limits = {'summary_ru': 100, 'summary_en': 100, 'desc_ru': 5000, 'desc_en': 5000}
+    texts = render_lot_texts(service, quantity, price, choice, limits, cfg, '')
+    ru = (f'{header}\n🎨 {escape(_template_name(cfg, texts["template"]))}\n\n<b>Название (RU):</b>\n<pre>{escape(texts["summary_ru"])}</pre>\n'
+          f'<b>Описание (RU):</b>\n<pre>{escape(texts["desc_ru"][:3200])}</pre>')
+    en = (f'<b>Title (EN):</b>\n<pre>{escape(texts["summary_en"])}</pre>\n'
+          f'<b>Description (EN):</b>\n<pre>{escape(texts["desc_en"][:3400])}</pre>')
+    return [ru, en]
+
+
+@route('ltx', 'ltxt')
+def r_lot_text(q: Any, key: str, token: str = '') -> None:
+    cfg = load_config()
+    lot = cfg['lot_mapping'].get(key)
+    if not lot:
+        _answer(q, 'Лот не найден.', True)
+        return
+    _answer(q, '⏳ Готовлю текст…')
+    choice = _token_choice(token) if token else (lot.get('template') or 'auto')
+
+    def job() -> None:
+        try:
+            service = PanelAPI(cfg, lot['panel_id']).service(lot['service_id'])
+        except PanelError as exc:
+            _show(q.message.chat.id, f'❌ {escape(str(exc))}', _back_kb('lot:' + key, '◀️ К лоту'))
+            return
+        price = _float(lot.get('last_price'))
+        parts = _text_message(service, lot['quantity'], price, choice,
+                              f'📋 <b>Текст для лота</b> — нажмите на блок, чтобы скопировать, и вставьте в редактор лота на {MARKET}.')
+        _show(q.message.chat.id, parts[0])
+        rows = _template_buttons(f'ltxt:{key}', cfg)
+        rows.append([B('◀️ К лоту', 'lot:' + key)])
+        _show(q.message.chat.id, parts[1], _kb(*rows))
     _submit(job)
 
 
@@ -4978,11 +5049,19 @@ def _search_services(panel_id: str, text: str) -> List[Dict[str, Any]]:
 
 @route('new')
 def r_new(q: Any) -> None:
+    if CAN_CREATE_LOTS:
+        _edit(q, '➕ <b>Новый лот</b>\n\n'
+                 '🔗 <b>Привязать</b> — у вас уже есть лот на FunPay: бот свяжет его с услугой панели и запишет тег.\n'
+                 '🛠 <b>Создать</b> — бот сам создаст красиво оформленный лот на FunPay из услуги панели.',
+              _kb([B('🔗 Привязать лот FunPay по ID', 'nb')], [B('🛠 Создать лот из услуги панели', 'nc')],
+                  [B('📋 Только текст для лота', 'ntx')], [B('◀️ Назад', 'home')]))
+        return
     _edit(q, '➕ <b>Новый лот</b>\n\n'
-             '🔗 <b>Привязать</b> — у вас уже есть лот на FunPay: бот свяжет его с услугой панели и запишет тег.\n'
-             '🛠 <b>Создать</b> — бот сам создаст красиво оформленный лот на FunPay из услуги панели.',
-          _kb([B('🔗 Привязать лот FunPay по ID', 'nb')], [B('🛠 Создать лот из услуги панели', 'nc')],
-              [B('◀️ Назад', 'home')]))
+             f'{MARKET} не даёт создавать лоты через API, поэтому так:\n'
+             '1️⃣ <b>📋 Текст для лота</b> — бот подготовит красивое название и описание под услугу панели.\n'
+             f'2️⃣ Создайте лот на {MARKET} вручную и вставьте этот текст.\n'
+             '3️⃣ <b>🔗 Привязать</b> — введите ID лота, и бот начнёт выполнять по нему заказы, менять цену и следить за балансом.',
+          _kb([B('📋 Текст для лота', 'ntx')], [B(f'🔗 Привязать лот {MARKET} по ID', 'nb')], [B('◀️ Назад', 'home')]))
 
 
 @route('nb')
@@ -4991,7 +5070,7 @@ def r_new_bind(q: Any) -> None:
         _answer(q, 'Сначала добавьте SMM-панель в разделе «🔌 Панели».', True)
         return
     _wizard(q.from_user.id, 'bind', reset=True)
-    _ask(q, 'bind_lot', '🔗 Введите ID лота FunPay — число из ссылки редактирования лота (<code>offerEdit?…offer=ЧИСЛО</code>):', back='new')
+    _ask(q, 'bind_lot', f'🔗 Введите ID лота FunPay — {LOT_ID_HINT}:', back='new')
 
 
 @inp('bind_lot')
@@ -5049,9 +5128,11 @@ def _service_pick(message: Any, text: str, mode: str) -> None:
     if len(found) == 1:
         _service_chosen(message.chat.id, message.from_user.id, mode, str(found[0]['service']))
         return
-    rows = [[B(f'{x.get("service")} · {_short(str(x.get("name")), 40)} · {x.get("rate")}', f'{"nbs" if mode == "bind" else "ncs"}:{x.get("service")}')]
+    prefix = {'bind': 'nbs', 'create': 'ncs', 'text': 'nts'}[mode]
+    again = {'bind': 'nbp', 'create': 'ncp', 'text': 'ntp'}[mode]
+    rows = [[B(f'{x.get("service")} · {_short(str(x.get("name")), 40)} · {x.get("rate")}', f'{prefix}:{x.get("service")}')]
             for x in found[:12]]
-    rows.append([B('🔍 Искать заново', 'nbp:' + wizard['panel'] if mode == 'bind' else 'ncp:' + wizard['panel'])])
+    rows.append([B('🔍 Искать заново', f'{again}:{wizard["panel"]}')])
     _show(message.chat.id, f'🔍 Найдено услуг: {len(found)}' + (' (первые 12)' if len(found) > 12 else '') + '. Выберите:', _kb(*rows))
 
 
@@ -5060,10 +5141,10 @@ def i_bind_service(message: Any, text: str, data: Dict[str, Any]) -> None:
     _service_pick(message, text, 'bind')
 
 
-@route('nbs', 'ncs')
+@route('nbs', 'ncs', 'nts')
 def r_service_chosen(q: Any, service_id: str) -> None:
     _answer(q)
-    mode = 'bind' if q.data.startswith('nbs') else 'create'
+    mode = {'nbs': 'bind', 'ncs': 'create', 'nts': 'text'}[q.data.split(':')[0]]
     _service_chosen(q.message.chat.id, q.from_user.id, mode, service_id)
 
 
@@ -5087,6 +5168,11 @@ def _service_chosen(chat_id: int, user_id: int, mode: str, service_id: str) -> N
     wizard['service_id'] = str(service['service'])
     profile = _service_profile(service)
     wizard['profile'] = profile
+    if mode == 'text':
+        sent = _show(chat_id, _service_card(service, wizard['panel']) + '\n\n📦 Сколько единиц услуги в 1 шт. лота? Обычно 1.',
+                     _kb(*_qty_rows('ntq', service), [B('❌ Отмена', 'x:new')]))
+        cardinal_instance.telegram.set_state(chat_id, getattr(sent, 'message_id', 0), user_id, 'autosmm:text_qty', {})
+        return
     if mode == 'create':
         cfg = load_config()
         node = cfg['design']['sections'].get(f'{profile["platform"]}:{profile["kind"]}') or cfg['design']['sections'].get(profile['platform'])
@@ -5154,6 +5240,9 @@ def _bind_finish(chat_id: int, user_id: int, quantity: int) -> None:
 
 @route('nc')
 def r_new_create(q: Any) -> None:
+    if not CAN_CREATE_LOTS:
+        _answer(q, f'{MARKET} не даёт создавать лоты через API. Используйте «📋 Текст для лота» и привязку.', True)
+        return
     if not load_config()['services']:
         _answer(q, 'Сначала добавьте SMM-панель в разделе «🔌 Панели».', True)
         return
@@ -5389,6 +5478,9 @@ def r_create_go(q: Any) -> None:
 
 @route('auto')
 def r_auto(q: Any) -> None:
+    if not CAN_CREATE_LOTS:
+        _answer(q, f'{MARKET} не даёт создавать лоты через API — автовыгрузка недоступна.', True)
+        return
     if not load_config()['services']:
         _answer(q, 'Сначала добавьте SMM-панель.', True)
         return
@@ -6022,6 +6114,81 @@ def r_auto_review_again(q: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Текст для лота из услуги панели (без создания лота)
+# ---------------------------------------------------------------------------
+
+@route('ntx')
+def r_text_start(q: Any) -> None:
+    if not load_config()['services']:
+        _answer(q, 'Сначала добавьте SMM-панель в разделе «🔌 Панели».', True)
+        return
+    _wizard(q.from_user.id, 'text', reset=True)
+    _edit(q, '📋 <b>Текст для лота</b>\n\nБот подготовит название и описание под услугу панели. Выберите панель:',
+          _kb(*_panel_rows('ntp', 'new')))
+
+
+@route('ntp')
+def r_text_panel(q: Any, panel_id: str) -> None:
+    _wizard(q.from_user.id, 'text')['panel'] = panel_id
+    _ask(q, 'text_service', '🆔 Введите ID услуги или часть названия для поиска:', back='new')
+
+
+@inp('text_service')
+def i_text_service(message: Any, text: str, data: Dict[str, Any]) -> None:
+    _service_pick(message, text, 'text')
+
+
+@inp('text_qty')
+def i_text_qty(message: Any, text: str, data: Dict[str, Any]) -> None:
+    if _int(text) <= 0:
+        raise ValueError('Введите число больше нуля.')
+    _clear(message)
+    _text_show(message.chat.id, message.from_user.id, _int(text), 'auto')
+
+
+@route('ntq')
+def r_text_qty(q: Any, value: str) -> None:
+    _answer(q)
+    try:
+        cardinal_instance.telegram.clear_state(q.message.chat.id, q.from_user.id, False)
+    except Exception:
+        pass
+    _text_show(q.message.chat.id, q.from_user.id, _int(value, 1), 'auto')
+
+
+@route('ntt')
+def r_text_theme(q: Any, token: str) -> None:
+    _answer(q)
+    wizard = _wizard(q.from_user.id, 'text')
+    _text_show(q.message.chat.id, q.from_user.id, _int(wizard.get('qty'), 1), _token_choice(token))
+
+
+def _text_show(chat_id: int, user_id: int, quantity: int, choice: str) -> None:
+    wizard = _wizard(user_id, 'text')
+    service = wizard.get('service')
+    if not service:
+        _show(chat_id, '⌛ Мастер устарел — начните заново.', _back_kb('new'))
+        return
+    wizard['qty'] = max(1, quantity)
+    cfg = load_config()
+    try:
+        cost, _, _ = _cost_rub(cfg, wizard['panel'], service, wizard['qty'])
+        mode, value = _effective_markup(cfg, None)
+        price = _price_from_cost(cost, mode, value)
+        price_line = f'\n💵 Рекомендуемая цена: <b>{_money(price)} ₽</b> за 1 шт. (себестоимость {_money(cost)} ₽, наценка {_markup_text(mode, value)})'
+    except PanelError as exc:
+        price, price_line = 0.0, f'\n⚠️ Цену посчитать не удалось: {escape(str(exc))}'
+    parts = _text_message(service, wizard['qty'], price, choice,
+                          f'📋 <b>Текст для лота</b> — нажмите на блок, чтобы скопировать, и вставьте в редактор лота на {MARKET}.'
+                          + price_line)
+    _show(chat_id, parts[0])
+    rows = _template_buttons('ntt', cfg)
+    rows.append([B('🔗 Лот создан — привязать по ID', 'nb')])
+    rows.append([B('◀️ Меню', 'home')])
+    _show(chat_id, parts[1], _kb(*rows))
+
+
+# ---------------------------------------------------------------------------
 # Панели и прокси
 # ---------------------------------------------------------------------------
 
@@ -6413,7 +6580,7 @@ def r_design(q: Any) -> None:
             'Порядок выбора оформления: шаблон лота → назначение «соцсеть + тип» → «соцсеть» → «тип» → тема по умолчанию.')
     kb = _kb([B('🎨 Тема по умолчанию', 'dsth'), B('👁 Предпросмотр', 'dsp')],
              [B('🧩 Свои шаблоны', 'dsc'), B('📌 Назначения', 'dsa')],
-             [B('🗺 Карта разделов FunPay', 'dsm'), B('🔄 Переоформить лоты', 'dsr')],
+             [B('🗺 Карта разделов FunPay', 'dsm'), B('🔄 Переоформить лоты', 'dsr')] if CAN_CREATE_LOTS else [B('📋 Текст для лота', 'ntx')],
              [B(f'🏷 Название: {"тип + вариант" if d.get("title_source") != "panel" else "как в панели"}', 'dstn')],
              [B(f'🇬🇧 EN: {"перевод" if d.get("english", True) else "транслит"}', 'dse'), B('◀️ Назад', 'home')])
     _edit(q, text, kb)
@@ -6771,8 +6938,8 @@ def r_message_edit(q: Any, key: str) -> None:
 
 @inp('message_edit')
 def i_message_edit(message: Any, text: str, data: Dict[str, Any]) -> None:
-    if len(text) > 2000:
-        raise ValueError('Слишком длинный текст: FunPay не примет сообщение длиннее ~2000 символов.')
+    if len(text) > MAX_MESSAGE_LEN:
+        raise ValueError(f'Слишком длинный текст: FunPay не примет сообщение длиннее {MAX_MESSAGE_LEN} символов.')
     if not text.strip():
         raise ValueError('Текст не может быть пустым.')
     with config_tx() as tx:
@@ -7018,9 +7185,31 @@ def r_paused(q: Any) -> None:
     cfg = load_config()
     rows = [[B(f'▶️ Возобновить {item.get("username") or ""} (ID {item.get("id") or "?"})', f'stpr:{index}')]
             for index, item in enumerate(cfg['paused_buyers'][:20])]
-    rows.append([B('🔙 Назад', 'st')])
+    rows.append([B('➕ Поставить на паузу', 'stpa'), B('🔙 Назад', 'st')])
     _edit(q, '⏸ <b>Покупатели на паузе</b>\n\n' + ('Нажмите, чтобы вернуть покупателя в автоматический режим.' if cfg['paused_buyers'] else
           'Список пуст. Чтобы поставить покупателя на паузу, напишите /stop в чате с ним на FunPay, вернуть — /start.'), _kb(*rows))
+
+
+@route('stpa')
+def r_paused_add(q: Any) -> None:
+    _ask(q, 'pause_add', '⏸ Введите ник покупателя или его числовой ID. Бот перестанет обрабатывать его сообщения и новые заказы, '
+                         'а заказы в работе переведёт в ручной режим.', back='stp')
+
+
+@inp('pause_add')
+def i_pause_add(message: Any, text: str, data: Dict[str, Any]) -> None:
+    value = text.strip().lstrip('@')
+    if not value:
+        raise ValueError('Введите ник или ID.')
+    buyer_id, username = (value, '') if value.isdigit() else ('', value)
+    known = [x for x in list(waiting.values()) + _orders()
+             if (buyer_id and str(x.get('buyer_id')) == buyer_id) or (username and str(x.get('buyer_username') or '').lower() == username.lower())]
+    if known:
+        buyer_id = buyer_id or str(known[-1].get('buyer_id') or '')
+        username = username or str(known[-1].get('buyer_username') or '')
+    _clear(message)
+    _pause_buyer(cardinal_instance, buyer_id, username, None)
+    _show(message.chat.id, f'⏸ Покупатель {escape(username or buyer_id)} на паузе.', _back_kb('stp', '◀️ К списку'))
 
 
 @route('stpr')

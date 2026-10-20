@@ -1,0 +1,315 @@
+# ---------------------------------------------------------------------------
+# Каталог соцсетей и типов услуг
+# ---------------------------------------------------------------------------
+
+PLATFORMS: Dict[str, Dict[str, Any]] = {
+    'telegram': {'name': 'Telegram', 'short': 'TELEGRAM', 'emoji': '✈️',
+                 'pattern': r'telegram|телеграм|\btg\b|\bтг\b|t\.me', 'domains': ['t.me', 'telegram.me'],
+                 'links': {'profile': 'https://t.me/channel', 'group': 'https://t.me/chat', 'post': 'https://t.me/channel/123',
+                           'story': 'https://t.me/channel/s/1', 'poll': 'https://t.me/channel/123', 'bot': 'https://t.me/your_bot',
+                           'channel': 'https://t.me/channel', 'comment': 'https://t.me/channel/123?comment=1'}},
+    'instagram': {'name': 'Instagram', 'short': 'INSTAGRAM', 'emoji': '📸',
+                  'pattern': r'instagram|инстаграм|инста\b|\binsta\b|\big\b', 'domains': ['instagram.com'],
+                  'links': {'profile': 'https://instagram.com/username', 'post': 'https://instagram.com/p/XXXXXXX',
+                            'video': 'https://instagram.com/reel/XXXXXXX', 'story': 'https://instagram.com/stories/username/123',
+                            'stream': 'https://instagram.com/username/live'}},
+    'tiktok': {'name': 'TikTok', 'short': 'TIKTOK', 'emoji': '🎵',
+               'pattern': r'tik\s?tok|тик\s?ток', 'domains': ['tiktok.com', 'vt.tiktok.com', 'vm.tiktok.com'],
+               'links': {'profile': 'https://tiktok.com/@username', 'post': 'https://tiktok.com/@username/video/123',
+                         'video': 'https://tiktok.com/@username/video/123', 'stream': 'https://tiktok.com/@username/live'}},
+    'youtube': {'name': 'YouTube', 'short': 'YOUTUBE', 'emoji': '▶️',
+                'pattern': r'youtube|ютуб|\byt\b|shorts', 'domains': ['youtube.com', 'youtu.be'],
+                'links': {'profile': 'https://youtube.com/@channel', 'post': 'https://youtube.com/watch?v=XXXXXXX',
+                          'video': 'https://youtube.com/watch?v=XXXXXXX', 'stream': 'https://youtube.com/live/XXXXXXX',
+                          'comment': 'https://youtube.com/watch?v=XXXXXXX&lc=XXXX'}},
+    'vk': {'name': 'ВКонтакте', 'short': 'VK', 'emoji': '🔵',
+           'pattern': r'\bvk\b|\bвк\b|вконтакт|vkontakte|vk\.com', 'domains': ['vk.com', 'vk.ru', 'm.vk.com'],
+           'links': {'profile': 'https://vk.com/club123', 'group': 'https://vk.com/club123', 'post': 'https://vk.com/wall-123_456',
+                     'poll': 'https://vk.com/wall-123_456', 'video': 'https://vk.com/video-123_456',
+                     'stream': 'https://vk.com/video-123_456', 'story': 'https://vk.com/story-123_456'}},
+    'twitch': {'name': 'Twitch', 'short': 'TWITCH', 'emoji': '🟣', 'pattern': r'twitch|твич', 'domains': ['twitch.tv'],
+               'links': {'profile': 'https://twitch.tv/channel', 'stream': 'https://twitch.tv/channel',
+                         'video': 'https://twitch.tv/videos/123'}},
+    'kick': {'name': 'Kick', 'short': 'KICK', 'emoji': '🟢', 'pattern': r'\bkick\b', 'domains': ['kick.com'],
+             'links': {'profile': 'https://kick.com/channel', 'stream': 'https://kick.com/channel'}},
+    'twitter': {'name': 'X (Twitter)', 'short': 'X/TWITTER', 'emoji': '✖️',
+                'pattern': r'twitter|твиттер|\bx\.com\b|\(x\)|\bx\s*/\s*twitter', 'domains': ['twitter.com', 'x.com'],
+                'links': {'profile': 'https://x.com/username', 'post': 'https://x.com/username/status/123',
+                          'poll': 'https://x.com/username/status/123', 'stream': 'https://x.com/i/broadcasts/XXXX'}},
+    'discord': {'name': 'Discord', 'short': 'DISCORD', 'emoji': '🎮', 'pattern': r'discord|дискорд',
+                'domains': ['discord.com', 'discord.gg'],
+                'links': {'profile': 'https://discord.gg/invite', 'group': 'https://discord.gg/invite',
+                          'post': 'https://discord.com/channels/123/456/789'}},
+    'facebook': {'name': 'Facebook', 'short': 'FACEBOOK', 'emoji': '📘', 'pattern': r'facebook|фейсбук|\bfb\b',
+                 'domains': ['facebook.com', 'fb.com', 'fb.watch'],
+                 'links': {'profile': 'https://facebook.com/page', 'group': 'https://facebook.com/groups/123',
+                           'post': 'https://facebook.com/page/posts/123', 'video': 'https://facebook.com/watch/?v=123',
+                           'stream': 'https://facebook.com/watch/?v=123'}},
+    'threads': {'name': 'Threads', 'short': 'THREADS', 'emoji': '🧵', 'pattern': r'threads', 'domains': ['threads.net', 'threads.com'],
+                'links': {'profile': 'https://threads.net/@username', 'post': 'https://threads.net/@username/post/XXXX'}},
+    'ok': {'name': 'Одноклассники', 'short': 'OK.RU', 'emoji': '🟠', 'pattern': r'одноклассник|odnoklassniki|ok\.ru',
+           'domains': ['ok.ru'], 'links': {'profile': 'https://ok.ru/group/123', 'group': 'https://ok.ru/group/123',
+                                           'post': 'https://ok.ru/group/123/topic/456', 'video': 'https://ok.ru/video/123'}},
+    'rutube': {'name': 'Rutube', 'short': 'RUTUBE', 'emoji': '📺', 'pattern': r'rutube|рутуб', 'domains': ['rutube.ru'],
+               'links': {'profile': 'https://rutube.ru/channel/123', 'post': 'https://rutube.ru/video/XXXX',
+                         'video': 'https://rutube.ru/video/XXXX', 'stream': 'https://rutube.ru/video/XXXX'}},
+    'dzen': {'name': 'Дзен', 'short': 'ДЗЕН', 'emoji': '🟡', 'pattern': r'дзен|dzen|zen\.yandex', 'domains': ['dzen.ru', 'zen.yandex.ru'],
+             'links': {'profile': 'https://dzen.ru/id/XXXX', 'post': 'https://dzen.ru/a/XXXX', 'video': 'https://dzen.ru/video/watch/XXXX'}},
+    'spotify': {'name': 'Spotify', 'short': 'SPOTIFY', 'emoji': '🎧', 'pattern': r'spotify|спотифай', 'domains': ['spotify.com', 'open.spotify.com'],
+                'links': {'profile': 'https://open.spotify.com/artist/XXXX', 'track': 'https://open.spotify.com/track/XXXX',
+                          'post': 'https://open.spotify.com/track/XXXX'}},
+    'yamusic': {'name': 'Яндекс Музыка', 'short': 'ЯНДЕКС МУЗЫКА', 'emoji': '🎶', 'pattern': r'яндекс\s*музык|yandex\s*music',
+                'domains': ['music.yandex.ru'], 'links': {'profile': 'https://music.yandex.ru/artist/123',
+                                                          'track': 'https://music.yandex.ru/album/1/track/2',
+                                                          'post': 'https://music.yandex.ru/album/1/track/2'}},
+    'soundcloud': {'name': 'SoundCloud', 'short': 'SOUNDCLOUD', 'emoji': '☁️', 'pattern': r'soundcloud|саундклауд',
+                   'domains': ['soundcloud.com'], 'links': {'profile': 'https://soundcloud.com/artist',
+                                                            'track': 'https://soundcloud.com/artist/track',
+                                                            'post': 'https://soundcloud.com/artist/track'}},
+    'likee': {'name': 'Likee', 'short': 'LIKEE', 'emoji': '💗', 'pattern': r'likee|лайки\s*\(likee\)', 'domains': ['likee.video', 'l.likee.video'],
+              'links': {'profile': 'https://likee.video/@username', 'post': 'https://likee.video/@username/video/123'}},
+    'pinterest': {'name': 'Pinterest', 'short': 'PINTEREST', 'emoji': '📌', 'pattern': r'pinterest|пинтерест',
+                  'domains': ['pinterest.com', 'pin.it'], 'links': {'profile': 'https://pinterest.com/username',
+                                                                    'post': 'https://pinterest.com/pin/123'}},
+    'reddit': {'name': 'Reddit', 'short': 'REDDIT', 'emoji': '👽', 'pattern': r'reddit|реддит', 'domains': ['reddit.com'],
+               'links': {'profile': 'https://reddit.com/user/name', 'group': 'https://reddit.com/r/community',
+                         'post': 'https://reddit.com/r/community/comments/XXXX'}},
+    'linkedin': {'name': 'LinkedIn', 'short': 'LINKEDIN', 'emoji': '💼', 'pattern': r'linkedin|линкедин', 'domains': ['linkedin.com'],
+                 'links': {'profile': 'https://linkedin.com/in/name', 'post': 'https://linkedin.com/posts/XXXX'}},
+    'website': {'name': 'Сайт', 'short': 'САЙТ', 'emoji': '🌐', 'pattern': r'traffic|трафик|website|сайт\b|визит',
+                'domains': ['*'], 'links': {'page': 'https://example.com/page', 'post': 'https://example.com/page',
+                                            'profile': 'https://example.com'}},
+}
+PLATFORM_ORDER = ['telegram', 'instagram', 'tiktok', 'youtube', 'vk', 'twitch', 'kick', 'twitter', 'discord', 'facebook',
+                  'threads', 'ok', 'rutube', 'dzen', 'spotify', 'yamusic', 'soundcloud', 'likee', 'pinterest', 'reddit',
+                  'linkedin', 'website']
+OTHER_PLATFORM = {'name': 'SMM', 'short': '', 'emoji': '⚡', 'domains': [], 'links': {'post': 'https://example.com/page',
+                                                                                    'profile': 'https://example.com/page'}}
+
+KINDS: Dict[str, Dict[str, Any]] = {
+    'followers': {'ru': 'ПОДПИСЧИКИ', 'en': 'FOLLOWERS', 'emoji': '👥', 'unit': ('подписчик', 'подписчика', 'подписчиков'),
+                  'unit_en': ('follower', 'followers'), 'target': 'profile',
+                  'select': ['подписчик', 'фолловер', 'follower', 'subscriber', 'участник']},
+    'premium_followers': {'ru': 'PREMIUM-ПОДПИСЧИКИ', 'en': 'PREMIUM FOLLOWERS', 'emoji': '💎',
+                          'unit': ('premium-подписчик', 'premium-подписчика', 'premium-подписчиков'),
+                          'unit_en': ('premium follower', 'premium followers'), 'target': 'profile',
+                          'select': ['премиум', 'premium', 'подписчик']},
+    'members': {'ru': 'УЧАСТНИКИ', 'en': 'MEMBERS', 'emoji': '👨‍👩‍👧', 'unit': ('участник', 'участника', 'участников'),
+                'unit_en': ('member', 'members'), 'target': 'group', 'select': ['участник', 'подписчик', 'member']},
+    'friends': {'ru': 'ДРУЗЬЯ', 'en': 'FRIENDS', 'emoji': '🤝', 'unit': ('друг', 'друга', 'друзей'),
+                'unit_en': ('friend', 'friends'), 'target': 'profile', 'select': ['друз', 'заявк', 'friend']},
+    'views': {'ru': 'ПРОСМОТРЫ', 'en': 'VIEWS', 'emoji': '👁', 'unit': ('просмотр', 'просмотра', 'просмотров'),
+              'unit_en': ('view', 'views'), 'target': 'post', 'select': ['просмотр', 'view']},
+    'story_views': {'ru': 'ПРОСМОТРЫ СТОРИС', 'en': 'STORY VIEWS', 'emoji': '📲', 'unit': ('просмотр', 'просмотра', 'просмотров'),
+                    'unit_en': ('view', 'views'), 'target': 'story', 'select': ['сторис', 'истори', 'stories', 'просмотр']},
+    'reels_views': {'ru': 'ПРОСМОТРЫ REELS/SHORTS', 'en': 'REELS/SHORTS VIEWS', 'emoji': '🎬',
+                    'unit': ('просмотр', 'просмотра', 'просмотров'), 'unit_en': ('view', 'views'), 'target': 'video',
+                    'select': ['просмотр', 'reels', 'shorts', 'view']},
+    'stream_viewers': {'ru': 'ЗРИТЕЛИ НА СТРИМ', 'en': 'STREAM VIEWERS', 'emoji': '🎥', 'unit': ('зритель', 'зрителя', 'зрителей'),
+                       'unit_en': ('viewer', 'viewers'), 'target': 'stream',
+                       'select': ['зрител', 'стрим', 'трансляц', 'эфир', 'viewer', 'просмотр']},
+    'watchtime': {'ru': 'ЧАСЫ ПРОСМОТРА', 'en': 'WATCH TIME', 'emoji': '⏱', 'unit': ('час', 'часа', 'часов'),
+                  'unit_en': ('hour', 'hours'), 'target': 'video', 'select': ['врем', 'час', 'watch', 'просмотр']},
+    'likes': {'ru': 'ЛАЙКИ', 'en': 'LIKES', 'emoji': '❤️', 'unit': ('лайк', 'лайка', 'лайков'), 'unit_en': ('like', 'likes'),
+              'target': 'post', 'select': ['лайк', 'like', 'нрав', 'оценк']},
+    'dislikes': {'ru': 'ДИЗЛАЙКИ', 'en': 'DISLIKES', 'emoji': '👎', 'unit': ('дизлайк', 'дизлайка', 'дизлайков'),
+                 'unit_en': ('dislike', 'dislikes'), 'target': 'post', 'select': ['дизлайк', 'dislike', 'лайк']},
+    'reactions': {'ru': 'РЕАКЦИИ', 'en': 'REACTIONS', 'emoji': '🔥', 'unit': ('реакция', 'реакции', 'реакций'),
+                  'unit_en': ('reaction', 'reactions'), 'target': 'post', 'select': ['реакц', 'reaction', 'лайк']},
+    'comments': {'ru': 'КОММЕНТАРИИ', 'en': 'COMMENTS', 'emoji': '💬', 'unit': ('комментарий', 'комментария', 'комментариев'),
+                 'unit_en': ('comment', 'comments'), 'target': 'post', 'select': ['коммент', 'comment']},
+    'comment_likes': {'ru': 'ЛАЙКИ НА КОММЕНТАРИИ', 'en': 'COMMENT LIKES', 'emoji': '👍', 'unit': ('лайк', 'лайка', 'лайков'),
+                      'unit_en': ('like', 'likes'), 'target': 'comment', 'select': ['лайк', 'коммент']},
+    'reposts': {'ru': 'РЕПОСТЫ', 'en': 'SHARES', 'emoji': '🔁', 'unit': ('репост', 'репоста', 'репостов'),
+                'unit_en': ('share', 'shares'), 'target': 'post', 'select': ['репост', 'подел', 'share', 'repost']},
+    'saves': {'ru': 'СОХРАНЕНИЯ', 'en': 'SAVES', 'emoji': '🔖', 'unit': ('сохранение', 'сохранения', 'сохранений'),
+              'unit_en': ('save', 'saves'), 'target': 'post', 'select': ['сохран', 'save']},
+    'votes': {'ru': 'ГОЛОСА В ОПРОС', 'en': 'POLL VOTES', 'emoji': '🗳', 'unit': ('голос', 'голоса', 'голосов'),
+              'unit_en': ('vote', 'votes'), 'target': 'poll', 'select': ['голос', 'опрос', 'vote', 'poll']},
+    'boosts': {'ru': 'БУСТЫ КАНАЛА', 'en': 'CHANNEL BOOSTS', 'emoji': '🚀', 'unit': ('буст', 'буста', 'бустов'),
+               'unit_en': ('boost', 'boosts'), 'target': 'channel', 'select': ['буст', 'boost', 'голос']},
+    'bot_starts': {'ru': 'СТАРТЫ БОТА', 'en': 'BOT STARTS', 'emoji': '🤖', 'unit': ('старт', 'старта', 'стартов'),
+                   'unit_en': ('start', 'starts'), 'target': 'bot', 'select': ['старт', 'бот', 'запуск', 'bot']},
+    'plays': {'ru': 'ПРОСЛУШИВАНИЯ', 'en': 'PLAYS', 'emoji': '🎧', 'unit': ('прослушивание', 'прослушивания', 'прослушиваний'),
+              'unit_en': ('play', 'plays'), 'target': 'track', 'select': ['прослуш', 'воспроизвед', 'play', 'stream']},
+    'impressions': {'ru': 'ОХВАТЫ И ПОКАЗЫ', 'en': 'IMPRESSIONS', 'emoji': '📣', 'unit': ('показ', 'показа', 'показов'),
+                    'unit_en': ('impression', 'impressions'), 'target': 'post', 'select': ['охват', 'показ', 'impression', 'reach']},
+    'traffic': {'ru': 'ТРАФИК НА САЙТ', 'en': 'WEBSITE TRAFFIC', 'emoji': '🌐', 'unit': ('посещение', 'посещения', 'посещений'),
+                'unit_en': ('visit', 'visits'), 'target': 'page', 'select': ['трафик', 'посещ', 'traffic', 'визит']},
+    'generic': {'ru': 'SMM-УСЛУГА', 'en': 'SMM SERVICE', 'emoji': '⚡', 'unit': ('единица', 'единицы', 'единиц'),
+                'unit_en': ('unit', 'units'), 'target': 'post', 'select': []},
+}
+KIND_ORDER = ['followers', 'premium_followers', 'members', 'friends', 'views', 'story_views', 'reels_views', 'stream_viewers',
+              'watchtime', 'likes', 'dislikes', 'reactions', 'comments', 'comment_likes', 'reposts', 'saves', 'votes',
+              'boosts', 'bot_starts', 'plays', 'impressions', 'traffic', 'generic']
+
+# Составные типы проверяются первыми: они точнее простых слов.
+_COMPOUND_KINDS = [
+    ('bot_starts', r'bot\s*start|старт\w*\s+бот|запуск\w*\s+бот|bot\s*users?|пользовател\w*\s+(в\s+)?бот'),
+    ('boosts', r'boost|буст|голос\w*\s+(для|за|на)\s+канал'),
+    ('watchtime', r'watch\s*-?time|время\s+просмотр|час\w*\s+просмотр'),
+    ('stream_viewers', r'live\s*stream|stream\s*view|зрител|прям\w*\s+эфир|трансляц|\blive\b[^|\]]*?(view|просмотр)'),
+    ('story_views', r'(stor(y|ies)|сторис|истори)[^|\]]*?(view|просмотр)|(view|просмотр)[^|\]]*?(stor(y|ies)|сторис|истори)'),
+    ('reels_views', r'(reels?|shorts|клип|igtv)[^|\]]*?(view|просмотр)|(view|просмотр)[^|\]]*?(reels?|shorts|клип|igtv)'),
+    ('comment_likes', r'(like|лайк)\w*\s+(on\s+|на\s+|for\s+|к\s+)?(comment|коммент)|(comment|коммент)\w*\s+(like|лайк)'),
+    ('premium_followers', r'(premium|премиум)[^|\]]*?(подписч|subscriber|member|follower|участник)|'
+                          r'(подписч|subscriber|member|follower|участник)[^|\]]*?(premium|премиум)'),
+    ('traffic', r'traffic|трафик|website|визит\w*\s+на\s+сайт|посещен'),
+    ('votes', r'\bpoll|\bопрос|голосован|\bvotes?\b'),
+]
+# Простые типы: выбирается слово, которое встречается в названии раньше всех.
+_SIMPLE_KINDS = [
+    ('dislikes', r'dislike|дизлайк'),
+    ('reactions', r'reaction|реакци|emoji|эмодзи'),
+    ('comments', r'comment|коммент'),
+    ('members', r'member|участник|\bjoin|вступлен'),
+    ('followers', r'follower|subscriber|подписч|фоллов|\bsubs\b'),
+    ('friends', r'friend|друз|заявк\w*\s+в\s+друз'),
+    ('saves', r'\bsaves?\b|сохранен|закладк|bookmark'),
+    ('reposts', r'repost|репост|\bshares?\b|подел|retweet|ретвит'),
+    ('plays', r'\bplays?\b|прослушив|\bstreams?\b|listen|слушател'),
+    ('impressions', r'impression|охват|показ|\breach\b'),
+    ('views', r'view|просмотр'),
+    ('likes', r'like|лайк|heart|сердеч'),
+    ('votes', r'голос'),
+]
+
+TARGET_TEXT = {
+    'profile': ('ссылку на открытый профиль, канал или страницу', 'a link to a public profile, channel or page'),
+    'group': ('ссылку на открытую группу, чат или канал', 'a link to a public group, chat or channel'),
+    'post': ('ссылку на конкретный пост, видео или публикацию', 'a link to the exact post, video or publication'),
+    'story': ('ссылку на активную сторис', 'a link to an active story'),
+    'video': ('ссылку на видео (Reels, Shorts, ролик)', 'a link to the video (Reels, Shorts, clip)'),
+    'stream': ('ссылку на трансляцию или канал со стримом', 'a link to the live stream or streaming channel'),
+    'poll': ('ссылку на пост с опросом', 'a link to the post with the poll'),
+    'bot': ('ссылку на бота', 'a link to the bot'),
+    'channel': ('ссылку на публичный канал', 'a link to the public channel'),
+    'comment': ('ссылку на комментарий', 'a link to the comment'),
+    'track': ('ссылку на трек, альбом или артиста', 'a link to the track, album or artist'),
+    'page': ('полную ссылку на страницу сайта', 'the full link to the website page'),
+}
+TARGET_NOTES = {
+    'profile': (['Профиль или канал должен быть открытым (публичным)', 'Не меняйте ссылку и юзернейм до завершения заказа'],
+                ['The profile or channel must be public', 'Do not change the link or username until completion']),
+    'group': (['Группа или чат должны быть открытыми, вступление — без одобрения', 'Не меняйте ссылку до завершения заказа'],
+              ['The group or chat must be public with open joining', 'Do not change the link until completion']),
+    'post': (['Публикация должна быть доступна без авторизации', 'Не удаляйте и не скрывайте публикацию до завершения'],
+             ['The publication must be visible without login', 'Do not delete or hide the publication until completion']),
+    'story': (['Сторис должна быть активна до завершения заказа', 'Аккаунт должен быть открытым'],
+              ['The story must stay active until completion', 'The account must be public']),
+    'video': (['Видео должно быть доступно без авторизации', 'Не удаляйте видео до завершения заказа'],
+              ['The video must be public', 'Do not delete the video until completion']),
+    'stream': (['Трансляция должна идти в момент запуска', 'Не завершайте стрим раньше заказанного времени'],
+               ['The stream must be live when the order starts', 'Do not end the stream early']),
+    'poll': (['Опрос должен быть открытым', 'Бот спросит номер варианта ответа, если это нужно'],
+             ['The poll must be open', 'The bot will ask for the answer number if required']),
+    'bot': (['Бот должен быть доступен и отвечать на /start'], ['The bot must be available and respond to /start']),
+    'channel': (['Канал должен быть публичным'], ['The channel must be public']),
+    'comment': (['Комментарий должен быть виден без авторизации'], ['The comment must be visible without login']),
+    'track': (['Трек должен быть доступен для прослушивания'], ['The track must be publicly playable']),
+    'page': (['Страница должна открываться без пароля и гео-блокировок'], ['The page must open without passwords or geo-blocks']),
+}
+KIND_EXTRA_NOTES = {
+    'comments': (['Комментарии под публикацией должны быть открыты'], ['Comments must be enabled under the publication']),
+    'votes': (['Проверьте, что голосование ещё не закрыто'], ['Make sure the poll is still open']),
+    'friends': (['Профиль должен принимать заявки в друзья'], ['The profile must accept friend requests']),
+}
+
+# ---------------------------------------------------------------------------
+# Темы оформления лотов
+# ---------------------------------------------------------------------------
+# FunPay показывает обычный текст пропорциональным шрифтом: рамки вида ╔═╗
+# «едут», поэтому используются только горизонтальные линии и маркеры слева.
+THEMES: Dict[str, Dict[str, Any]] = {
+    'premium': {'title': '⭐ Премиум', 'summary': '⭐ {title} ⭐ {badges}', 'joiner': ' • ',
+                'sep': '━━━━━━━━━━━━━━━━━━━━', 'bullet': '▸', 'steps': ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'],
+                'get': ('📦 ЧТО ВЫ ПОЛУЧАЕТЕ', '📦 WHAT YOU GET'), 'how': ('📝 КАК ЗАКАЗАТЬ', '📝 HOW TO ORDER'),
+                'warn': ('⚠️ ВАЖНО', '⚠️ IMPORTANT'),
+                'intro': ('⚡ Автовыдача 24/7 — бот сам примет заказ и запустит услугу',
+                          '⚡ 24/7 auto delivery — the bot accepts and starts your order automatically'),
+                'footer': ('⭐ Спасибо за выбор! Будем рады вашему отзыву.', '⭐ Thank you for choosing us! Your review is appreciated.')},
+    'neon': {'title': '⚡ Неон', 'summary': '⚡ {title} ⚡ {badges}', 'joiner': ' | ',
+             'sep': '⚡━━━━━━━━━━━━━━━━━━⚡', 'bullet': '💠', 'steps': ['➊', '➋', '➌', '➍', '➎'],
+             'get': ('💠 ЧТО ВХОДИТ', '💠 WHAT IS INCLUDED'), 'how': ('🧭 КАК ЗАКАЗАТЬ', '🧭 HOW TO ORDER'),
+             'warn': ('🚨 ОБЯЗАТЕЛЬНО', '🚨 REQUIRED'),
+             'intro': ('⚡ МОМЕНТАЛЬНЫЙ АВТОЗАПУСК 24/7', '⚡ INSTANT 24/7 AUTO START'),
+             'footer': ('💠 Работаем круглосуточно — заказывайте в любое время!', '💠 We work 24/7 — order any time!')},
+    'fire': {'title': '🔥 Яркий', 'summary': '🔥 {title} 🔥 {badges}', 'joiner': ' ✦ ',
+             'sep': '🔥━━━━━━━━━━━━━━━━━━🔥', 'bullet': '🔸', 'steps': ['①', '②', '③', '④', '⑤'],
+             'get': ('🎁 ВЫ ПОЛУЧИТЕ', '🎁 YOU GET'), 'how': ('🛒 КАК КУПИТЬ', '🛒 HOW TO BUY'), 'warn': ('❗ ВНИМАНИЕ', '❗ ATTENTION'),
+             'intro': ('🔥 ГОРЯЧЕЕ ПРЕДЛОЖЕНИЕ • АВТОВЫДАЧА 24/7', '🔥 HOT DEAL • 24/7 AUTO DELIVERY'),
+             'footer': ('🔥 Оставьте отзыв — это очень помогает!', '🔥 Leave a review — it helps a lot!')},
+    'minimal': {'title': '💎 Минимал', 'summary': '{title} • {badges}', 'joiner': ' • ',
+                'sep': '────────────────', 'bullet': '•', 'steps': ['1.', '2.', '3.', '4.', '5.'],
+                'get': ('Что входит', 'What is included'), 'how': ('Как заказать', 'How to order'), 'warn': ('Важно', 'Important'),
+                'intro': ('Автоматический запуск 24/7.', 'Automatic start 24/7.'),
+                'footer': ('Спасибо за заказ!', 'Thank you for your order!')},
+    'classic': {'title': '📋 Классика FunPay', 'summary': '【{title}】 {badges}', 'joiner': ' ✔ ',
+                'sep': '═══════════════════', 'bullet': '✔️', 'steps': ['1)', '2)', '3)', '4)', '5)'],
+                'get': ('🛍 ОПИСАНИЕ ТОВАРА', '🛍 PRODUCT'), 'how': ('📌 ПОРЯДОК ЗАКАЗА', '📌 ORDER STEPS'),
+                'warn': ('⛔ ПРАВИЛА', '⛔ RULES'),
+                'intro': ('✅ Автоматическая выдача — без ожидания продавца', '✅ Automatic delivery — no waiting for the seller'),
+                'footer': ('🤝 Честная работа. Отзыв — лучшая благодарность!', '🤝 Honest service. A review is the best thanks!')},
+    'info': {'title': '🎯 Информативный', 'summary': '🎯 {title} • {badges}', 'joiner': ' • ',
+             'sep': '▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬', 'bullet': '▪️', 'steps': ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'],
+             'get': ('📊 ПАРАМЕТРЫ УСЛУГИ', '📊 SERVICE DETAILS'), 'how': ('🧾 ИНСТРУКЦИЯ', '🧾 INSTRUCTIONS'),
+             'warn': ('📌 УСЛОВИЯ', '📌 TERMS'),
+             'intro': ('🤖 Заказ обрабатывается ботом автоматически 24/7', '🤖 Orders are processed by the bot 24/7'),
+             'footer': ('📈 Статус заказа можно проверить в любой момент командой «чек».',
+                        '📈 You can check the order status any time with the "check" command.'), 'details': True},
+}
+THEME_ORDER = ['premium', 'neon', 'fire', 'minimal', 'classic', 'info']
+LEGACY_STYLE_THEME = {'s1': 'premium', 's2': 'neon', 's3': 'classic', 's4': 'info', 's5': 'fire'}
+
+CUSTOM_TEMPLATE_VARS = (
+    '{title} {title_en} {platform} {platform_en} {kind} {kind_en} {emoji} {service_name} {clean_name} '
+    '{per_piece} {unit} {min_pcs} {max_pcs} {min} {max} {speed} {start} {guarantee} {quality} '
+    '{example_link} {link_hint} {requirements} {price} {service_id} {category} {badges} {variant}'
+)
+
+DEFAULT_DOMAINS = [
+    "t.me", "telegram.me", "vk.com", "instagram.com", "tiktok.com",
+    "youtube.com", "youtu.be", "twitch.tv", "twitter.com", "x.com",
+    "facebook.com", "threads.net", "kick.com", "discord.com", "discord.gg",
+    "ok.ru", "rutube.ru", "spotify.com", "soundcloud.com", "pinterest.com",
+    "linkedin.com", "reddit.com", "dzen.ru", "music.yandex.ru", "likee.video",
+]
+
+DEFAULT_MESSAGES = {
+    "after_payment": "✅ Оплата получена!\n\nЧтобы запустить услугу, отправьте в этот чат корректную ссылку.\n\n📎 Пример: {example_link}\n\n⚠️ Не запускайте эту же услугу параллельно у другого продавца.",
+    "after_confirmation": "🚀 Заказ передан в работу!\n\n🔢 Номер заказа в панели: {panel_order_id}\n🔗 Ссылка: {link}\n\n📊 Проверить статус: чек {panel_order_id}",
+    "after_completion": "🎉 НАКРУТКА ЗАВЕРШЕНА УСПЕШНО!\n\n✅ Ваш заказ полностью выполнен.\n\n🔢 Номер заказа в панели: {panel_order_id}\n📎 Ссылка: {link}\n\n⭐ Спасибо за заказ! Будем рады вашему отзыву.",
+    "refill_info": "♻️ Для этого заказа доступно восстановление списаний (рефилл).\n\nЕсли часть накрутки спишется, отправьте в чат: {command} {order_id}\n🔁 Доступно запусков: {refill_limit}\n⏳ Действует: {refill_period} (до {refill_deadline})",
+    "poll_request": "🔢 Пришлите номер варианта ответа в опросе (цифрой, например: 1).",
+    "queued": "📥 Заказ #{funpay_id} принят и поставлен в очередь (позиция {position}).\n\nСначала завершим предыдущий заказ — затем бот сам попросит ссылку для этого.",
+    "next_in_queue": "➡️ Переходим к следующему заказу #{funpay_order_id}.\n\nОтправьте ссылку для него.\n📎 Пример: {example_link}\n\n📥 Осталось в очереди: {remaining}",
+    "order_error": "⚠️ Не удалось запустить заказ в SMM-сервисе. Продавец уже получил уведомление — средства будут возвращены или заказ запустят вручную.",
+    "link_reminder": "⏰ Напоминаем: для запуска заказа #{funpay_order_id} отправьте в этот чат ссылку.\n📎 Пример: {example_link}",
+}
+MESSAGE_INFO = {
+    'after_payment': ('После оплаты', '{buyer_username} {funpay_order_id} {example_link} {service_title}'),
+    'after_confirmation': ('После запуска', '{panel_order_id} {order_id} {funpay_order_id} {link}'),
+    'after_completion': ('После выполнения', '{panel_order_id} {order_id} {funpay_order_id} {link}'),
+    'refill_info': ('Рефилл доступен', '{command} {order_id} {funpay_order_id} {link} {refill_limit} {refill_period} {refill_deadline}'),
+    'poll_request': ('Запрос номера ответа (опрос)', 'нет'),
+    'queued': ('Постановка в очередь', '{funpay_id} {funpay_order_id} {position}'),
+    'next_in_queue': ('Следующий заказ из очереди', '{funpay_order_id} {remaining} {example_link}'),
+    'order_error': ('Ошибка запуска заказа', 'нет'),
+    'link_reminder': ('Напоминание о ссылке', '{funpay_order_id} {example_link}'),
+}
+_PREVIOUS_DEFAULT_MESSAGES = {
+    "after_payment": "❤️ Спасибо за оплату!\n\nПришлите ссылку для запуска услуги.\nПример: {example_link}",
+    "after_confirmation": "🎉 Заказ передан в работу!\n\n🔢 Номер: {panel_order_id}\n🔗 Ссылка: {link}\n\nПроверка: <code>чек {panel_order_id}</code>",
+}
+_PREVIOUS_CONFIRMATION_TEXTS = {
+    _PREVIOUS_DEFAULT_MESSAGES['after_confirmation'],
+    "🚀 Заказ передан в работу!\n\n🔢 Номер заказа в панели: {panel_order_id}\n🔗 Ссылка: {link}\n\nДля проверки отправьте: чек {panel_order_id}",
+    "🚀 Заказ передан в работу!\n\n🔢 Номер заказа в панели: {panel_order_id}\n🔗 Ссылка: {link}\n\n📊 Проверить статус: чек {panel_order_id}\n🔄 Запросить refill: рефилл {panel_order_id}",
+}
+
+GOOD_STATUSES = {'completed', 'complete', 'done', 'success'}
+BAD_STATUSES = {'failed', 'error', 'canceled', 'cancelled', 'fail', 'refunded_by_panel'}
+REVIEW_STATUSES = {'submission_unknown', 'awaiting_refund', 'refund_unknown', 'partial'}
+YES_WORDS = {'+', 'да', 'yes', 'y', 'ok', 'ок', 'okay', 'go', 'start', 'старт', 'подтверждаю', 'верно', 'запуск'}
+NO_WORDS = {'-', 'нет', 'no', 'n', 'stop', 'стоп', 'cancel', 'отмена'}
+REFILL_RE = re.compile(r'^(?:!|/)?(?:рефилл|refill)(?:\s+#?(\d+))?$', re.I)
