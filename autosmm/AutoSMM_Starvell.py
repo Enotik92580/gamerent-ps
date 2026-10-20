@@ -71,7 +71,7 @@ class InlineKeyboardMarkup:
         return self
 
 NAME = "AutoSMM"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 DESCRIPTION = "Автоматическая продажа SMM-услуг на Starvell: заказы через SMM-панели, автоцена, рефилл"
 AUTHOR = "@LuckyFunPay_Support"
 CREDITS = "@LuckyFunPay_Support"
@@ -7745,33 +7745,87 @@ def _retry_bootstrap() -> None:
             continue
 
 
-def _install_plugin_card_button() -> bool:
-    """Карточка плагина в Starvell Cardinal не умеет кнопку настроек — добавляем свою только для AutoSMM."""
-    try:
-        import importlib
-        cp = importlib.import_module('bot.plugins.cp')
-    except Exception:
-        return False
-    original = getattr(cp, 'edit_plugin', None)
-    if not callable(original):
-        return False
-    if getattr(original, '_autosmm', False):
-        return True
+SETTINGS_BUTTON_TEXT = '⚙️ Настройки AutoSMM'
 
-    def edit_plugin(plugin_data: Any, CBT: Any, uuid: str, offset: int, ask_delete: bool = False, *args: Any, **kwargs: Any) -> Any:
-        keyboard = original(plugin_data, CBT, uuid, offset, ask_delete, *args, **kwargs)
-        if str(uuid) != UUID or ask_delete:
-            return keyboard
+
+def _settings_markup(markup: Any) -> Any:
+    """Добавляет кнопку настроек первой строкой в aiogram-клавиатуру карточки плагина."""
+    from aiogram.types import InlineKeyboardButton as AioButton, InlineKeyboardMarkup as AioMarkup
+    rows = list(getattr(markup, 'inline_keyboard', None) or [])
+    if any(getattr(b, 'callback_data', None) == 'autosmm:home' for row in rows for b in row):
+        return markup
+    return AioMarkup(inline_keyboard=[[AioButton(text=SETTINGS_BUTTON_TEXT, callback_data='autosmm:home')]] + rows)
+
+
+def _install_plugin_card_button() -> int:
+    """В карточке плагина Starvell Cardinal нет кнопки настроек — добавляем её только для AutoSMM.
+    Сборки рисуют карточку разными функциями, поэтому подменяем все известные."""
+    import importlib
+    patched = 0
+    targets = [('bot.plugins.cp', 'edit_plugin'), ('bot.handlers.plugins_handlers', 'get_plugin_info_menu'),
+               ('bot.keyboards', 'get_plugin_info_menu'), ('bot.keyboards.keyboards', 'get_plugin_info_menu'),
+               ('bot.keyboards.plugins', 'edit_plugin')]
+    for module_name, name in targets:
         try:
-            from aiogram.types import InlineKeyboardButton as AioButton, InlineKeyboardMarkup as AioMarkup
-            rows = [[AioButton(text='⚙️ Настройки AutoSMM', callback_data='autosmm:home')]] + list(keyboard.inline_keyboard)
-            return AioMarkup(inline_keyboard=rows)
+            module = importlib.import_module(module_name)
         except Exception:
-            return keyboard
+            continue
+        original = getattr(module, name, None)
+        if not callable(original):
+            continue
+        if getattr(original, '_autosmm', False):
+            patched += 1
+            continue
 
-    edit_plugin._autosmm = True
-    cp.edit_plugin = edit_plugin
-    return True
+        def wrapper(*args: Any, __original: Callable = original, **kwargs: Any) -> Any:
+            keyboard = __original(*args, **kwargs)
+            uuid = kwargs.get('uuid', args[2] if __original.__name__ == 'edit_plugin' and len(args) > 2 else (args[0] if args else ''))
+            if str(uuid) != UUID or kwargs.get('ask_delete') or (len(args) > 4 and args[4] is True):
+                return keyboard
+            try:
+                return _settings_markup(keyboard)
+            except Exception:
+                return keyboard
+
+        wrapper._autosmm = True
+        wrapper.__name__ = name
+        setattr(module, name, wrapper)
+        patched += 1
+    return patched
+
+
+async def _card_request_middleware(make_request: Any, bot_obj: Any, method: Any) -> Any:
+    """Подстраховка для любых сборок: если бот отправляет карточку AutoSMM (в тексте и кнопках есть его UUID),
+    добавляем кнопку настроек прямо в запрос к Telegram."""
+    try:
+        text = str(getattr(method, 'text', '') or '')
+        markup = getattr(method, 'reply_markup', None)
+        rows = getattr(markup, 'inline_keyboard', None)
+        if UUID in text and rows:
+            datas = [str(getattr(b, 'callback_data', '') or '') for row in rows for b in row]
+            texts = [str(getattr(b, 'text', '') or '') for row in rows for b in row]
+            is_card = any(UUID in d for d in datas) and not any(t.startswith('✅ Да') for t in texts)
+            if is_card and 'autosmm:home' not in datas:
+                method = method.model_copy(update={'reply_markup': _settings_markup(markup)})
+    except Exception as exc:
+        logger.debug('[AutoSMM] Card middleware skipped: %s', exc)
+    return await make_request(bot_obj, method)
+
+
+def _install_card_middleware(aio_bot: Any) -> bool:
+    try:
+        manager = aio_bot.session.middleware
+        if getattr(aio_bot, '_autosmm_card_mw', False):
+            return True
+        manager(_card_request_middleware)
+        try:
+            aio_bot._autosmm_card_mw = True
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.warning('[AutoSMM] Cannot install card middleware: %s', type(exc).__name__)
+        return False
 
 
 async def _add_bot_commands(aio_bot: Any) -> None:
@@ -7792,8 +7846,9 @@ async def on_init(aio_bot: Any = None, starvell: Any = None, db: Any = None, plu
     logger.info('[AutoSMM] Initialising plugin %s for Starvell Cardinal', VERSION)
     _SV['loop'], _SV['loop_thread'] = asyncio.get_running_loop(), threading.get_ident()
     _attach(starvell, aio_bot)
-    if _install_plugin_card_button():
-        logger.info('[AutoSMM] Settings button added to the plugin card')
+    patched = _install_plugin_card_button()
+    middleware = aio_bot is not None and _install_card_middleware(aio_bot)
+    logger.info('[AutoSMM] Settings button: card functions patched=%s, request middleware=%s', patched, middleware)
     await _add_bot_commands(aio_bot)
     await asyncio.to_thread(_bootstrap)
 
